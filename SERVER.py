@@ -55,12 +55,22 @@ def main():
     quant = "fp8"
 
     # Set environment and paths based on model
-    if model == "GROK1":
+    if model == "GROK1-INT4":
         env["RCCL_MSCCL_ENABLE"] = "0"
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_INT4_WEIGHT"] = "1"
-        model_path = "/data/models/huggingface/hub/models--amd--grok-1-W4A8KV8/snapshots/f47a2b93f0215b8bb156e817a2a08fc93fffdbaa/"
-        tokenizer_path = "Xenova/grok-1-tokenizer"
+        model_path = "/data/grok-1-W4A8KV8/"
+        tokenizer_path = "/data/Xenova/grok-1-tokenizer"
+        tp = 8
+        quant = "fp8"
+        extra_args = "--mem-fraction-static 0.5"
+
+    elif model == "GROK1-FP8":
+        env["RCCL_MSCCL_ENABLE"] = "0"
+        env["SGLANG_USE_AITER"] = "1"
+        env["SGLANG_INT4_WEIGHT"] = "0"
+        model_path = "/data/lmzheng-grok-1/"
+        tokenizer_path = "/data/Xenova/grok-1-tokenizer"
         tp = 8
         quant = "fp8"
         extra_args = "--mem-fraction-static 0.5"

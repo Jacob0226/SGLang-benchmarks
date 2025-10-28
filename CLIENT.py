@@ -7,9 +7,9 @@ from datetime import datetime
 
 def main():
     # ---------- Parse arguments ----------
-    parser = argparse.ArgumentParser(description="Run sglang benchmark for GROK1 or GROK2.")
-    parser.add_argument("--model", type=str, choices=["GROK1", "GROK2"], required=True,
-                        help="Select which model to run: GROK1 or GROK2.")
+    parser = argparse.ArgumentParser(description="Run sglang benchmark for models.")
+    parser.add_argument("--model", type=str, choices=["GROK1-INT4", "GROK1-FP8", "GROK2"], required=True,
+                        help="Select which model to run: GROK1-INT4, GROK1-FP8 or GROK2.")
     args = parser.parse_args()
     model = args.model
 
@@ -52,13 +52,24 @@ def main():
                         f"--request-rate {rate} "
                         f"--output-file online-GROK2.jsonl"
                     )
+                elif model == "GROK1-FP8":
+                    cmd = (
+                        f"python3 -m sglang.bench_serving "
+                        f"--backend sglang --dataset-name random "
+                        f"--random-input 1024 --random-output 1024 "
+                        f"--num-prompts {num_prompts} "
+                        f"--tokenizer /data/Xenova/grok-1-tokenizer/ "
+                        f"--request-rate {rate} "
+                        f"--output-file online-GROK1-FP8.jsonl"
+                    )
+
                 else:  # GROK1
                     cmd = (
                         f"python3 -m sglang.bench_serving "
                         f"--backend sglang --dataset-name random "
                         f"--random-input 1024 --random-output 1024 "
                         f"--num-prompts {num_prompts} "
-                        f"--tokenizer Xenova/grok-1-tokenizer "
+                        f"--tokenizer /data/Xenova/grok-1-tokenizer/ "
                         f"--request-rate {rate} "
                         f"--output-file online-GROK1.jsonl"
                     )
