@@ -6,7 +6,8 @@ import os
 import sys
 
 # Supported model configurations
-SUPPORTED_MODELS = ["GROK1", "GROK2", "GROK2.8T", "LLAMA3.1-70B", "LLAMA3.1-8B"]
+SUPPORTED_MODELS = ["GROK1-INT4-KV_AUTO", "GROK1-INT4-KV_FP8", "GROK1-FP8", "GROK2",
+                    "GROK2.8T", "LLAMA3.1-70B", "LLAMA3.1-8B"]
 
 def main():
     # Argument parsing
@@ -55,7 +56,7 @@ def main():
     quant = "fp8"
 
     # Set environment and paths based on model
-    if model == "GROK1-INT4":
+    if model == "GROK1-INT4-KV_AUTO":
         env["RCCL_MSCCL_ENABLE"] = "0"
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_INT4_WEIGHT"] = "1"
@@ -63,7 +64,17 @@ def main():
         tokenizer_path = "/data/Xenova/grok-1-tokenizer"
         tp = 8
         quant = "fp8"
-        extra_args = "--mem-fraction-static 0.5"
+        extra_args = "--mem-fraction-static 0.5 --attention-backend aiter"
+    
+    elif model == "GROK1-INT4-KV_FP8":
+        env["RCCL_MSCCL_ENABLE"] = "0"
+        env["SGLANG_USE_AITER"] = "1"
+        env["SGLANG_INT4_WEIGHT"] = "1"
+        model_path = "/data/grok-1-W4A8KV8/"
+        tokenizer_path = "/data/Xenova/grok-1-tokenizer"
+        tp = 8
+        quant = "fp8"
+        extra_args = "--mem-fraction-static 0.5 --attention-backend aiter --kv-cache-dtype fp8_e4m3"
 
     elif model == "GROK1-FP8":
         env["RCCL_MSCCL_ENABLE"] = "0"
@@ -80,20 +91,29 @@ def main():
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_INT4_WEIGHT"] = "0"
         env["SGLANG_ROCM_DISABLE_LINEARQUANT"] = "1"
-        model_path = "/data2/grok-2/"
-        tokenizer_path = "/data2/grok-2/tokenizer.tok.json"
+        model_path = "/data/huggingface/hub/xai-org/grok-2"
+        tokenizer_path = "/data/huggingface/hub/xai-org/grok-2/tokenizer.tok.json"
         tp = 8
-        quant = "fp8"
+        quant = "mxfp4" #"fp8"
+        extra_args = "--page-size 16"
 
     elif model == "GROK2.8T":
         env["RCCL_MSCCL_ENABLE"] = "0"
-        env["SGLANG_USE_AITER"] = "0"
+        env["SGLANG_AITER_MLA_PERSIST"] = "1"
+        env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
         env["SGLANG_INT4_WEIGHT"] = "0"
-        model_path = "/dockerx/data/models/dummy_grok_2t/"
-        tokenizer_path = "/dockerx/data/grok-2/tokenizer.tok.json"
+        env["SGLANG_MOE_PADDING"] = "1"
+        env["SGLANG_ROCM_DISABLE_LINEARQUANT"] = "0"
+        env["SGLANG_ROCM_FUSED_DECODE_MLA"] = "1"
+        env["SGLANG_SET_CPU_AFFINITY"] = "1"
+        env["SGLANG_USE_AITER"] = "1"
+        env["SGLANG_USE_ROCM700A"] = "1"
+        model_path =     "/data/huggingface/hub/xai-org/dummy_grok_2t/"
+        tokenizer_path = "/data/huggingface/hub/alvarobartt/grok-2-tokenizer/"
         tp = 8
-        quant = "fp8"
-        extra_args = "--load-format dummy"
+        # quant = "fp8"
+        # --disable-custom-all-reduce 
+        extra_args = "--load-format dummy --mem-fraction-static 0.7"
 
     elif model == "LLAMA3.1-70B":
         env["RCCL_MSCCL_ENABLE"] = "1"
@@ -157,3 +177,13 @@ def main():
 if __name__ == "__main__":
     main()
 
+'''
+Usage:
+# KV cache FP8:
+python ~/SGLang-benchmarks/SERVER.py --model GROK1-INT4-KV_FP8
+python ~/SGLang-benchmarks/CLIENT.py --model GROK1-INT4-KV_FP8
+
+# KV cache Auto:
+python ~/SGLang-benchmarks/SERVER.py --model GROK1-INT4-KV_AUTO
+python ~/SGLang-benchmarks/CLIENT.py --model GROK1-INT4-KV_AUTO
+'''

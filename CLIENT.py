@@ -8,15 +8,17 @@ from datetime import datetime
 def main():
     # ---------- Parse arguments ----------
     parser = argparse.ArgumentParser(description="Run sglang benchmark for models.")
-    parser.add_argument("--model", type=str, choices=["GROK1-INT4", "GROK1-FP8", "GROK2"], required=True,
-                        help="Select which model to run: GROK1-INT4, GROK1-FP8 or GROK2.")
+    parser.add_argument("--model", type=str, choices=["GROK1-INT4-KV_AUTO", "GROK1-INT4-KV_FP8", "GROK1-INT4", "GROK1-FP8", "GROK2", "GROK2.8T"], required=True,
+                        help="Select which model to run: GROK1-INT4, GROK1-FP8, GROK2 or GROK2.8T.")
     args = parser.parse_args()
     model = args.model
 
     # ---------- Basic settings ----------
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    request_rates = [1, 2, 4, 8]
-    max_num_prompts_options = [2400]
+    request_rates = [1, 4]
+    max_num_prompts_options = [1200]
+    # request_rates = [16, 32, 64]
+    # max_num_prompts_options = [1200]
     completed_file = "completed_combinations.log"
 
     # Ensure the completed log file exists
@@ -48,7 +50,7 @@ def main():
                         f"--backend sglang --dataset-name random "
                         f"--random-input 8192 --random-output 1024 "
                         f"--num-prompts {num_prompts} "
-                        f"--tokenizer /data2/grok-2/tokenizer.tok.json "
+                        f"--tokenizer /data/huggingface/hub/xai-org/grok-2/tokenizer.tok.json "
                         f"--request-rate {rate} "
                         f"--output-file online-GROK2.jsonl"
                     )
@@ -62,8 +64,18 @@ def main():
                         f"--request-rate {rate} "
                         f"--output-file online-GROK1-FP8.jsonl"
                     )
+                elif model == "GROK2.8T":
+                    cmd = (
+                        f"python3 -m sglang.bench_serving "
+                        f"--backend sglang --dataset-name random "
+                        f"--random-input 1024 --random-output 1024 "
+                        f"--num-prompts {num_prompts} "
+                        f"--tokenizer /data/huggingface/hub/alvarobartt/grok-2-tokenizer/ "
+                        f"--request-rate {rate} "
+                        f"--output-file online-GROK2.8T.jsonl"
+                    )
 
-                else:  # GROK1
+                elif model == "GROK1-INT4-KV_AUTO" or model == "GROK1-INT4-KV_FP8":
                     cmd = (
                         f"python3 -m sglang.bench_serving "
                         f"--backend sglang --dataset-name random "
@@ -71,11 +83,12 @@ def main():
                         f"--num-prompts {num_prompts} "
                         f"--tokenizer /data/Xenova/grok-1-tokenizer/ "
                         f"--request-rate {rate} "
-                        f"--output-file online-GROK1.jsonl"
+                        f"--output-file online-{model}.jsonl"
                     )
 
                 # ---------- Execute the command ----------
                 with open(logfile, "a") as log:
+                    print(f"cmd=\n{cmd}")
                     log.write(f"Executing: {cmd}\n")
                     log.flush()
                     process = subprocess.Popen(cmd, shell=True, stdout=log, stderr=log)
