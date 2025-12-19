@@ -178,6 +178,8 @@ if __name__ == "__main__":
     main()
 
 '''
+Docker: lmsysorg/sglang:v0.5.6.post2-rocm700-mi35x
+
 Usage:
 # KV cache FP8:
 python ~/SGLang-benchmarks/SERVER.py --model GROK1-INT4-KV_FP8
