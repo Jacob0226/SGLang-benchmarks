@@ -60,7 +60,7 @@ def main():
                         f"--backend sglang --dataset-name random "
                         f"--random-input 1024 --random-output 1024 "
                         f"--num-prompts {num_prompts} "
-                        f"--tokenizer /data/Xenova/grok-1-tokenizer/ "
+                        f"--tokenizer /data/huggingface/hub/Xenova/grok-1-tokenizer "
                         f"--request-rate {rate} "
                         f"--output-file online-GROK1-FP8.jsonl"
                     )
@@ -81,7 +81,7 @@ def main():
                         f"--backend sglang --dataset-name random "
                         f"--random-input 1024 --random-output 1024 "
                         f"--num-prompts {num_prompts} "
-                        f"--tokenizer /data/Xenova/grok-1-tokenizer/ "
+                        f"--tokenizer /data/huggingface/hub/Xenova/grok-1-tokenizer "
                         f"--request-rate {rate} "
                         f"--output-file online-{model}.jsonl"
                     )
