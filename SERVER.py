@@ -60,8 +60,8 @@ def main():
         env["RCCL_MSCCL_ENABLE"] = "0"
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_INT4_WEIGHT"] = "1"
-        model_path = "/data/grok-1-W4A8KV8/"
-        tokenizer_path = "/data/Xenova/grok-1-tokenizer"
+        model_path = "/data/huggingface/hub/amd/grok-1-W4A8KV8/"
+        tokenizer_path = "/data/huggingface/hub/Xenova/grok-1-tokenizer"
         tp = 8
         quant = "fp8"
         extra_args = "--mem-fraction-static 0.5 --attention-backend aiter"
@@ -70,8 +70,8 @@ def main():
         env["RCCL_MSCCL_ENABLE"] = "0"
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_INT4_WEIGHT"] = "1"
-        model_path = "/data/grok-1-W4A8KV8/"
-        tokenizer_path = "/data/Xenova/grok-1-tokenizer"
+        model_path = "/data/huggingface/hub/amd/grok-1-W4A8KV8/"
+        tokenizer_path = "/data/huggingface/hub/Xenova/grok-1-tokenizer"
         tp = 8
         quant = "fp8"
         extra_args = "--mem-fraction-static 0.5 --attention-backend aiter --kv-cache-dtype fp8_e4m3"
@@ -80,8 +80,8 @@ def main():
         env["RCCL_MSCCL_ENABLE"] = "0"
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_INT4_WEIGHT"] = "0"
-        model_path = "/data/lmzheng-grok-1/"
-        tokenizer_path = "/data/Xenova/grok-1-tokenizer"
+        model_path = "/data/huggingface/hub/amd/grok-1-W4A8KV8/"
+        tokenizer_path = "/data/huggingface/hub/Xenova/grok-1-tokenizer"
         tp = 8
         quant = "fp8"
         extra_args = "--mem-fraction-static 0.5"
