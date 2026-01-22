@@ -38,17 +38,26 @@ PORT=30000
 URL="http://127.0.0.1:$PORT"
 CONFIGS=( 
 	# ilen olen concurrency 
-    "   128 128  1"  
-    "700000 200  2" 
+    "   200 200  1" 
+    "   200 200  8"
+    "   200 200  32"
+    "  2048 200  1" 
+    "  2048 200  8"
+    "  2048 200  32"
+    # "700000 200  1" 
+    # "700000 200  2" 
     # "700000 200  4"
     # "700000 200  8"
-    # "700000 200 16"       
+    # "700000 200 16"        
 )
 
 # --- Define LaunchServer Function ---
 LaunchServer() {
     echo "Starting SGLang server..."
-    export SGLANG_USE_AITER=1
+    if command -v rocminfo > /dev/null 2>&1 || [ -d "/opt/rocm" ]; then
+        echo "ROCm environment detected. Setting SGLANG_USE_AITER=1"
+        export SGLANG_USE_AITER=1
+    fi
     export RCCL_MSCCL_ENABLE=0 
     export SGLANG_INT4_WEIGHT=0 
     export PYTHONPATH=$PYTHONPATH:/opt/tilelang
@@ -74,10 +83,10 @@ LaunchServer() {
         --backend sglang \
         --model "$MODEL" \
         --dataset-name random \
-        --random-input 1024 \
-        --random-output 1024 \
+        --random-input 256 \
+        --random-output 256 \
         --random-range-ratio 1.0 \
-        --num-prompts 16 \
+        --num-prompts 8 \
         --max-concurrency 2
 }
 
@@ -91,7 +100,7 @@ for config in "${CONFIGS[@]}"; do
 	prompt=$((concurrency*8))
     
     # Prepare output folder
-    o_folder="$HOME/prof/i${ilen}-o${olen}-n${prompt}-concurrency${concurrency}"
+    o_folder="$HOME/prof/0122/i${ilen}-o${olen}-n${prompt}-concurrency${concurrency}"
     mkdir -p "$o_folder"
 
     
