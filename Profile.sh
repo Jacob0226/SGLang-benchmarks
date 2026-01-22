@@ -38,14 +38,14 @@ PORT=30000
 URL="http://127.0.0.1:$PORT"
 CONFIGS=( 
 	# ilen olen concurrency 
-    "   200 200  1" 
+    # "   200 200  1" 
     "   200 200  8"
     "   200 200  32"
     "  2048 200  1" 
     "  2048 200  8"
     "  2048 200  32"
-    # "700000 200  1" 
-    # "700000 200  2" 
+    "700000 200  1" 
+    "700000 200  2" 
     # "700000 200  4"
     # "700000 200  8"
     # "700000 200 16"        
@@ -54,18 +54,37 @@ CONFIGS=(
 # --- Define LaunchServer Function ---
 LaunchServer() {
     echo "Starting SGLang server..."
-    if command -v rocminfo > /dev/null 2>&1 || [ -d "/opt/rocm" ]; then
-        echo "ROCm environment detected. Setting SGLANG_USE_AITER=1"
-        export SGLANG_USE_AITER=1
-    fi
-    export RCCL_MSCCL_ENABLE=0 
     export SGLANG_INT4_WEIGHT=0 
-    export PYTHONPATH=$PYTHONPATH:/opt/tilelang
-    
+
     # Launch server in background
-    python3 -m sglang.launch_server --model "$MODEL" --attention-backend aiter --mem-fraction-static 0.7 \
-        --tp 8 --port $PORT --trust-remote-code  --disable-radix-cache --chunked-prefill-size 131072 \
-        --nsa-prefill-backend tilelang --nsa-decode-backend tilelang &
+    if command -v rocminfo > /dev/null 2>&1 || [ -d "/opt/rocm" ]; then
+        echo ">>> ROCm environment detected."
+        export RCCL_MSCCL_ENABLE=0 
+        export SGLANG_USE_AITER=1
+        export PYTHONPATH="${PYTHONPATH}:/opt/tilelang"
+        python3 -m sglang.launch_server \
+            --model "$MODEL" \
+            --mem-fraction-static 0.7 \
+            --tp 8 \
+            --port "$PORT" \
+            --trust-remote-code \
+            --disable-radix-cache \
+            --chunked-prefill-size 131072 \
+            --nsa-prefill-backend tilelang \
+            --nsa-decode-backend tilelang \
+            --attention-backend aiter 2>&1 | tee sglang_server.log &
+    else
+        echo ">>> NVIDIA environment detected."
+        # NVIDIA (B200/H100) 
+        python3 -m sglang.launch_server \
+            --model "$MODEL" \
+            --mem-fraction-static 0.8 \
+            --tp 8 \
+            --port "$PORT" \
+            --trust-remote-code \
+            --disable-radix-cache  2>&1 | tee sglang_server.log &
+            # --chunked-prefill-size 131072
+    fi
     
     SERVER_PID=$!
 
@@ -95,6 +114,7 @@ LaunchServer() {
 LaunchServer
 # --- Main Loop ---
 for config in "${CONFIGS[@]}"; do
+    
     # Read variables from the config string
     read -r ilen olen concurrency  <<< "$config"
 	prompt=$((concurrency*8))
@@ -138,21 +158,21 @@ for config in "${CONFIGS[@]}"; do
         # Give some time for the server to dump the trace files
         sleep 10
 
-        # --- Process TorchProfiler files ---
-        for file in "$o_folder"/*; do
-            if [[ "$file" == *.trace.json.gz ]]; then
-                # Get filename without the extension
-                base_name=$(basename "$file" .trace.json.gz)
-                python3 "$HOME/SGLang-benchmarks/parse_torch_profiler.py" \
-                    --file "$file" \
-                    --out "${o_folder}/${base_name}.csv"
-            fi
-        done
+        # # --- Process TorchProfiler files ---
+        # for file in "$o_folder"/*; do
+        #     if [[ "$file" == *.trace.json.gz ]]; then
+        #         # Get filename without the extension
+        #         base_name=$(basename "$file" .trace.json.gz)
+        #         python3 "$HOME/SGLang-benchmarks/parse_torch_profiler.py" \
+        #             --file "$file" \
+        #             --out "${o_folder}/${base_name}.csv"
+        #     fi
+        # done
     fi
 
 
 done
 
-# Kill the server to clean up for the next config
-kill $SERVER_PID
-sleep 10
+    # Kill the server to clean up for the next config
+    kill $SERVER_PID
+    sleep 10
