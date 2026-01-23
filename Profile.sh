@@ -1,12 +1,18 @@
 #!/bin/bash
 set -x
 
+# Usage:
+# ./Profile.sh --model /data/huggingface/hub/deepseek-ai/DeepSeek-V3.2-Exp --prof Torch_Profiler
+# ./Profile.sh --model /data/huggingface/hub/deepseek-ai/DeepSeek-V3.2-Exp
+
 # Disable NUMA balancing for better performance consistency on multi-socket systems
 echo 0 > /proc/sys/kernel/numa_balancing
 
 # --- Default Values ---
 MODEL=""
 PROF="None" # Default to benchmark only
+TAG=TEST
+
 
 # --- Parse Arguments ---
 while [[ $# -gt 0 ]]; do
@@ -32,24 +38,6 @@ if [ -z "$MODEL" ]; then
     echo "Error: Missing required argument --model"
     exit 1
 fi
-
-# --- Configuration ---
-PORT=30000
-URL="http://127.0.0.1:$PORT"
-CONFIGS=( 
-	# ilen olen concurrency 
-    # "   200 200  1" 
-    "   200 200  8"
-    "   200 200  32"
-    "  2048 200  1" 
-    "  2048 200  8"
-    "  2048 200  32"
-    "700000 200  1" 
-    "700000 200  2" 
-    # "700000 200  4"
-    # "700000 200  8"
-    # "700000 200 16"        
-)
 
 # --- Define LaunchServer Function ---
 LaunchServer() {
@@ -109,56 +97,73 @@ LaunchServer() {
         --max-concurrency 2
 }
 
+# --------------------------------Start --------------------------------------------
+# --- Configuration ---
+PORT=30000
+URL="http://127.0.0.1:$PORT"
+CONFIGS=( 
+    # ilen olen concurrency 
+    "   200 200  1" 
+    "   200 200  8"
+    "   200 200  32"
+    "  2048 200  1" 
+    "  2048 200  8"
+    "  2048 200  32"
+    "700000 200  1" 
+    "700000 200  2" 
+    # "700000 200  4"
+    # "700000 200  8"
+    # "700000 200 16"        
+)
+
+N_LOOOP=3
+WORK="bench"
+if [ "$PROF" == "Torch_Profiler" ]; then # if profiling, run only 1 time
+    N_LOOOP=1
+    WORK="prof"
+fi 
+
+prof_cmd=""
+if [ "$PROF" == "Torch_Profiler" ]; then
+    prof_cmd="--profile"
+    mkdir -p "$HOME/prof/${TAG}_${WORK}"
+    export SGLANG_TORCH_PROFILER_DIR=$HOME/prof/${TAG}_${WORK}
+fi
 
 # Start the server
 LaunchServer
+
 # --- Main Loop ---
 for config in "${CONFIGS[@]}"; do
     
     # Read variables from the config string
     read -r ilen olen concurrency  <<< "$config"
-	prompt=$((concurrency*8))
+    prompt=$((concurrency*8))
     
     # Prepare output folder
-    o_folder="$HOME/prof/0122/i${ilen}-o${olen}-n${prompt}-concurrency${concurrency}"
+    o_folder="$HOME/prof/${TAG}_${WORK}/i${ilen}-o${olen}-n${prompt}-concurrency${concurrency}"
     mkdir -p "$o_folder"
 
-    
-
-    # --- Start Profiling ---
-    if [ "$PROF" == "Torch_Profiler" ]; then
-        echo "Starting Torch Profiler..."
-        curl -X POST "http://localhost:$PORT/start_profile" \
-             -H "Content-Type: application/json" \
-             -d "{
-                \"output_dir\": \"$o_folder\", 
-                \"activities\": [\"CPU\", \"GPU\"],
-                \"merge_profiles\": false
-             }"
-    fi
-
     # --- Run Benchmark ---
-    python3 -m sglang.bench_serving \
-        --port $PORT \
-        --backend sglang \
-        --model "$MODEL" \
-        --dataset-name random \
-        --random-input "$ilen" \
-        --random-output "$olen" \
-        --random-range-ratio 1.0 \
-        --num-prompts "$prompt" \
-        --max-concurrency  "$concurrency " 2>&1 | tee "${o_folder}/bench.log"
+    # Fixed the Python-style loop to Bash-style
+    for (( i=1; i<=N_LOOOP; i++ )); do
+        python3 -m sglang.bench_serving \
+            --port $PORT \
+            --backend sglang \
+            --model "$MODEL" \
+            --dataset-name random \
+            --random-input "$ilen" \
+            --random-output "$olen" \
+            --random-range-ratio 1.0 \
+            --num-prompts "$prompt" \
+            --max-concurrency  "$concurrency" \
+            $prof_cmd 2>&1 | tee "${o_folder}/bench_${i}.log"
+    done
     
-    # --- Stop Profiling ---
+    # --- Process TorchProfiler files ---
     if [ "$PROF" == "Torch_Profiler" ]; then
-        echo "Stopping Torch Profiler..."
-        curl -X POST "http://localhost:$PORT/stop_profile" \
-             -H "Content-Type: application/json"
-        
-        # Give some time for the server to dump the trace files
-        sleep 10
-
-        # # --- Process TorchProfiler files ---
+        mv $SGLANG_TORCH_PROFILER_DIR/*.gz $o_folder/
+        echo "Process TorchProfiler files"
         # for file in "$o_folder"/*; do
         #     if [[ "$file" == *.trace.json.gz ]]; then
         #         # Get filename without the extension
@@ -170,9 +175,8 @@ for config in "${CONFIGS[@]}"; do
         # done
     fi
 
-
 done
 
-    # Kill the server to clean up for the next config
-    kill $SERVER_PID
-    sleep 10
+# Kill the server to clean up for the next config
+pkill -9 python
+sleep 10
