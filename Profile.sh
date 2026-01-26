@@ -11,7 +11,7 @@ echo 0 > /proc/sys/kernel/numa_balancing
 # --- Default Values ---
 MODEL=""
 PROF="None" # Default to benchmark only
-TAG=TEST
+TAG=0126
 
 
 # --- Parse Arguments ---
@@ -42,7 +42,6 @@ fi
 # --- Define LaunchServer Function ---
 LaunchServer() {
     echo "Starting SGLang server..."
-    export SGLANG_INT4_WEIGHT=0 
 
     # Launch server in background
     if command -v rocminfo > /dev/null 2>&1 || [ -d "/opt/rocm" ]; then
@@ -66,7 +65,7 @@ LaunchServer() {
         # NVIDIA (B200/H100) 
         python3 -m sglang.launch_server \
             --model "$MODEL" \
-            --mem-fraction-static 0.8 \
+            --mem-fraction-static 0.7 \
             --tp 8 \
             --port "$PORT" \
             --trust-remote-code \
@@ -103,14 +102,28 @@ PORT=30000
 URL="http://127.0.0.1:$PORT"
 CONFIGS=( 
     # ilen olen concurrency 
-    "   200 200  1" 
-    "   200 200  8"
-    "   200 200  32"
-    "  2048 200  1" 
-    "  2048 200  8"
-    "  2048 200  32"
-    "700000 200  1" 
-    "700000 200  2" 
+    " 8000 1000 1"
+    " 8000 1000 2"
+    " 8000 1000 4"
+    " 8000 1000 8"
+
+    " 1000 1000 1"
+    " 1000 1000 2"
+    " 1000 1000 4"
+    " 1000 1000 8"
+
+    " 1000 8000 1"
+    " 1000 8000 2"
+    " 1000 8000 4"
+    " 1000 8000 8"
+    # "   200 200  1" 
+    # "   200 200  8"
+    # "   200 200  32"
+    # "  2048 200  1" 
+    # "  2048 200  8"
+    # "  2048 200  32"
+    # "700000 200  1" 
+    # "700000 200  2" 
     # "700000 200  4"
     # "700000 200  8"
     # "700000 200 16"        
@@ -123,10 +136,12 @@ if [ "$PROF" == "Torch_Profiler" ]; then # if profiling, run only 1 time
     WORK="prof"
 fi 
 
+ROOT_FOLDER="$HOME/prof/${TAG}_${WORK}"
+FINISH_LOG="$ROOT_FOLDER/Finish.log"
 prof_cmd=""
 if [ "$PROF" == "Torch_Profiler" ]; then
     prof_cmd="--profile"
-    mkdir -p "$HOME/prof/${TAG}_${WORK}"
+    mkdir -p "$ROOT_FOLDER"
     export SGLANG_TORCH_PROFILER_DIR=$HOME/prof/${TAG}_${WORK}
 fi
 
@@ -141,23 +156,33 @@ for config in "${CONFIGS[@]}"; do
     prompt=$((concurrency*8))
     
     # Prepare output folder
-    o_folder="$HOME/prof/${TAG}_${WORK}/i${ilen}-o${olen}-n${prompt}-concurrency${concurrency}"
+    o_folder="$ROOT_FOLDER/i${ilen}-o${olen}-n${prompt}-concurrency${concurrency}"
     mkdir -p "$o_folder"
 
     # --- Run Benchmark ---
     # Fixed the Python-style loop to Bash-style
     for (( i=1; i<=N_LOOOP; i++ )); do
-        python3 -m sglang.bench_serving \
-            --port $PORT \
-            --backend sglang \
-            --model "$MODEL" \
-            --dataset-name random \
-            --random-input "$ilen" \
-            --random-output "$olen" \
-            --random-range-ratio 1.0 \
-            --num-prompts "$prompt" \
-            --max-concurrency  "$concurrency" \
-            $prof_cmd 2>&1 | tee "${o_folder}/bench_${i}.log"
+        LOG_FILE="${o_folder}/bench_${i}.log"
+        
+        # Check if already benchmarked
+        if ! grep -q "$LOG_FILE" "$FINISH_LOG"; then
+            echo "Running: $LOG_FILE"
+            python3 -m sglang.bench_serving \
+                --port $PORT \
+                --backend sglang \
+                --model "$MODEL" \
+                --dataset-name random \
+                --random-input "$ilen" \
+                --random-output "$olen" \
+                --random-range-ratio 1.0 \
+                --num-prompts "$prompt" \
+                --max-concurrency "$concurrency" \
+                $prof_cmd 2>&1 | tee "$LOG_FILE"
+            
+            echo "$LOG_FILE" >> "$FINISH_LOG"
+        else
+            echo "Found $LOG_FILE in ${FINISH_LOG}. Skipping."
+        fi
     done
     
     # --- Process TorchProfiler files ---
