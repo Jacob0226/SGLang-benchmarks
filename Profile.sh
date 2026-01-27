@@ -96,6 +96,13 @@ LaunchServer() {
         --max-concurrency 2
 }
 
+parse_config() {
+    local config="$1"
+    read -r ilen olen concurrency <<< "$config"
+    prompt=$((concurrency * 8))
+    o_folder="$ROOT_FOLDER/i${ilen}-o${olen}-n${prompt}-concurrency${concurrency}"
+}
+
 # --------------------------------Start --------------------------------------------
 # --- Configuration ---
 PORT=30000
@@ -112,10 +119,6 @@ CONFIGS=(
     " 1000 1000 4"
     " 1000 1000 8"
 
-    " 1000 8000 1"
-    " 1000 8000 2"
-    " 1000 8000 4"
-    " 1000 8000 8"
     # "   200 200  1" 
     # "   200 200  8"
     # "   200 200  32"
@@ -146,17 +149,12 @@ if [ "$PROF" == "Torch_Profiler" ]; then
 fi
 
 # Start the server
-LaunchServer
+# LaunchServer
 
 # --- Main Loop ---
 for config in "${CONFIGS[@]}"; do
-    
     # Read variables from the config string
-    read -r ilen olen concurrency  <<< "$config"
-    prompt=$((concurrency*8))
-    
-    # Prepare output folder
-    o_folder="$ROOT_FOLDER/i${ilen}-o${olen}-n${prompt}-concurrency${concurrency}"
+    parse_config "$config"
     mkdir -p "$o_folder"
 
     # --- Run Benchmark ---
@@ -184,24 +182,33 @@ for config in "${CONFIGS[@]}"; do
             echo "Found $LOG_FILE in ${FINISH_LOG}. Skipping."
         fi
     done
-    
-    # --- Process TorchProfiler files ---
+done
+
+# Kill the server
+pkill -9 python
+sleep 10
+
+
+# --- Process TorchProfiler files ---
+for config in "${CONFIGS[@]}"; do
+    parse_config "$config"
     if [ "$PROF" == "Torch_Profiler" ]; then
         mv $SGLANG_TORCH_PROFILER_DIR/*.gz $o_folder/
         echo "Process TorchProfiler files"
-        # for file in "$o_folder"/*; do
-        #     if [[ "$file" == *.trace.json.gz ]]; then
-        #         # Get filename without the extension
-        #         base_name=$(basename "$file" .trace.json.gz)
-        #         python3 "$HOME/SGLang-benchmarks/parse_torch_profiler.py" \
-        #             --file "$file" \
-        #             --out "${o_folder}/${base_name}.csv"
-        #     fi
-        # done
+        for file in "$o_folder"/*; do
+            if [[ "$file" == *.trace.json.gz ]]; then
+                # Get filename without the extension
+                base_name=$(basename "$file" .trace.json.gz)
+                output_csv=${o_folder}/${base_name}.csv
+                if [ ! -f "$output_csv" ]; then
+                    echo "Parsing: $file"
+                    time python3 "$HOME/SGLang-benchmarks/parse_torch_profiler.py" \
+                        --file "$file" \
+                        --out "$output_csv"
+                else
+                    echo "Skipping: $output_csv already exists."
+                fi
+            fi
+        done
     fi
-
 done
-
-# Kill the server to clean up for the next config
-pkill -9 python
-sleep 10
