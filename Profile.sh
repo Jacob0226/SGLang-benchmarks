@@ -11,7 +11,7 @@ echo 0 > /proc/sys/kernel/numa_balancing
 # --- Default Values ---
 MODEL=""
 PROF="None" # Default to benchmark only
-TAG=0126
+TAG=test
 
 
 # --- Parse Arguments ---
@@ -69,7 +69,8 @@ LaunchServer() {
             --tp 8 \
             --port "$PORT" \
             --trust-remote-code \
-            --disable-radix-cache  2>&1 | tee sglang_server.log &
+            --disable-radix-cache  \
+            --dp 8 --enable-dp-attention 2>&1 | tee sglang_server.log &
             # --chunked-prefill-size 131072
     fi
     
@@ -149,7 +150,7 @@ if [ "$PROF" == "Torch_Profiler" ]; then
 fi
 
 # Start the server
-# LaunchServer
+LaunchServer
 
 # --- Main Loop ---
 for config in "${CONFIGS[@]}"; do
@@ -181,6 +182,25 @@ for config in "${CONFIGS[@]}"; do
         else
             echo "Found $LOG_FILE in ${FINISH_LOG}. Skipping."
         fi
+
+        # --- Move and Rename TorchProfiler files ---
+        if [ "$PROF" == "Torch_Profiler" ]; then
+            folder_name=$(basename "$o_folder")
+            for file in "$SGLANG_TORCH_PROFILER_DIR"/*.gz; do
+                [ -e "$file" ] || continue  
+
+                # Get string "TP-X" from filename
+                # E.g., 1769417917.7469258-TP-0.trace.json.gz --> Keep TP-0.trace.json.gz
+                filename=$(basename "$file")
+                suffix="TP-${filename##*-TP-}"
+                
+                # Rename： folder_name-TP-X.trace.json.gz
+                new_name="${folder_name}-${suffix}"
+                
+                mv "$file" "$o_folder/$new_name"
+                echo "Renamed: $(basename "$file") -> $new_name"
+            done
+        fi
     done
 done
 
@@ -190,10 +210,9 @@ sleep 10
 
 
 # --- Process TorchProfiler files ---
-for config in "${CONFIGS[@]}"; do
-    parse_config "$config"
-    if [ "$PROF" == "Torch_Profiler" ]; then
-        mv $SGLANG_TORCH_PROFILER_DIR/*.gz $o_folder/
+if [ "$PROF" == "Torch_Profiler" ]; then
+    for config in "${CONFIGS[@]}"; do
+        parse_config "$config"
         echo "Process TorchProfiler files"
         for file in "$o_folder"/*; do
             if [[ "$file" == *.trace.json.gz ]]; then
@@ -210,5 +229,5 @@ for config in "${CONFIGS[@]}"; do
                 fi
             fi
         done
-    fi
-done
+    done
+fi
