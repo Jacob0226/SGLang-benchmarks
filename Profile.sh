@@ -7,11 +7,12 @@ set -x
 
 # Disable NUMA balancing for better performance consistency on multi-socket systems
 echo 0 > /proc/sys/kernel/numa_balancing
+pip install ijson
 
 # --- Default Values ---
 MODEL=""
 PROF="None" # Default to benchmark only
-TAG=test
+TAG=0128_NsaBackend_Rename
 
 
 # --- Parse Arguments ---
@@ -47,7 +48,6 @@ LaunchServer() {
     if command -v rocminfo > /dev/null 2>&1 || [ -d "/opt/rocm" ]; then
         echo ">>> ROCm environment detected."
         export RCCL_MSCCL_ENABLE=0 
-        export SGLANG_USE_AITER=1
         export PYTHONPATH="${PYTHONPATH}:/opt/tilelang"
         python3 -m sglang.launch_server \
             --model "$MODEL" \
@@ -58,20 +58,31 @@ LaunchServer() {
             --disable-radix-cache \
             --chunked-prefill-size 131072 \
             --nsa-prefill-backend tilelang \
-            --nsa-decode-backend tilelang \
-            --attention-backend aiter 2>&1 | tee sglang_server.log &
+            --nsa-decode-backend tilelang 2>&1 | tee $ROOT_FOLDER/sglang_server.log &
+            # Do we really need --chunked-prefill-size ?
     else
         echo ">>> NVIDIA environment detected."
         # NVIDIA (B200/H100) 
+        # From: https://lmsys.org/blog/2025-09-29-deepseek-V32/
+        # python3 -m sglang.launch_server \
+        #     --model "$MODEL" \
+        #     --mem-fraction-static 0.7 \
+        #     --tp 8 \
+        #     --port "$PORT" \
+        #     --trust-remote-code \
+        #     --disable-radix-cache  \
+        #     --dp 8 --enable-dp-attention 2>&1 | tee $ROOT_FOLDER/sglang_server.log &
+        
+        # For long context. From: https://docs.sglang.io/basic_usage/deepseek_v32.html#in-sequence-splitting-default-setting
         python3 -m sglang.launch_server \
             --model "$MODEL" \
-            --mem-fraction-static 0.7 \
             --tp 8 \
-            --port "$PORT" \
-            --trust-remote-code \
-            --disable-radix-cache  \
-            --dp 8 --enable-dp-attention 2>&1 | tee sglang_server.log &
-            # --chunked-prefill-size 131072
+            --ep 8 \
+            --dp 2 \
+            --enable-dp-attention \
+            --enable-nsa-prefill-context-parallel \
+            --nsa-prefill-cp-mode in-seq-split \
+            --max-running-requests 32 2>&1 | tee $ROOT_FOLDER/sglang_server.log &
     fi
     
     SERVER_PID=$!
@@ -94,7 +105,12 @@ LaunchServer() {
         --random-output 256 \
         --random-range-ratio 1.0 \
         --num-prompts 8 \
-        --max-concurrency 2
+        --max-concurrency 8
+
+    # --- Accuracy Check ---
+    echo -e "Accuracy check"
+    python3  /sgl-workspace/sglang/benchmark/gsm8k/bench_sglang.py \
+        --num-questions 1319 --port 30000 --parallel 200 2>&1 | tee $ROOT_FOLDER/Accuracy.log
 }
 
 parse_config() {
@@ -142,11 +158,11 @@ fi
 
 ROOT_FOLDER="$HOME/prof/${TAG}_${WORK}"
 FINISH_LOG="$ROOT_FOLDER/Finish.log"
+mkdir -p "$ROOT_FOLDER"
 prof_cmd=""
 if [ "$PROF" == "Torch_Profiler" ]; then
     prof_cmd="--profile"
-    mkdir -p "$ROOT_FOLDER"
-    export SGLANG_TORCH_PROFILER_DIR=$HOME/prof/${TAG}_${WORK}
+    export SGLANG_TORCH_PROFILER_DIR=$ROOT_FOLDER
 fi
 
 # Start the server
