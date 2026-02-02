@@ -48,41 +48,60 @@ LaunchServer() {
     if command -v rocminfo > /dev/null 2>&1 || [ -d "/opt/rocm" ]; then
         echo ">>> ROCm environment detected."
         export RCCL_MSCCL_ENABLE=0 
-        export PYTHONPATH="${PYTHONPATH}:/opt/tilelang"
-        python3 -m sglang.launch_server \
+        export PYTHONPATH="${PYTHONPATH}:/opt/tilelang"        
+        CMD="python3 -m sglang.launch_server \
+                --model $MODEL \
+                --mem-fraction-static 0.7 \
+                --tp 8 \
+                --port $PORT \
+                --trust-remote-code \
+                --disable-radix-cache \
+                --chunked-prefill-size 131072 \
+                --nsa-prefill-backend tilelang \
+                --nsa-decode-backend tilelang"
+
+        echo "Server cmd: $CMD" | tee $ROOT_FOLDER/sglang_server.log
+        $CMD 2>&1 | tee -a $ROOT_FOLDER/sglang_server.log &
+
+    else
+        echo ">>> NVIDIA environment detected."
+        # NVIDIA (B200/H100) 
+        # From: https://lmsys.org/blog/2025-09-29-deepseek-V32/
+    else
+        echo ">>> NVIDIA environment detected."
+        # NVIDIA (B200/H100) 
+        CMD="python3 -m sglang.launch_server \
             --model "$MODEL" \
             --mem-fraction-static 0.7 \
             --tp 8 \
             --port "$PORT" \
             --trust-remote-code \
-            --disable-radix-cache \
-            --chunked-prefill-size 131072 \
-            --nsa-prefill-backend tilelang \
-            --nsa-decode-backend tilelang 2>&1 | tee $ROOT_FOLDER/sglang_server.log &
-            # Do we really need --chunked-prefill-size ?
-    else
-        echo ">>> NVIDIA environment detected."
-        # NVIDIA (B200/H100) 
+            --disable-radix-cache"
+
+        # DP8
         # From: https://lmsys.org/blog/2025-09-29-deepseek-V32/
-        # python3 -m sglang.launch_server \
+        # CMD="python3 -m sglang.launch_server \
         #     --model "$MODEL" \
         #     --mem-fraction-static 0.7 \
         #     --tp 8 \
         #     --port "$PORT" \
         #     --trust-remote-code \
         #     --disable-radix-cache  \
-        #     --dp 8 --enable-dp-attention 2>&1 | tee $ROOT_FOLDER/sglang_server.log &
+        #     --dp 8 --enable-dp-attention"
         
         # For long context. From: https://docs.sglang.io/basic_usage/deepseek_v32.html#in-sequence-splitting-default-setting
-        python3 -m sglang.launch_server \
-            --model "$MODEL" \
-            --tp 8 \
-            --ep 8 \
-            --dp 2 \
-            --enable-dp-attention \
-            --enable-nsa-prefill-context-parallel \
-            --nsa-prefill-cp-mode in-seq-split \
-            --max-running-requests 32 2>&1 | tee $ROOT_FOLDER/sglang_server.log &
+        # CMD="python3 -m sglang.launch_server \
+        #     --model "$MODEL" \
+        #     --tp 8 \
+        #     --ep 8 \
+        #     --dp 2 \
+        #     --enable-dp-attention \
+        #     --enable-nsa-prefill-context-parallel \
+        #     --nsa-prefill-cp-mode in-seq-split \
+        #     --max-running-requests 32"
+
+        echo "Server cmd: $CMD" | tee $ROOT_FOLDER/sglang_server.log
+        $CMD 2>&1 | tee -a $ROOT_FOLDER/sglang_server.log &
     fi
     
     SERVER_PID=$!
@@ -110,7 +129,7 @@ LaunchServer() {
     # --- Accuracy Check ---
     echo -e "Accuracy check"
     python3  /sgl-workspace/sglang/benchmark/gsm8k/bench_sglang.py \
-        --num-questions 1319 --port 30000 --parallel 200 2>&1 | tee $ROOT_FOLDER/Accuracy.log
+        --num-questions 200 --port 30000 --parallel 200 2>&1 | tee $ROOT_FOLDER/Accuracy.log
 }
 
 parse_config() {
@@ -126,15 +145,15 @@ PORT=30000
 URL="http://127.0.0.1:$PORT"
 CONFIGS=( 
     # ilen olen concurrency 
-    " 8000 1000 1"
-    " 8000 1000 2"
-    " 8000 1000 4"
-    " 8000 1000 8"
+    # " 8000 1000 1"
+    # " 8000 1000 2"
+    # " 8000 1000 4"
+    # " 8000 1000 8"
 
-    " 1000 1000 1"
-    " 1000 1000 2"
-    " 1000 1000 4"
-    " 1000 1000 8"
+    # " 1000 1000 1"
+    # " 1000 1000 2"
+    # " 1000 1000 4"
+    # " 1000 1000 8"
 
     # "   200 200  1" 
     # "   200 200  8"
@@ -161,7 +180,7 @@ FINISH_LOG="$ROOT_FOLDER/Finish.log"
 mkdir -p "$ROOT_FOLDER"
 prof_cmd=""
 if [ "$PROF" == "Torch_Profiler" ]; then
-    prof_cmd="--profile"
+    prof_cmd="--profile --profile-num-steps 400 --profile-by-stage"
     export SGLANG_TORCH_PROFILER_DIR=$ROOT_FOLDER
 fi
 
