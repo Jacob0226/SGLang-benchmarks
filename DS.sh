@@ -6,9 +6,18 @@
 # ./DS.sh --model /data/huggingface/hub/amd/DeepSeek-R1-MXFP4 --mtp
 # ./DS.sh --model /data/huggingface/hub/deepseek-ai/DeepSeek-V3.2-Exp # --prof
 set -euo pipefail
+set -x
+
+pip install ijson
+if ! command -v zip &> /dev/null; then
+    echo "Zip is not installed. Updating and installing..."
+    apt update && apt install -y zip
+fi
 
 # ===================== Argument  =====================
-ROOT_FOLDER="results/henryx-xsgl:v0.5.8-rocm720-mi35x-20260202-preview-aiter-0e0a37"
+DOCKER="henryx/xsgl:sgl-a6f53cc-rocm720-mi35x-20260203-aiter-f252f19"
+DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
+ROOT_FOLDER="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME"           
 FINISH_LOG="$ROOT_FOLDER/Finish.log"
 TASKS=(
     "/data/huggingface/hub/deepseek-ai/DeepSeek-R1|false"
@@ -19,7 +28,7 @@ TASKS=(
 PROF_ENABLED="false"
 MTP_ENABLED="false"
 MTP_LOG_NAME=""
-prof_cmd="--profile --profile-num-steps 400 --profile-by-stage"
+prof_cmd="--profile " # --profile-num-steps 400 --profile-by-stage"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -61,6 +70,7 @@ output_tokens=200
 random_range_ratio=1.0
 
 concurrencies=(1 2 4 8 16)
+concurrencies=(4)
 # CHUNKED_PREFILL_SIZE_VALUES=(131072) 
 
 # ===================== Functions =====================
@@ -217,7 +227,7 @@ start_server() {
             --num-questions 200 --port "$PORT" --parallel 200 2>&1 | tee "$LOG_DIR/Accuracy.log"
         echo "$LOG_DIR/Accuracy.log" >> "$FINISH_LOG"
     else
-        echo "Found $LOG_DIR/Accuracy.log in ${FINISH_LOG}. Skipping."
+        echo "Found Accuracy.log in ${FINISH_LOG}. Skipping."
     fi
 }
 
@@ -292,7 +302,7 @@ for task in "${FINAL_TASKS[@]}"; do
     mkdir -p "$LOG_DIR"
 
     if [ "$PROF_ENABLED" == "true" ]; then
-        export SGLANG_TORCH_PROFILER_DIR=$ROOT_FOLDER
+        export SGLANG_TORCH_PROFILER_DIR=$LOG_DIR
     fi
 
     echo ">>> Log Directory: ${LOG_DIR}"
@@ -301,29 +311,44 @@ for task in "${FINAL_TASKS[@]}"; do
     start_server
     run_benchmarks
 
+    # Benchamrk mode: parsing benchmark logs
+    if [ "$PROF_ENABLED" == "false" ]; then
+        python ~/SGLang-benchmarks/parse_perf_metrics_to_csv.py \
+            --input_dir $LOG_DIR \
+            --output $LOG_DIR/${MODEL_NAME}${MTP_TAG}.csv
+    fi
+
     # stop_server
     echo ">>> All configurations completed. Logs: ${LOG_DIR}. Stop server..."
     pkill -9 python || true
     sleep 10
 done
 
+# Benchamrk mode: zip all csv
+if [ "$PROF_ENABLED" == "false" ]; then
+    ZIP_NAME=$(basename "${ROOT_FOLDER%/}")
+    FULL_ZIP_PATH="${ROOT_FOLDER}/${ZIP_NAME}.zip"
+    zip -j "$FULL_ZIP_PATH" "${ROOT_FOLDER%/}"/**/*.csv
+fi
+
+
 
 # ===================== Profiler parsing =====================
-echo ">>> Starting recursive post-processing of profiler traces..."
-find "$ROOT_FOLDER" -type f -name "*.gz" | while read -r file; do
-    # get file name (E.g., /A/B/C/123.gz --> /A/B/C/123)
-    base_path="${file%.gz}"
+# echo ">>> Starting recursive post-processing of profiler traces..."
+# find "$ROOT_FOLDER" -type f -name "*.gz" | while read -r file; do
+#     # get file name (E.g., /A/B/C/123.gz --> /A/B/C/123)
+#     base_path="${file%.gz}"
     
-    # define csv filename
-    output_csv="${base_path}.csv"
+#     # define csv filename
+#     output_csv="${base_path}.csv"
     
-    echo "Processing: $file"
-    echo "Output to: $output_csv"
+#     echo "Processing: $file"
+#     echo "Output to: $output_csv"
     
-    # Parsing
-    python3 "$HOME/SGLang-benchmarks/parse_torch_profiler.py" \
-        --file "$file" \
-        --out "$output_csv"
-done
+#     # Parsing
+#     python3 "$HOME/SGLang-benchmarks/parse_torch_profiler.py" \
+#         --file "$file" \
+#         --out "$output_csv"
+# done
 
 echo ">>> All post-processing completed."
