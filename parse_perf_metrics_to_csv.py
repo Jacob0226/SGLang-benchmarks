@@ -7,8 +7,8 @@ START_MARK = "============ Serving Benchmark Result ============"
 END_MARK = "=================================================="
 
 kv_pattern = re.compile(r"^(.*?):\s+(.*)$")
-# 用來提取檔名中 conc_ 後面數字的正則
-conc_pattern = re.compile(r"conc_(\+?\d+)")
+# 支援檔名格式：bench_in1000_out1000_conc1.log / bench_in1000_out1000_conc_1.log
+meta_pattern = re.compile(r"in(\d+)_out(\d+)_conc_?(\d+)")
 
 def convert_value(v: str):
     v = v.strip()
@@ -36,6 +36,10 @@ def parse_log(log_path: Path):
                 if END_MARK in line and in_block:
                     # 將來源檔名也存進去，方便追蹤
                     current["source_file"] = log_path.name
+                    input_len, output_len, concurrency = get_bench_meta(log_path)
+                    current["input_len"] = input_len
+                    current["output_len"] = output_len
+                    current["concurrency"] = concurrency
                     records.append(current)
                     current = None
                     in_block = False
@@ -53,22 +57,24 @@ def parse_log(log_path: Path):
         print(f"Error reading {log_path}: {e}")
     return records, column_order
 
-def get_conc_number(path: Path):
-    """從檔名提取 conc_X 的數字，找不到則回傳 0"""
-    match = conc_pattern.search(path.name)
-    return int(match.group(1)) if match else 0
+def get_bench_meta(path: Path):
+    """從檔名提取 input_len/output_len/concurrency，找不到則回傳 0。"""
+    match = meta_pattern.search(path.name)
+    if not match:
+        return 0, 0, 0
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 def write_csv(records, column_order, output_csv):
     if not records:
         print("No records found to write.")
         return
     
-    # 確保 source_file 出現在 CSV 的第一欄
-    if "source_file" not in column_order:
-        column_order.insert(0, "source_file")
+    # 固定把 metadata 欄位放在 CSV 最前面
+    front_columns = ["input_len", "output_len", "concurrency", "source_file"]
+    ordered_columns = front_columns + [c for c in column_order if c not in front_columns]
 
     with open(output_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=column_order)
+        writer = csv.DictWriter(f, fieldnames=ordered_columns)
         writer.writeheader()
         for r in records:
             writer.writerow(r)
@@ -89,15 +95,15 @@ def main():
         and "Accuracy" not in f.name
     ]
 
-    # 2. 依照 conc_XXX 的數字進行「數值排序」
-    log_files.sort(key=get_conc_number)
+    # 2. 依照 input_len -> output_len -> concurrency 進行數值排序
+    log_files.sort(key=get_bench_meta)
 
     all_records = []
     master_column_order = ["source_file"]
 
     # 3. 依序讀取
     for log_file in log_files:
-        print(f"Processing ({get_conc_number(log_file)}): {log_file.name}")
+        print(f"Processing ({get_bench_meta(log_file)[2]}): {log_file.name}")
         records, column_order = parse_log(log_file)
         all_records.extend(records)
         for col in column_order:
