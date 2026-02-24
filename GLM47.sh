@@ -9,7 +9,6 @@ set -x
 MTP_ENABLED="false"
 PROF_ENABLED="false"
 MTP_TAG=""
-ACTION_TAG=""
 MODEL_PATH="/data/huggingface/hub/zai-org/GLM-4.7"
 MODEL_NAME=$(basename "${MODEL_PATH%/}")
 CURRENT_DIR=$(pwd)
@@ -40,14 +39,20 @@ random_range_ratio=1.0
 concurrencies=(1 2 4 8 16)
 
 # ===================== Argument  =====================
-DOCKER="henryx/xsgl:v0.5.8-rocm720-mi35x-20260202-preview-aiter-0e0a37"
-SPECIAL_TAG=""
+DOCKER="rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260222"
+SPECIAL_TAG="-bench"
+if [ "$PROF_ENABLED" == "true" ]; then
+    SPECIAL_TAG="-prof"
+fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
 LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}${MTP_TAG}${SPECIAL_TAG}"
 FINISH_LOG="$LOG_DIR/Finish.log"
 PROF_CMD="--profile"
 mkdir -p "$LOG_DIR"
 touch "$FINISH_LOG"
+if [ "$PROF_ENABLED" == "true" ]; then
+    export SGLANG_TORCH_PROFILER_DIR=$LOG_DIR
+fi
 
 log_command() {
     local logfile=$1
@@ -171,6 +176,7 @@ run_benchmarks() {
                 echo "Found $logfile in ${FINISH_LOG}. Skipping."
             fi
 
+
             # --- Move and Rename TorchProfiler files ---
             if [ "$PROF_ENABLED" == "true" ]; then
                 echo ">>> Processing profiler traces..."
@@ -196,7 +202,8 @@ accuracy_test
 run_benchmarks
 
 
-
+pkill -9 python || true
+sleep 10
 
 
 
