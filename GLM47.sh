@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Usage:
-# ./GLM47.sh
-# ./GLM47.sh --mtp
-# ./GLM47.sh --prof
+# ./GLM.sh
+# ./GLM.sh --mtp
+# ./GLM.sh --prof
+# ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-5
+# ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-4.7 --mtp --prof
 set -euo pipefail
 set -x
 ulimit -n 65535
@@ -10,8 +12,7 @@ ulimit -n 65535
 MTP_ENABLED="false"
 PROF_ENABLED="false"
 MTP_TAG=""
-MODEL_PATH="/data/huggingface/hub/zai-org/GLM-5"
-MODEL_NAME=$(basename "${MODEL_PATH%/}")
+MODEL_PATH="/data/huggingface/hub/zai-org/GLM-4.7"
 CURRENT_DIR=$(pwd)
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -24,12 +25,17 @@ while [[ $# -gt 0 ]]; do
         PROF_ENABLED="true"
         shift 1
         ;;
+    --model)
+        MODEL_PATH="$2"
+        shift 2
+        ;;
     *)
       echo "Unknown option: $1"
       exit 1
       ;;
   esac
 done
+MODEL_NAME=$(basename "${MODEL_PATH%/}")
 
 # ===================== Server and Benchmark Setting =====================
 HOST="localhost"
@@ -127,6 +133,13 @@ start_server() {
             --disable-radix-cache
             --watchdog-timeout 1200
     )
+
+    if [ "${MODEL_NAME}" == "GLM-5" ]; then
+        cmd+=(
+            --nsa-prefill-backend tilelang
+            --nsa-decode-backend tilelang
+        )
+    fi
 
     if [ "$MTP_ENABLED" == "true" ]; then
         # ROCm GPU (MI355X) currently only support triton backend in speculative decoding
