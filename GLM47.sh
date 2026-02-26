@@ -5,11 +5,12 @@
 # ./GLM47.sh --prof
 set -euo pipefail
 set -x
+ulimit -n 65535
 
 MTP_ENABLED="false"
 PROF_ENABLED="false"
 MTP_TAG=""
-MODEL_PATH="/data/huggingface/hub/zai-org/GLM-4.7"
+MODEL_PATH="/data/huggingface/hub/zai-org/GLM-5"
 MODEL_NAME=$(basename "${MODEL_PATH%/}")
 CURRENT_DIR=$(pwd)
 while [[ $# -gt 0 ]]; do
@@ -36,7 +37,8 @@ PORT="8552"
 DATASET="random"
 in_out_tokens=("1000:1000" "8000:1000")
 random_range_ratio=1.0
-concurrencies=(1 2 4 8 16)
+concurrencies=(4 8 16 32 64)
+PROMPT_MULTIPLIER=8
 
 # ===================== Argument  =====================
 DOCKER="rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260222"
@@ -67,6 +69,49 @@ log_command() {
     "$@" 2>&1 | tee -a "$logfile"
 }
 
+list_profiler_dirs() {
+    find "${LOG_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | grep -E '^[0-9]+(\.[0-9]+)?$' || true
+}
+
+rename_profiler_artifacts() {
+    local input_tokens=$1
+    local output_tokens=$2
+    local c=$3
+    local before_dirs=$4
+    local after_dirs=$5
+    local target_dir_name="prof_in${input_tokens}_out${output_tokens}_conc${c}"
+    local target_dir_path="${LOG_DIR}/${target_dir_name}"
+    local new_dirs
+
+    new_dirs=$(comm -13 <(printf '%s\n' "${before_dirs}" | sort) <(printf '%s\n' "${after_dirs}" | sort))
+    if [ -z "${new_dirs}" ]; then
+        echo "No new profiler directory found under ${LOG_DIR}"
+        return 0
+    fi
+
+    local src_dir src_dir_path
+    src_dir=$(printf '%s\n' "${new_dirs}" | tail -n 1)
+    src_dir_path="${LOG_DIR}/${src_dir}"
+    if [ "${src_dir}" != "${target_dir_name}" ]; then
+        if [ -e "${target_dir_path}" ]; then
+            target_dir_path="${LOG_DIR}/${target_dir_name}_$(date +%s)"
+            echo "Target directory exists. Using ${target_dir_path}"
+        fi
+        mv "${src_dir_path}" "${target_dir_path}"
+        echo "Renamed profiler dir: ${src_dir} -> $(basename "${target_dir_path}")"
+    fi
+
+    local trace_file filename tp_rank new_name
+    for trace_file in "${target_dir_path}"/*-TP-*.trace.json.gz; do
+        [ -f "${trace_file}" ] || continue
+        filename=$(basename "${trace_file}")
+        tp_rank=$(sed -E 's/^.*-TP-([0-9]+)\.trace\.json\.gz$/\1/' <<< "${filename}")
+        new_name="in${input_tokens}_out${output_tokens}_conc${c}-TP-${tp_rank}.trace.json.gz"
+        mv "${trace_file}" "${target_dir_path}/${new_name}"
+        echo "Renamed trace: ${filename} -> ${new_name}"
+    done
+}
+
 start_server() {
     local logfile="${LOG_DIR}/server_GLM47.log"
     echo ">>> Starting SGLang server" | tee "$logfile"
@@ -80,6 +125,7 @@ start_server() {
             --tool-call-parser glm47  
             --reasoning-parser glm45
             --disable-radix-cache
+            --watchdog-timeout 1200
     )
 
     if [ "$MTP_ENABLED" == "true" ]; then
@@ -147,7 +193,7 @@ run_benchmarks() {
     for io_pair in "${in_out_tokens[@]}"; do
         IFS=":" read -r input_tokens output_tokens <<< "$io_pair"
         for c in "${concurrencies[@]}"; do
-            local num_prompts=$((c * 16))
+            local num_prompts=$((c * PROMPT_MULTIPLIER))
             local logfile="${LOG_DIR}/bench_in${input_tokens}_out${output_tokens}_conc${c}.log"
 
             local cmd=(
@@ -170,25 +216,21 @@ run_benchmarks() {
 
             if ! grep -q "$logfile" "$FINISH_LOG"; then
                 echo "Running: $logfile"
+                local profiler_dirs_before=""
+                local profiler_dirs_after=""
+                if [ "$PROF_ENABLED" == "true" ]; then
+                    profiler_dirs_before=$(list_profiler_dirs) # Get the current folders under $LOG_DIR
+                fi
                 log_command "$logfile" "${cmd[@]}"
                 echo "$logfile" >> "$FINISH_LOG"
+
+                if [ "$PROF_ENABLED" == "true" ]; then
+                    profiler_dirs_after=$(list_profiler_dirs) # Get the current folders under $LOG_DIR. This time will have another torch profiler folder
+                    echo ">>> Processing profiler traces..."
+                    rename_profiler_artifacts "${input_tokens}" "${output_tokens}" "${c}" "${profiler_dirs_before}" "${profiler_dirs_after}"
+                fi
             else
                 echo "Found $logfile in ${FINISH_LOG}. Skipping."
-            fi
-
-
-            # --- Move and Rename TorchProfiler files ---
-            if [ "$PROF_ENABLED" == "true" ]; then
-                echo ">>> Processing profiler traces..."
-                for file in "${LOG_DIR}"/*.gz; do
-                    if [[ -f "$file" && "$file" == *"TP-"* ]]; then
-                        filename=$(basename "$file")
-                        suffix="TP-${filename##*-TP-}"
-                        new_name="${MODEL_NAME}_conc${c}_${suffix}"
-                        mv "$file" "${LOG_DIR}/${new_name}"
-                        echo "Renamed: $filename -> $new_name"
-                    fi
-                done
             fi
         done
     done
@@ -196,7 +238,7 @@ run_benchmarks() {
 
 
 # ------------------- Start -----------------
-start_server
+# start_server
 warmup
 accuracy_test
 run_benchmarks
