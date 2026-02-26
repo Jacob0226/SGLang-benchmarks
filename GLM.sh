@@ -75,6 +75,10 @@ log_command() {
     "$@" 2>&1 | tee -a "$logfile"
 }
 
+is_rocm_gpu_env() {
+    [ -e /dev/kfd ] || command -v rocm-smi >/dev/null 2>&1
+}
+
 list_profiler_dirs() {
     find "${LOG_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | grep -E '^[0-9]+(\.[0-9]+)?$' || true
 }
@@ -134,7 +138,7 @@ start_server() {
             --watchdog-timeout 1200
     )
 
-    if [ "${MODEL_NAME}" == "GLM-5" ]; then
+    if [ "${MODEL_NAME}" == "GLM-5" ] && is_rocm_gpu_env; then
         cmd+=(
             --nsa-prefill-backend tilelang
             --nsa-decode-backend tilelang
