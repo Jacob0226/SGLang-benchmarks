@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Usage:
 # ./GLM.sh
-# ./GLM.sh --mtp
-# ./GLM.sh --prof
-# ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-5
-# ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-4.7 --mtp --prof
+# ./GLM.sh --mtp --prof
+# ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-4.7
+# ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-4.7-FP8
+# ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-5   # B200 OOM
+# ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-5-FP8
 set -euo pipefail
 set -x
 ulimit -n 65535
@@ -37,7 +38,15 @@ while [[ $# -gt 0 ]]; do
 done
 MODEL_NAME=$(basename "${MODEL_PATH%/}")
 
+if [[ "${MODEL_NAME}" == *GLM-5* ]]; then
+    echo ">>> GLM-5 detected (${MODEL_NAME}), upgrading transformers..."
+    pip install --upgrade transformers --break-system-packages
+else
+    echo ">>> Non-GLM-5 model (${MODEL_NAME}), skip transformers upgrade."
+fi
+
 # ===================== Server and Benchmark Setting =====================
+# export ROCM_QUICK_REDUCE_QUANTIZATION=INT8 # Accuracy drop 0.95 --> 0.868
 HOST="localhost"
 PORT="8552"
 DATASET="random"
@@ -47,13 +56,14 @@ concurrencies=(4 8 16 32 64)
 PROMPT_MULTIPLIER=8
 
 # ===================== Argument  =====================
-DOCKER="rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260222"
+DOCKER="rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260302"
 SPECIAL_TAG="-bench"
+SPECIAL_TAG2=""
 if [ "$PROF_ENABLED" == "true" ]; then
     SPECIAL_TAG="-prof"
 fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
-LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}${MTP_TAG}${SPECIAL_TAG}"
+LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}${MTP_TAG}${SPECIAL_TAG}${SPECIAL_TAG2}"
 FINISH_LOG="$LOG_DIR/Finish.log"
 PROF_CMD="--profile"
 mkdir -p "$LOG_DIR"
@@ -138,7 +148,7 @@ start_server() {
             --watchdog-timeout 1200
     )
 
-    if [ "${MODEL_NAME}" == "GLM-5" ] && is_rocm_gpu_env; then
+    if [[ "${MODEL_NAME}" == *GLM-5* ]] && is_rocm_gpu_env; then
         cmd+=(
             --nsa-prefill-backend tilelang
             --nsa-decode-backend tilelang
@@ -255,7 +265,7 @@ run_benchmarks() {
 
 
 # ------------------- Start -----------------
-# start_server
+start_server
 warmup
 accuracy_test
 run_benchmarks
