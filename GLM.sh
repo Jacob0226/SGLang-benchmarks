@@ -2,9 +2,10 @@
 # Usage:
 # ./GLM.sh
 # ./GLM.sh --mtp --prof
+# ./GLM.sh 
 # ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-4.7
 # ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-4.7-FP8
-# ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-5   # B200 OOM
+# ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-5 # B200 OOM
 # ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-5-FP8
 set -euo pipefail
 set -x
@@ -38,13 +39,6 @@ while [[ $# -gt 0 ]]; do
 done
 MODEL_NAME=$(basename "${MODEL_PATH%/}")
 
-if [[ "${MODEL_NAME}" == *GLM-5* ]]; then
-    echo ">>> GLM-5 detected (${MODEL_NAME}), upgrading transformers..."
-    pip install --upgrade transformers --break-system-packages
-else
-    echo ">>> Non-GLM-5 model (${MODEL_NAME}), skip transformers upgrade."
-fi
-
 # ===================== Server and Benchmark Setting =====================
 # export ROCM_QUICK_REDUCE_QUANTIZATION=INT8 # Accuracy drop 0.95 --> 0.868
 HOST="localhost"
@@ -56,16 +50,19 @@ concurrencies=(4 8 16 32 64)
 PROMPT_MULTIPLIER=8
 
 # ===================== Argument  =====================
-DOCKER="rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260302"
+DOCKER="rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260222"
 SPECIAL_TAG="-bench"
-SPECIAL_TAG2=""
+SPECIAL_TAG2="-MarvinPR_18684"
 if [ "$PROF_ENABLED" == "true" ]; then
     SPECIAL_TAG="-prof"
+    in_out_tokens=("1000:1000" "8000:1000")
+    concurrencies=(4)
+    PROMPT_MULTIPLIER=2
 fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
 LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}${MTP_TAG}${SPECIAL_TAG}${SPECIAL_TAG2}"
 FINISH_LOG="$LOG_DIR/Finish.log"
-PROF_CMD="--profile"
+PROF_CMD="--profile --profile-num-steps 400 --profile-by-stage"
 mkdir -p "$LOG_DIR"
 touch "$FINISH_LOG"
 if [ "$PROF_ENABLED" == "true" ]; then
@@ -97,9 +94,10 @@ rename_profiler_artifacts() {
     local input_tokens=$1
     local output_tokens=$2
     local c=$3
-    local before_dirs=$4
-    local after_dirs=$5
-    local target_dir_name="prof_in${input_tokens}_out${output_tokens}_conc${c}"
+    local num_prompts=$4
+    local before_dirs=$5
+    local after_dirs=$6
+    local target_dir_name="prof_in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}"
     local target_dir_path="${LOG_DIR}/${target_dir_name}"
     local new_dirs
 
@@ -126,14 +124,14 @@ rename_profiler_artifacts() {
         [ -f "${trace_file}" ] || continue
         filename=$(basename "${trace_file}")
         tp_rank=$(sed -E 's/^.*-TP-([0-9]+)\.trace\.json\.gz$/\1/' <<< "${filename}")
-        new_name="in${input_tokens}_out${output_tokens}_conc${c}-TP-${tp_rank}.trace.json.gz"
+        new_name="in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}-TP-${tp_rank}.trace.json.gz"
         mv "${trace_file}" "${target_dir_path}/${new_name}"
         echo "Renamed trace: ${filename} -> ${new_name}"
     done
 }
 
 start_server() {
-    local logfile="${LOG_DIR}/server_GLM47.log"
+    local logfile="${LOG_DIR}/server_${MODEL_NAME}.log"
     echo ">>> Starting SGLang server" | tee "$logfile"
 
     local cmd=(
@@ -254,7 +252,7 @@ run_benchmarks() {
                 if [ "$PROF_ENABLED" == "true" ]; then
                     profiler_dirs_after=$(list_profiler_dirs) # Get the current folders under $LOG_DIR. This time will have another torch profiler folder
                     echo ">>> Processing profiler traces..."
-                    rename_profiler_artifacts "${input_tokens}" "${output_tokens}" "${c}" "${profiler_dirs_before}" "${profiler_dirs_after}"
+                    rename_profiler_artifacts "${input_tokens}" "${output_tokens}" "${c}" "${num_prompts}" "${profiler_dirs_before}" "${profiler_dirs_after}"
                 fi
             else
                 echo "Found $logfile in ${FINISH_LOG}. Skipping."
