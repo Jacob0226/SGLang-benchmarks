@@ -38,6 +38,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 MODEL_NAME=$(basename "${MODEL_PATH%/}")
+if [[ "${MODEL_NAME}" == *GLM-5* ]]; then
+    echo ">>> Detected GLM-5, ensuring transformers is up-to-date..."
+    pip install --upgrade transformers --break-system-packages
+fi
 
 # ===================== Server and Benchmark Setting =====================
 # export ROCM_QUICK_REDUCE_QUANTIZATION=INT8 # Accuracy drop 0.95 --> 0.868
