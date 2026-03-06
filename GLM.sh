@@ -56,17 +56,18 @@ PROMPT_MULTIPLIER=8
 # ===================== Argument  =====================
 DOCKER="rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260222"
 SPECIAL_TAG="-bench"
-SPECIAL_TAG2="-MarvinPR_18684"
+SPECIAL_TAG2=""
 if [ "$PROF_ENABLED" == "true" ]; then
     SPECIAL_TAG="-prof"
     in_out_tokens=("1000:1000" "8000:1000")
+    in_out_tokens=("1000:64" "8000:64")
     concurrencies=(4)
     PROMPT_MULTIPLIER=2
 fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
 LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}${MTP_TAG}${SPECIAL_TAG}${SPECIAL_TAG2}"
 FINISH_LOG="$LOG_DIR/Finish.log"
-PROF_CMD="--profile --profile-num-steps 400 --profile-by-stage"
+PROF_CMD=(--profile --profile-num-steps 400 --profile-by-stage)
 mkdir -p "$LOG_DIR"
 touch "$FINISH_LOG"
 if [ "$PROF_ENABLED" == "true" ]; then
@@ -240,7 +241,7 @@ run_benchmarks() {
             
             # Add profiling args
             if [ "$PROF_ENABLED" == "true" ]; then
-                cmd+=("${PROF_CMD}")
+                cmd+=("${PROF_CMD[@]}")
             fi
 
             if ! grep -q "$logfile" "$FINISH_LOG"; then
