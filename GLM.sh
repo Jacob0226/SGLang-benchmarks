@@ -40,7 +40,7 @@ done
 MODEL_NAME=$(basename "${MODEL_PATH%/}")
 if [[ "${MODEL_NAME}" == *GLM-5* ]]; then
     echo ">>> Detected GLM-5, ensuring transformers is up-to-date..."
-    pip install --upgrade transformers --break-system-packages
+    pip install transformers==5.2.0 --break-system-packages
 fi
 
 # ===================== Server and Benchmark Setting =====================
@@ -52,22 +52,22 @@ in_out_tokens=("1000:1000" "8000:1000")
 random_range_ratio=1.0
 concurrencies=(4 8 16 32 64)
 PROMPT_MULTIPLIER=8
+PROF_CMD=(--profile --profile-num-steps 400 --profile-by-stage)
 
 # ===================== Argument  =====================
-DOCKER="rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260222"
+DOCKER="lmsysorg/sglang:v0.5.9-cu130-runtime"
 SPECIAL_TAG="-bench"
-SPECIAL_TAG2=""
+SPECIAL_TAG2="-0306"
 if [ "$PROF_ENABLED" == "true" ]; then
     SPECIAL_TAG="-prof"
-    in_out_tokens=("1000:1000" "8000:1000")
-    in_out_tokens=("1000:64" "8000:64")
-    concurrencies=(4)
-    PROMPT_MULTIPLIER=2
+    in_out_tokens=("256:128" "512:128")
+    concurrencies=(1)
+    PROMPT_MULTIPLIER=1
+    PROF_CMD=(--profile --profile-num-steps 100 --profile-by-stage)
 fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
 LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}${MTP_TAG}${SPECIAL_TAG}${SPECIAL_TAG2}"
 FINISH_LOG="$LOG_DIR/Finish.log"
-PROF_CMD=(--profile --profile-num-steps 400 --profile-by-stage)
 mkdir -p "$LOG_DIR"
 touch "$FINISH_LOG"
 if [ "$PROF_ENABLED" == "true" ]; then
@@ -133,6 +133,63 @@ rename_profiler_artifacts() {
         mv "${trace_file}" "${target_dir_path}/${new_name}"
         echo "Renamed trace: ${filename} -> ${new_name}"
     done
+}
+
+rename_profiler_artifacts_by_stage() {
+    local input_tokens=$1
+    local output_tokens=$2
+    local c=$3
+    local num_prompts=$4
+    local before_dirs=$5
+    local after_dirs=$6
+    local target_dir_name="prof_in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}"
+    local target_dir_path="${LOG_DIR}/${target_dir_name}"
+    local new_dirs
+
+    new_dirs=$(comm -13 <(printf '%s\n' "${before_dirs}" | sort) <(printf '%s\n' "${after_dirs}" | sort))
+    if [ -z "${new_dirs}" ]; then
+        echo "No new profiler directory found under ${LOG_DIR}"
+        return 0
+    fi
+
+    local src_dir src_dir_path
+    src_dir=$(printf '%s\n' "${new_dirs}" | tail -n 1)
+    src_dir_path="${LOG_DIR}/${src_dir}"
+    if [ "${src_dir}" != "${target_dir_name}" ]; then
+        if [ -e "${target_dir_path}" ]; then
+            target_dir_path="${LOG_DIR}/${target_dir_name}_$(date +%s)"
+            echo "Target directory exists. Using ${target_dir_path}"
+        fi
+        mv "${src_dir_path}" "${target_dir_path}"
+        echo "Renamed profiler dir: ${src_dir} -> $(basename "${target_dir_path}")"
+    fi
+
+    local trace_file filename tp_rank stage new_name
+    for trace_file in "${target_dir_path}"/*-TP-*.trace.json.gz; do
+        [ -f "${trace_file}" ] || continue
+        filename=$(basename "${trace_file}")
+        tp_rank=$(sed -E 's/^.*-TP-([0-9]+)-(EXTEND|DECODE)\.trace\.json\.gz$/\1/' <<< "${filename}")
+        stage=$(sed -E 's/^.*-TP-([0-9]+)-(EXTEND|DECODE)\.trace\.json\.gz$/\2/' <<< "${filename}")
+
+        if [ "${tp_rank}" = "${filename}" ] || [ "${stage}" = "${filename}" ]; then
+            echo "Skip unmatched trace name: ${filename}"
+            continue
+        fi
+
+        new_name="in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}-TP-${tp_rank}-${stage}.trace.json.gz"
+        mv "${trace_file}" "${target_dir_path}/${new_name}"
+        echo "Renamed trace: ${filename} -> ${new_name}"
+    done
+}
+
+prof_cmd_has_profile_by_stage() {
+    local arg
+    for arg in "${PROF_CMD[@]}"; do
+        if [ "${arg}" = "--profile-by-stage" ]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 start_server() {
@@ -257,7 +314,11 @@ run_benchmarks() {
                 if [ "$PROF_ENABLED" == "true" ]; then
                     profiler_dirs_after=$(list_profiler_dirs) # Get the current folders under $LOG_DIR. This time will have another torch profiler folder
                     echo ">>> Processing profiler traces..."
-                    rename_profiler_artifacts "${input_tokens}" "${output_tokens}" "${c}" "${num_prompts}" "${profiler_dirs_before}" "${profiler_dirs_after}"
+                    if prof_cmd_has_profile_by_stage; then
+                        rename_profiler_artifacts_by_stage "${input_tokens}" "${output_tokens}" "${c}" "${num_prompts}" "${profiler_dirs_before}" "${profiler_dirs_after}"
+                    else
+                        rename_profiler_artifacts "${input_tokens}" "${output_tokens}" "${c}" "${num_prompts}" "${profiler_dirs_before}" "${profiler_dirs_after}"
+                    fi
                 fi
             else
                 echo "Found $logfile in ${FINISH_LOG}. Skipping."
