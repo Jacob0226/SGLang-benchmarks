@@ -45,6 +45,9 @@ fi
 
 # ===================== Server and Benchmark Setting =====================
 # export ROCM_QUICK_REDUCE_QUANTIZATION=INT8 # Accuracy drop 0.95 --> 0.868
+if [[ "${MODEL_NAME}" == *GLM-4.7* ]]; then
+    unset ROCM_QUICK_REDUCE_QUANTIZATION
+fi
 HOST="localhost"
 PORT="8552"
 DATASET="random"
@@ -52,18 +55,18 @@ in_out_tokens=("1000:1000" "8000:1000")
 random_range_ratio=1.0
 concurrencies=(4 8 16 32 64)
 PROMPT_MULTIPLIER=8
-PROF_CMD=(--profile --profile-num-steps 400 --profile-by-stage)
+PROF_CMD=(--profile --profile-num-steps 5 --profile-by-stage)
 
 # ===================== Argument  =====================
-DOCKER="lmsysorg/sglang:v0.5.9-cu130-runtime"
+# DOCKER="rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260316"
+DOCKER="rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260222"
 SPECIAL_TAG="-bench"
-SPECIAL_TAG2="-0306"
+SPECIAL_TAG2=""
 if [ "$PROF_ENABLED" == "true" ]; then
     SPECIAL_TAG="-prof"
-    in_out_tokens=("256:128" "512:128")
-    concurrencies=(1)
-    PROMPT_MULTIPLIER=1
-    PROF_CMD=(--profile --profile-num-steps 100 --profile-by-stage)
+    in_out_tokens=("1000:1000" "8000:1000")
+    concurrencies=(4)
+    PROMPT_MULTIPLIER=2
 fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
 LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}${MTP_TAG}${SPECIAL_TAG}${SPECIAL_TAG2}"
@@ -248,10 +251,10 @@ warmup() {
         --port "${PORT}" 
         --model "${MODEL_PATH}" 
         --dataset-name "${DATASET}" 
-        --random-input 256
-        --random-output 256
+        --random-input 2048
+        --random-output 2048
         --random-range-ratio "${random_range_ratio}"
-        --max-concurrency 2 
+        --max-concurrency 4 
         --num-prompt 8 
     )
     log_command "$warmup_log" "${warmup_cmd[@]}"
