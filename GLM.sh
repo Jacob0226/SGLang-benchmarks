@@ -10,6 +10,7 @@
 set -euo pipefail
 set -x
 ulimit -n 65535
+sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'
 
 MTP_ENABLED="false"
 PROF_ENABLED="false"
@@ -58,8 +59,8 @@ PROMPT_MULTIPLIER=8
 PROF_CMD=(--profile --profile-num-steps 5 --profile-by-stage)
 
 # ===================== Argument  =====================
-# DOCKER="rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260316"
-DOCKER="rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260222"
+DOCKER="rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260222" # MI355
+# DOCKER="lmsysorg/sglang:v0.5.9-cu130-runtime" # B200
 SPECIAL_TAG="-bench"
 SPECIAL_TAG2=""
 if [ "$PROF_ENABLED" == "true" ]; then
@@ -230,6 +231,10 @@ start_server() {
         )
     fi
 
+    if [ ${#EXTRA_SERVER_ARGS[@]} -gt 0 ]; then
+        cmd+=("${EXTRA_SERVER_ARGS[@]}")
+    fi
+
     # Start server in background
     echo ">>> Executing command:" | tee -a "$logfile"
     echo "${cmd[*]}" | tee -a "$logfile"
@@ -252,7 +257,7 @@ warmup() {
         --model "${MODEL_PATH}" 
         --dataset-name "${DATASET}" 
         --random-input 2048
-        --random-output 2048
+        --random-output 256
         --random-range-ratio "${random_range_ratio}"
         --max-concurrency 4 
         --num-prompt 8 
@@ -332,14 +337,38 @@ run_benchmarks() {
 
 
 # ------------------- Start -----------------
-start_server
-warmup
-accuracy_test
-run_benchmarks
+if [ "$PROF_ENABLED" == "true" ]; then
+    PROF_SERVER_MODES=("default" "no-cuda-graph")
+else
+    PROF_SERVER_MODES=("default")
+fi
 
+BASE_LOG_DIR="$LOG_DIR"
 
-pkill -9 python || true
-sleep 10
+for PROF_MODE in "${PROF_SERVER_MODES[@]}"; do
+    EXTRA_SERVER_ARGS=()
+    if [ "$PROF_MODE" == "no-cuda-graph" ]; then
+        EXTRA_SERVER_ARGS=(--disable-cuda-graph)
+        LOG_DIR="${BASE_LOG_DIR}/no-cuda-graph"
+        mkdir -p "$LOG_DIR"
+        FINISH_LOG="$LOG_DIR/Finish.log"
+        touch "$FINISH_LOG"
+        export SGLANG_TORCH_PROFILER_DIR=$LOG_DIR
+    else
+        LOG_DIR="${BASE_LOG_DIR}"
+    fi
+
+    echo ">>> [${PROF_MODE}] Starting server and benchmarks..."
+    start_server
+    warmup
+    if [ "$PROF_MODE" == "default" ]; then
+        accuracy_test
+    fi
+    run_benchmarks
+
+    pkill -9 python || true
+    sleep 10
+done
 
 
 
