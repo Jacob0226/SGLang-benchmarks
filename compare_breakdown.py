@@ -177,6 +177,44 @@ def build_comparison(rows_a, rows_b, label_a, label_b):
     named_b, self_b = _split_self_blocks(blocks_b)
     alignment = lcs_alignment(named_a, named_b)
 
+    # --- Consolidate alignment so same (layer_type, section) is not interleaved ---
+    # LCS can produce: ...SparseMoeBlock, prepare_mlp, SparseMoeBlock...
+    # when unmatched blocks from one side land between matched blocks.
+    # Re-order so that all entries of the same section within the same
+    # layer type are contiguous.
+    def _get_group_key(pair):
+        """Return (layer_type, section) for grouping."""
+        ia, ib = pair
+        if ia is not None:
+            rows = named_a[ia][1]
+            sec = named_a[ia][0][0]
+        else:
+            rows = named_b[ib][1]
+            sec = named_b[ib][0][0]
+        lt = ""
+        for r in rows:
+            if r.get("LayerType"):
+                lt = r["LayerType"]
+                break
+        return (lt, sec)
+
+    consolidated = []
+    for pair in alignment:
+        gk = _get_group_key(pair)
+        if consolidated and _get_group_key(consolidated[-1][-1]) == gk:
+            consolidated[-1].append(pair)
+        else:
+            # Check if this (layer_type, section) appeared in an earlier group
+            merged = False
+            for grp in consolidated:
+                if _get_group_key(grp[0]) == gk:
+                    grp.append(pair)
+                    merged = True
+                    break
+            if not merged:
+                consolidated.append([pair])
+    alignment = [pair for grp in consolidated for pair in grp]
+
     header = ["LayerType", "Section", "LeafModule", "LayerCount", "#",
               f"{label_a}_KernelName", f"{label_a}_us",
               f"{label_b}_us", f"{label_b}_KernelName",
