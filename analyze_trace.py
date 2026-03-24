@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 auto_detect_layer.py
 
@@ -797,6 +798,54 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
             "kernel_breakdown": breakdown,
             "n_kernels": len(all_kidxs),
         })
+
+    # === Fallback: recover unlinked kernels via GPU-timestamp interpolation ===
+    # Some kernels (e.g. launched via cudaLaunchKernelExC) lack matching
+    # cuda_runtime events, so get_kernels_for_module cannot find them.
+    # Recover by locating them in the GPU timeline relative to linked kernels.
+    linked_entries = []  # (gpu_ts, kernel_idx, layer_data_idx, section)
+    for ldi, ld in enumerate(layer_data):
+        for ki, section, _leaf in ld["kernel_breakdown"]:
+            linked_entries.append((kernels[ki]["ts"], ki, ldi, section))
+    linked_entries.sort()
+
+    if linked_entries:
+        assigned_kidxs = {e[1] for e in linked_entries}
+        fp_gpu_start = linked_entries[0][0]
+        fp_gpu_end = max(kernels[e[1]]["ts_end"] for e in linked_entries)
+        entry_ts = [e[0] for e in linked_entries]
+
+        unlinked_by_layer: dict[int, list] = {}
+        for ki in range(len(kernels)):
+            if ki in assigned_kidxs:
+                continue
+            k = kernels[ki]
+            if k["ts"] < fp_gpu_start or k["ts"] > fp_gpu_end:
+                continue
+            # Assign to same layer/section as nearest preceding linked kernel
+            pos = bisect.bisect_right(entry_ts, k["ts"]) - 1
+            if pos < 0:
+                ldi = linked_entries[0][2]
+                inferred_section = linked_entries[0][3]
+            else:
+                ldi = linked_entries[pos][2]
+                inferred_section = linked_entries[pos][3]
+            unlinked_by_layer.setdefault(ldi, []).append(
+                (ki, inferred_section))
+
+        n_recovered = 0
+        for ldi, items in unlinked_by_layer.items():
+            ld = layer_data[ldi]
+            existing = list(ld["kernel_breakdown"])
+            for ki, section in items:
+                existing.append((ki, section, ""))
+            existing.sort(key=lambda item: kernels[item[0]]["ts"])
+            ld["kernel_breakdown"] = existing
+            n_recovered += len(items)
+
+        if n_recovered:
+            print(f"[INFO] Recovered {n_recovered} unlinked kernels via "
+                  f"GPU-timestamp interpolation", file=sys.stderr)
 
     # Group by sub_module signature
     groups: OrderedDict = OrderedDict()
