@@ -142,58 +142,99 @@ def print_step1(stats: list[dict]) -> None:
     print(f"{'='*120}\n")
 
 
-def write_step1_csv(stats: list[dict], path: str) -> None:
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["Name", "Count", "SumDuration_us", "AvgDuration_us", "Percentage"])
-        for s in stats:
-            w.writerow([s["name"], s["count"], f"{s['sum_dur']:.1f}",
-                        f"{s['avg_dur']:.3f}", f"{s['pct']:.2f}"])
-    print(f"[INFO] Step 1 CSV written to: {path}", file=sys.stderr)
+def _write_xlsx(headers: list[str], rows: list[list], path: str) -> None:
+    """Write data to Excel with Arial font and auto-width columns."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+
+    arial = Font(name="Arial", size=10)
+    arial_bold = Font(name="Arial", size=10, bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2",
+                              fill_type="solid")
+
+    for c, val in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=c, value=val)
+        cell.font = arial_bold
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+    ws.freeze_panes = "A2"
+
+    for r, row_data in enumerate(rows, 2):
+        for c, val in enumerate(row_data, 1):
+            if isinstance(val, str):
+                try:
+                    val = float(val) if val and "." in val and val.replace(".", "").replace("-", "").isdigit() else val
+                except (ValueError, TypeError):
+                    pass
+            cell = ws.cell(row=r, column=c, value=val if val != "" else None)
+            cell.font = arial
+
+    for c in range(1, len(headers) + 1):
+        max_len = len(str(headers[c - 1]))
+        for r in range(2, min(len(rows) + 2, 50)):
+            val = ws.cell(row=r, column=c).value
+            if val:
+                max_len = max(max_len, min(len(str(val)), 60))
+        ws.column_dimensions[get_column_letter(c)].width = max_len + 2
+
+    wb.save(path)
 
 
-def write_step3_csv(layer_types: list[dict], kernels: list[dict],
-                     kernel_stats: list[dict] | None, path: str,
-                     callsite_map: dict | None = None) -> None:
-    """Export step 3 breakdown to CSV."""
+def write_step1(stats: list[dict], path: str) -> None:
+    headers = ["Name", "Count", "SumDuration_us", "AvgDuration_us", "Percentage"]
+    rows = [[s["name"], s["count"], round(s["sum_dur"], 1),
+             round(s["avg_dur"], 3), round(s["pct"], 2)] for s in stats]
+    _write_xlsx(headers, rows, path)
+    print(f"[INFO] Step 1 written to: {path}", file=sys.stderr)
+
+
+def write_step3(layer_types: list[dict], kernels: list[dict],
+                kernel_stats: list[dict] | None, path: str,
+                callsite_map: dict | None = None) -> None:
+    """Export step 3 breakdown to Excel."""
     stat_lookup = {}
     if kernel_stats:
         for s in kernel_stats:
             stat_lookup[s["name"]] = s
 
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        headers = ["LayerType", "LayerCount", "Index", "Module",
-                    "KernelName", "Duration_us"]
-        if kernel_stats:
-            headers += ["GraphON_AvgDuration_us", "GraphON_Count",
-                        "GraphON_SumDuration_us", "GraphON_Percentage"]
-        headers.append("CallSite")
-        w.writerow(headers)
+    headers = ["LayerType", "LayerCount", "Index",
+                "Section", "LeafModule",
+                "KernelName", "Duration_us"]
+    if kernel_stats:
+        headers += ["GraphON_AvgDuration_us", "GraphON_Count",
+                    "GraphON_SumDuration_us", "GraphON_Percentage"]
+    headers.append("CallSite")
 
-        for i, lt in enumerate(layer_types):
-            if i > 0:
-                w.writerow([])  # blank row between layer types
+    rows = []
+    for i, lt in enumerate(layer_types):
+        if i > 0:
+            rows.append([""] * len(headers))
 
-            label = chr(ord("A") + i)
-            sub_mod_str = " + ".join(lt["sub_modules"])
-            breakdown = lt.get("kernel_breakdown", [])
-            for pos, (kidx, mod_label) in enumerate(breakdown):
-                k = kernels[kidx]
-                cs = callsite_map.get(kidx, "") if callsite_map else ""
-                row = [f"{label}: {sub_mod_str}", lt["count"], pos,
-                       mod_label, k["name"], f"{k['dur']:.1f}"]
-                if kernel_stats:
-                    s = stat_lookup.get(k["name"])
-                    if s:
-                        row += [f"{s['avg_dur']:.3f}", s["count"],
-                                f"{s['sum_dur']:.1f}", f"{s['pct']:.2f}"]
-                    else:
-                        row += ["", "", "", ""]
-                row.append(cs)
-                w.writerow(row)
+        label = chr(ord("A") + i)
+        sub_mod_str = " + ".join(lt["sub_modules"])
+        breakdown = lt.get("kernel_breakdown", [])
+        for pos, (kidx, top_mod, leaf) in enumerate(breakdown):
+            k = kernels[kidx]
+            cs = callsite_map.get(kidx, "") if callsite_map else ""
+            row = [f"{label}: {sub_mod_str}", lt["count"], pos,
+                   top_mod, leaf if leaf else "(self)",
+                   k["name"], round(k["dur"], 1)]
+            if kernel_stats:
+                s = stat_lookup.get(k["name"])
+                if s:
+                    row += [round(s["avg_dur"], 3), s["count"],
+                            round(s["sum_dur"], 1), round(s["pct"], 2)]
+                else:
+                    row += ["", "", "", ""]
+            row.append(cs)
+            rows.append(row)
 
-    print(f"[INFO] Step 3 CSV written to: {path}", file=sys.stderr)
+    _write_xlsx(headers, rows, path)
+    print(f"[INFO] Step 3 written to: {path}", file=sys.stderr)
 
 
 # ===================================================================
@@ -286,23 +327,35 @@ def find_direct_children(trace: dict | list, parent_ev: dict,
 
 
 def build_ext_id_map(trace: dict | list, kernels: list[dict]) -> tuple:
-    """Build External id → kernel index mapping and sorted runtime events."""
+    """Build kernel lookup maps and sorted runtime events.
+
+    Returns (ext_to_kidx, corr_to_kidx, runtime, rt_ts) where:
+      ext_to_kidx: External id → kernel index
+      corr_to_kidx: correlation → kernel index (for kernels without External id)
+      runtime: sorted cuda_runtime events (with External id or correlation)
+      rt_ts: timestamps for binary search
+    """
     events = trace if isinstance(trace, list) else trace.get("traceEvents", [])
     ext_to_kidx = {}
+    corr_to_kidx = {}
     for i, k in enumerate(kernels):
         eid = k.get("args", {}).get("External id")
+        corr = k.get("args", {}).get("correlation")
         if eid is not None and eid not in ext_to_kidx:
             ext_to_kidx[eid] = i
+        elif eid is None and corr is not None and corr not in corr_to_kidx:
+            corr_to_kidx[corr] = i
 
     runtime = sorted(
         [ev for ev in events
          if isinstance(ev, dict) and ev.get("cat") == "cuda_runtime"
          and ev.get("ph") == "X"
-         and ev.get("args", {}).get("External id") is not None],
+         and (ev.get("args", {}).get("External id") is not None
+              or ev.get("args", {}).get("correlation") is not None)],
         key=lambda ev: ev["ts"],
     )
     rt_ts = [ev["ts"] for ev in runtime]
-    return ext_to_kidx, runtime, rt_ts
+    return ext_to_kidx, corr_to_kidx, runtime, rt_ts
 
 
 def build_callsite_map(trace: dict | list, kernels: list[dict],
@@ -334,12 +387,17 @@ def build_callsite_map(trace: dict | list, kernels: list[dict],
         py_by_thread[tid].sort(key=lambda e: e["ts"])
         py_ts_by_thread[tid] = [e["ts"] for e in py_by_thread[tid]]
 
-    # Build ext_id → runtime event mapping
+    # Build ext_id and correlation → runtime event mappings
     ext_to_runtime = {}
+    corr_to_runtime = {}
     for rt in runtime:
-        eid = rt.get("args", {}).get("External id")
+        args = rt.get("args", {})
+        eid = args.get("External id")
+        corr = args.get("correlation")
         if eid is not None and eid not in ext_to_runtime:
             ext_to_runtime[eid] = rt
+        if corr is not None and corr not in corr_to_runtime:
+            corr_to_runtime[corr] = rt
 
     # Resolve call sites
     callsite_map = {}
@@ -347,10 +405,14 @@ def build_callsite_map(trace: dict | list, kernels: list[dict],
 
     for i in resolve_list:
         k = kernels[i]
-        eid = k.get("args", {}).get("External id")
-        if eid is None or eid not in ext_to_runtime:
+        args = k.get("args", {})
+        eid = args.get("External id")
+        rt = ext_to_runtime.get(eid) if eid is not None else None
+        if rt is None:
+            corr = args.get("correlation")
+            rt = corr_to_runtime.get(corr) if corr is not None else None
+        if rt is None:
             continue
-        rt = ext_to_runtime[eid]
         rt_ts_val = rt["ts"]
         rt_tid = rt["tid"]
 
@@ -365,10 +427,10 @@ def build_callsite_map(trace: dict | list, kernels: list[dict],
 
         # Scan backwards. Don't break on gaps — outer functions with
         # longer duration may have started earlier and still contain rt_ts.
-        # Limit scan to 500 events or 50ms back to keep it fast.
+        # Limit scan to 2000 events or 50ms back to keep it fast.
         best = None
         best_dur = float("inf")
-        scan_limit = max(0, pos - 500)
+        scan_limit = max(0, pos - 2000)
         ts_limit = rt_ts_val - 50_000  # 50ms back max
 
         for j in range(max(0, pos), scan_limit - 1, -1):
@@ -394,7 +456,141 @@ def build_callsite_map(trace: dict | list, kernels: list[dict],
     return callsite_map
 
 
+def find_layer_sections(pf_events: list[dict], layer_ev: dict) -> list[dict]:
+    """Find section-level functions/modules within a decoder layer.
+
+    Sections are direct children of the decoder layer's forward method,
+    such as prepare_attn, DeepseekV2AttentionMLA, prepare_mlp, etc.
+
+    Args:
+        pf_events: python_function events within the layer's time range,
+                   sorted by (ts, -dur).
+        layer_ev: the decoder layer nn.Module event.
+
+    Returns sorted list of {"name": str, "ts": float, "end": float}
+    """
+    if not pf_events:
+        return []
+
+    layer_dur = layer_ev.get("dur", 1)
+
+    # Find the model's forward function (sglang source, large duration)
+    fwd = None
+    for ev in pf_events:
+        name = ev.get("name", "")
+        if ("/sglang/" in name and ": forward" in name
+                and ev.get("dur", 0) > layer_dur * 0.5):
+            fwd = ev
+            break
+
+    if fwd is None:
+        return []
+
+    fts = fwd["ts"]
+    fend = fts + fwd.get("dur", 0)
+
+    # Collect events contained in forward
+    children = [ev for ev in pf_events
+                if ev is not fwd
+                and ev["ts"] >= fts
+                and ev["ts"] + ev.get("dur", 0) <= fend + 1]
+
+    # Keep only direct children (not nested inside another child)
+    children.sort(key=lambda e: e["ts"])
+    direct = []
+    for c in children:
+        cts, cend = c["ts"], c["ts"] + c.get("dur", 0)
+        if not any(o["ts"] < cts and o["ts"] + o.get("dur", 0) > cend
+                   for o in children if o is not c):
+            direct.append(c)
+
+    # Filter to significant functions and extract clean names
+    sections = []
+    for c in direct:
+        name = c.get("name", "")
+        dur = c.get("dur", 0)
+        # Skip tiny helpers and torch internals
+        if dur < 1:
+            continue
+        if ("torch/" in name or "nn/modules/" in name
+                or "<built-in" in name) and not name.startswith("nn.Module:"):
+            continue
+
+        if name.startswith("nn.Module: "):
+            clean = re.sub(r'_\d+$', '', name.replace("nn.Module: ", ""))
+        else:
+            match = re.search(r':\s*(\w+)\s*$', name)
+            clean = match.group(1) if match else name
+
+        sections.append({"name": clean, "ts": c["ts"],
+                         "end": c["ts"] + dur})
+
+    sections.sort(key=lambda s: s["ts"])
+    return sections
+
+
+def find_pf_leaf(all_pf: list[dict], all_pf_ts: list[float],
+                 rt_ts: float, section_name: str) -> str:
+    """Find innermost python_function as fallback leaf label.
+
+    Used when no nn.Module wraps a kernel. Looks for the innermost
+    non-torch, non-module python_function that contains the runtime
+    event, excluding the section function itself.
+
+    Returns "filename.py(line)" or empty string.
+    """
+    pos = bisect.bisect_right(all_pf_ts, rt_ts) - 1
+    best_name = None
+    best_dur = float("inf")
+
+    for j in range(max(0, pos), max(0, pos - 2000), -1):
+        pf = all_pf[j]
+        pf_ts = pf["ts"]
+        if pf_ts > rt_ts:
+            continue
+        if pf_ts < rt_ts - 50_000:
+            break
+        pf_end = pf_ts + pf.get("dur", 0)
+        if pf_end < rt_ts:
+            continue
+        name = pf.get("name", "")
+        dur = pf.get("dur", 0)
+        # Skip torch internals, nn.Module wrappers, built-ins, triton runtime
+        if ("torch/" in name or "nn/modules/" in name
+                or "<built-in" in name or name.startswith("nn.Module:")
+                or "triton/runtime/" in name or "triton/backends/" in name):
+            continue
+        if dur < best_dur:
+            best_name = name
+            best_dur = dur
+
+    if not best_name:
+        return ""
+
+    # Extract "filename.py(line)" from full path
+    m = re.search(r'([^/]+\.py\(\d+\))', best_name)
+    if not m:
+        return ""
+
+    short = m.group(1)
+    # Skip if it's the section's own function (e.g. forward, prepare_attn)
+    func_match = re.search(r':\s*(\w+)\s*$', best_name)
+    if func_match and func_match.group(1) == section_name:
+        return ""
+
+    return short
+
+
+def get_section_name(sections: list[dict], ts: float) -> str:
+    """Find which section contains the given timestamp."""
+    for s in sections:
+        if s["ts"] <= ts <= s["end"]:
+            return s["name"]
+    return "(layer)"
+
+
 def get_kernels_for_module(module_ev: dict, ext_to_kidx: dict,
+                            corr_to_kidx: dict,
                             runtime: list[dict], rt_ts: list[float]) -> list[int]:
     """Get GPU kernel indices launched by a module event."""
     mod_ts = module_ev["ts"]
@@ -403,10 +599,81 @@ def get_kernels_for_module(module_ev: dict, ext_to_kidx: dict,
     hi = bisect.bisect_right(rt_ts, mod_end)
     kidxs = set()
     for j in range(lo, hi):
-        eid = runtime[j].get("args", {}).get("External id")
-        if eid in ext_to_kidx:
+        args = runtime[j].get("args", {})
+        eid = args.get("External id")
+        if eid is not None and eid in ext_to_kidx:
             kidxs.add(ext_to_kidx[eid])
+        else:
+            corr = args.get("correlation")
+            if corr is not None and corr in corr_to_kidx:
+                kidxs.add(corr_to_kidx[corr])
     return sorted(kidxs)
+
+
+def find_deep_kernel_labels(module_events: list[dict], layer_ev: dict,
+                             kidxs: list[int], kernels: list[dict],
+                             ext_to_rt: dict, corr_to_rt: dict) -> dict:
+    """Find deepest nn.Module path for each kernel within a layer.
+
+    Returns {kernel_idx: "ParentModule > LeafModule"}.
+    """
+    pts = layer_ev["ts"]
+    pend = pts + layer_ev.get("dur", 0)
+
+    # Collect all nn.Module descendants within layer's time range
+    descendants = []
+    for ev in module_events:
+        if ev is layer_ev:
+            continue
+        ets = ev.get("ts", 0)
+        eend = ets + ev.get("dur", 0)
+        if ets >= pts and eend <= pend + 1:
+            cls = re.sub(r'_\d+$', '', ev["name"].replace("nn.Module: ", ""))
+            descendants.append({
+                "cls": cls, "ts": ets, "end": eend, "dur": ev.get("dur", 0),
+            })
+
+    if not descendants:
+        return {}
+
+    # Build hierarchy paths: sort by duration desc (parents first)
+    descendants.sort(key=lambda m: m["dur"], reverse=True)
+    for i, m in enumerate(descendants):
+        parent_path = None
+        parent_dur = float("inf")
+        for j in range(i):
+            p = descendants[j]
+            if (p["ts"] <= m["ts"] and p["end"] >= m["end"] - 1
+                    and p["dur"] < parent_dur):
+                parent_path = p["path"]
+                parent_dur = p["dur"]
+        m["path"] = f"{parent_path} > {m['cls']}" if parent_path else m["cls"]
+
+    # For each kernel, find deepest enclosing module via runtime event timestamp
+    labels = {}
+    for ki in kidxs:
+        k = kernels[ki]
+        args = k.get("args", {})
+        eid = args.get("External id")
+        rt = ext_to_rt.get(eid) if eid is not None else None
+        if rt is None:
+            corr = args.get("correlation")
+            rt = corr_to_rt.get(corr) if corr is not None else None
+        if rt is None:
+            continue
+        rt_ts_val = rt["ts"]
+
+        best = None
+        best_dur = float("inf")
+        for m in descendants:
+            if m["ts"] <= rt_ts_val <= m["end"] and m["dur"] < best_dur:
+                best = m
+                best_dur = m["dur"]
+
+        if best:
+            labels[ki] = best["path"]
+
+    return labels
 
 
 def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
@@ -415,7 +682,7 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
     Returns (cls_name, layer_types, callsite_map) where layer_types is:
       [ { 'name': str, 'count': int, 'layers': [name, ...],
           'sub_modules': [cls, ...],
-          'kernel_breakdown': [ (kernel_idx, module_label), ... ] }, ... ]
+          'kernel_breakdown': [ (kernel_idx, top_module, leaf_detail), ... ] }, ... ]
     and callsite_map is { kernel_idx: "file.py(line): func_name" }
     """
     cls_name = find_decoder_layer_class(trace)
@@ -426,7 +693,27 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
     if not forward_pass:
         return cls_name, [], {}
 
-    ext_to_kidx, runtime, rt_ts = build_ext_id_map(trace, kernels)
+    ext_to_kidx, corr_to_kidx, runtime, rt_ts = build_ext_id_map(trace, kernels)
+
+    # Pre-compute module events and runtime mapping for deep labeling
+    events = trace if isinstance(trace, list) else trace.get("traceEvents", [])
+    module_events = [
+        ev for ev in events
+        if isinstance(ev, dict) and ev.get("ph") == "X"
+        and ev.get("name", "").startswith("nn.Module: ")
+    ]
+    module_events.sort(key=lambda e: e["ts"])
+
+    ext_to_rt = {}
+    corr_to_rt = {}
+    for rt in runtime:
+        args = rt.get("args", {})
+        eid = args.get("External id")
+        corr = args.get("correlation")
+        if eid is not None and eid not in ext_to_rt:
+            ext_to_rt[eid] = rt
+        if corr is not None and corr not in corr_to_rt:
+            corr_to_rt[corr] = rt
 
     # Discover significant child classes by sampling multiple layers
     # (different layer types may have different children)
@@ -449,6 +736,15 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
     print(f"[INFO] Sub-module classes: {', '.join(sorted(significant_classes))}",
           file=sys.stderr)
 
+    # Pre-filter python_function events for section detection
+    all_pf = sorted(
+        [ev for ev in events
+         if isinstance(ev, dict) and ev.get("ph") == "X"
+         and ev.get("cat") == "python_function" and ev.get("dur", 0) > 0],
+        key=lambda e: (e["ts"], -e.get("dur", 0)),
+    )
+    all_pf_ts = [e["ts"] for e in all_pf]
+
     # Analyze each layer
     layer_data = []
     for layer_ev in forward_pass:
@@ -457,17 +753,44 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
         sub_mods = [re.sub(r'_\d+$', '', c["name"].replace("nn.Module: ", ""))
                     for c in children]
 
-        # Get kernel-to-module mapping
-        all_kidxs = get_kernels_for_module(layer_ev, ext_to_kidx, runtime, rt_ts)
-        kernel_labels = {}  # kidx -> module_class
-        for cev in children:
-            ccls = re.sub(r'_\d+$', '', cev["name"].replace("nn.Module: ", ""))
-            ckidxs = get_kernels_for_module(cev, ext_to_kidx, runtime, rt_ts)
-            for ki in ckidxs:
-                if ki not in kernel_labels:
-                    kernel_labels[ki] = ccls
+        # Find sections (high-level code blocks in the layer's forward)
+        lts = layer_ev["ts"]
+        lend = lts + layer_ev.get("dur", 0)
+        pf_lo = bisect.bisect_left(all_pf_ts, lts)
+        pf_hi = bisect.bisect_right(all_pf_ts, lend)
+        sections = find_layer_sections(all_pf[pf_lo:pf_hi], layer_ev)
 
-        breakdown = [(ki, kernel_labels.get(ki, "(layer)")) for ki in all_kidxs]
+        # Get kernel-to-module mapping (deep — find leaf module)
+        all_kidxs = get_kernels_for_module(layer_ev, ext_to_kidx,
+                                            corr_to_kidx, runtime, rt_ts)
+        kernel_labels = find_deep_kernel_labels(
+            module_events, layer_ev, all_kidxs, kernels,
+            ext_to_rt, corr_to_rt)
+
+        breakdown = []
+        for ki in all_kidxs:
+            # Determine section from python_function context
+            k_args = kernels[ki].get("args", {})
+            eid = k_args.get("External id")
+            rt = ext_to_rt.get(eid) if eid is not None else None
+            if rt is None:
+                corr = k_args.get("correlation")
+                rt = corr_to_rt.get(corr) if corr is not None else None
+            section = get_section_name(sections, rt["ts"]) if rt else "(layer)"
+
+            # Leaf module from nn.Module hierarchy
+            leaf = kernel_labels.get(ki, "")
+            # Strip section prefix from leaf if it starts with the section name
+            if leaf.startswith(section + " > "):
+                leaf = leaf[len(section) + 3:]
+            elif leaf == section:
+                leaf = ""
+
+            # Fallback: use innermost python_function when no nn.Module
+            if not leaf and rt:
+                leaf = find_pf_leaf(all_pf, all_pf_ts, rt["ts"], section)
+
+            breakdown.append((ki, section, leaf))
         layer_data.append({
             "name": layer_name,
             "sub_modules": tuple(sub_mods),
@@ -504,8 +827,8 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
     # Build callsite map only for kernels in breakdowns (fast)
     target_kidxs = set()
     for lt in layer_types:
-        for kidx, _ in lt.get("kernel_breakdown", []):
-            target_kidxs.add(kidx)
+        for item in lt.get("kernel_breakdown", []):
+            target_kidxs.add(item[0])
     print(f"[INFO] Resolving call sites for {len(target_kidxs)} kernels...",
           file=sys.stderr)
     callsite_map = build_callsite_map(trace, kernels, ext_to_kidx, runtime,
@@ -571,32 +894,34 @@ def print_step3(cls_name: str, layer_types: list[dict],
               f"{' + '.join(lt['sub_modules'])}")
         print(f"  {'-'*90}")
 
-        current_module = None
-        module_dur = 0.0
+        current_top = None
+        top_dur = 0.0
         total_dur = 0.0
 
-        header = f"  {'#':>3}  {'Module':<30s}  {'Duration':>10}  {'Kernel Name'}"
+        header = f"  {'#':>3}  {'Detail':<40s}  {'Duration':>10}  {'Kernel Name'}"
         if kernel_stats:
             header += f"  {'(graph-ON avg)':>14}"
         print(header)
-        print(f"  {'-'*3}  {'-'*30}  {'-'*10}  {'-'*50}")
+        print(f"  {'-'*3}  {'-'*40}  {'-'*10}  {'-'*50}")
 
-        for pos, (kidx, mod_label) in enumerate(breakdown):
+        for pos, (kidx, top_mod, leaf) in enumerate(breakdown):
             k = kernels[kidx]
             dur = k["dur"]
             total_dur += dur
 
-            if mod_label != current_module:
-                if current_module is not None:
-                    print(f"  {'':>3}  {'Subtotal':>30}  {fmt_dur(module_dur):>10}")
+            if top_mod != current_top:
+                if current_top is not None:
+                    print(f"  {'':>3}  {'Subtotal':>40}  {fmt_dur(top_dur):>10}")
                     print()
-                current_module = mod_label
-                module_dur = 0.0
+                current_top = top_mod
+                top_dur = 0.0
+                print(f"  ---- {top_mod} ----")
 
-            module_dur += dur
+            top_dur += dur
+            detail = leaf if leaf else "(self)"
             name_display = k["name"][:60]
             cs = callsite_map.get(kidx, "") if callsite_map else ""
-            line = f"  {pos:>3}  {mod_label:<30s}  {fmt_dur(dur):>10}  {name_display}"
+            line = f"  {pos:>3}  {detail:<40s}  {fmt_dur(dur):>10}  {name_display}"
 
             if kernel_stats and k["name"] in stat_lookup:
                 avg = stat_lookup[k["name"]]["avg_dur"]
@@ -604,13 +929,13 @@ def print_step3(cls_name: str, layer_types: list[dict],
 
             print(line)
             if cs:
-                print(f"  {'':>3}  {'':>30}  {'':>10}  caller: {cs}")
+                print(f"  {'':>3}  {'':>40}  {'':>10}  caller: {cs}")
 
         # Last module subtotal
-        if current_module is not None:
-            print(f"  {'':>3}  {'Subtotal':>30}  {fmt_dur(module_dur):>10}")
+        if current_top is not None:
+            print(f"  {'':>3}  {'Subtotal':>40}  {fmt_dur(top_dur):>10}")
 
-        print(f"\n  {'':>3}  {'TOTAL':>30}  {fmt_dur(total_dur):>10}  "
+        print(f"\n  {'':>3}  {'TOTAL':>40}  {fmt_dur(total_dur):>10}  "
               f"({len(breakdown)} kernels)")
 
     print(f"\n{'='*100}\n")
@@ -632,8 +957,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Cuda-graph-OFF trace (for layer structure)")
     p.add_argument("--stream", type=int, default=None,
                    help="GPU stream ID (default: auto-detect)")
-    p.add_argument("--csv", metavar="DIR",
-                   help="Export CSVs to directory (step1_kernel_stats.csv, step3_layer_breakdown.csv)")
+    p.add_argument("--out", metavar="DIR",
+                   help="Export Excel files to directory (step1_kernel_stats.xlsx, step3_layer_breakdown.xlsx)")
     return p
 
 
@@ -642,11 +967,11 @@ def main() -> None:
     if not args.graph_on and not args.graph_off:
         sys.exit("Provide at least one: --graph-on or --graph-off")
 
-    # Prepare CSV output dir
-    csv_dir = None
-    if args.csv:
-        csv_dir = Path(args.csv)
-        csv_dir.mkdir(parents=True, exist_ok=True)
+    # Prepare output dir
+    out_dir = None
+    if args.out:
+        out_dir = Path(args.out)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
     kernel_stats = None
     cls_name = None
@@ -665,8 +990,8 @@ def main() -> None:
         kernel_stats = compute_kernel_stats(kernels_on)
         print_step1(kernel_stats)
 
-        if csv_dir:
-            write_step1_csv(kernel_stats, str(csv_dir / "step1_kernel_stats.csv"))
+        if out_dir:
+            write_step1(kernel_stats, str(out_dir / "step1_kernel_stats.xlsx"))
 
         del trace_on  # free memory
 
@@ -689,10 +1014,10 @@ def main() -> None:
             if layer_types:
                 print_step3(cls_name, layer_types, kernels_off, kernel_stats,
                             callsite_map)
-                if csv_dir:
-                    write_step3_csv(layer_types, kernels_off, kernel_stats,
-                                    str(csv_dir / "step3_layer_breakdown.csv"),
-                                    callsite_map)
+                if out_dir:
+                    write_step3(layer_types, kernels_off, kernel_stats,
+                                str(out_dir / "step3_layer_breakdown.xlsx"),
+                                callsite_map)
         else:
             print("[WARN] No nn.Module DecoderLayer events found.", file=sys.stderr)
 
