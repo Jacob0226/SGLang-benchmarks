@@ -2,7 +2,7 @@
 # Usage:
 # ./GLM.sh
 # ./GLM.sh --mtp --prof
-# ./GLM.sh 
+# ./GLM.sh --prof-combined           # profile without splitting prefill/decode
 # ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-5-FP8
 set -euo pipefail
 set -x
@@ -11,6 +11,7 @@ sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'
 
 MTP_ENABLED="false"
 PROF_ENABLED="false"
+PROF_COMBINED="false"   # if true: single combined trace (no --profile-by-stage)
 MTP_TAG=""
 MODEL_PATH="/data/huggingface/hub/zai-org/GLM-5-FP8"
 CURRENT_DIR=$(pwd)
@@ -23,6 +24,11 @@ while [[ $# -gt 0 ]]; do
         ;;
     --prof)
         PROF_ENABLED="true"
+        shift 1
+        ;;
+    --prof-combined)
+        PROF_ENABLED="true"
+        PROF_COMBINED="true"
         shift 1
         ;;
     --model)
@@ -54,20 +60,26 @@ in_out_tokens=("1024:1024" "8192:1024")
 random_range_ratio=0.8
 concurrencies=(4 8 16 32 64)
 PROMPT_MULTIPLIER=10
-PROF_CMD=(--profile --profile-num-steps 5 --profile-by-stage)
+if [ "$PROF_COMBINED" == "true" ]; then
+    PROF_CMD=(--profile --profile-num-steps 5)
+    COMBINED_SUFFIX="_Combined"
+else
+    PROF_CMD=(--profile --profile-num-steps 5 --profile-by-stage)
+    COMBINED_SUFFIX=""
+fi
 
 # ===================== Argument  =====================
 DOCKER="rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260326" # MI355
 # DOCKER="lmsysorg/sglang:v0.5.9-cu130-runtime" # B200
 SPECIAL_TAG="-bench"
-SPECIAL_TAG2="-InferenceMax-FP8Cache"
+SPECIAL_TAG2="-InferenceMax-KvFP8"
 if [ "$PROF_ENABLED" == "true" ]; then
     SPECIAL_TAG="-prof"
     concurrencies=(4)
     PROMPT_MULTIPLIER=2 # Faster for no cuda graph profiling
 
     # Debug
-    in_out_tokens=("1024:1024")
+    # in_out_tokens=("1024:1024")
     concurrencies=(4)
 fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
@@ -107,7 +119,7 @@ rename_profiler_artifacts() {
     local num_prompts=$4
     local before_dirs=$5
     local after_dirs=$6
-    local target_dir_name="prof_in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}"
+    local target_dir_name="prof_in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}${COMBINED_SUFFIX}"
     local target_dir_path="${LOG_DIR}/${target_dir_name}"
     local new_dirs
 
@@ -134,7 +146,7 @@ rename_profiler_artifacts() {
         [ -f "${trace_file}" ] || continue
         filename=$(basename "${trace_file}")
         tp_rank=$(sed -E 's/^.*-TP-([0-9]+)\.trace\.json\.gz$/\1/' <<< "${filename}")
-        new_name="in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}-TP-${tp_rank}.trace.json.gz"
+        new_name="in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}${COMBINED_SUFFIX}-TP-${tp_rank}${NOGRAPH_SUFFIX}.trace.json.gz"
         mv "${trace_file}" "${target_dir_path}/${new_name}"
         echo "Renamed trace: ${filename} -> ${new_name}"
     done
@@ -147,7 +159,7 @@ rename_profiler_artifacts_by_stage() {
     local num_prompts=$4
     local before_dirs=$5
     local after_dirs=$6
-    local target_dir_name="prof_in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}"
+    local target_dir_name="prof_in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}${COMBINED_SUFFIX}"
     local target_dir_path="${LOG_DIR}/${target_dir_name}"
     local new_dirs
 
@@ -181,7 +193,7 @@ rename_profiler_artifacts_by_stage() {
             continue
         fi
 
-        new_name="in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}-TP-${tp_rank}-${stage}.trace.json.gz"
+        new_name="in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}${COMBINED_SUFFIX}-TP-${tp_rank}-${stage}${NOGRAPH_SUFFIX}.trace.json.gz"
         mv "${trace_file}" "${target_dir_path}/${new_name}"
         echo "Renamed trace: ${filename} -> ${new_name}"
     done
@@ -314,7 +326,24 @@ run_benchmarks() {
                 cmd+=("${PROF_CMD[@]}")
             fi
 
-            if ! grep -q "$logfile" "$FINISH_LOG"; then
+            # Determine skip condition:
+            # - Profiling mode: skip if the profile output directory already exists
+            # - Benchmark mode: skip if logfile is recorded in Finish.log
+            local skip="false"
+            local prof_dir="${LOG_DIR}/prof_in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}${COMBINED_SUFFIX}"
+            if [ "$PROF_ENABLED" == "true" ]; then
+                if [ -d "${prof_dir}" ]; then
+                    echo "Found profile dir ${prof_dir}. Skipping."
+                    skip="true"
+                fi
+            else
+                if grep -q "$logfile" "$FINISH_LOG"; then
+                    echo "Found $logfile in ${FINISH_LOG}. Skipping."
+                    skip="true"
+                fi
+            fi
+
+            if [ "$skip" == "false" ]; then
                 echo "Running: $logfile"
                 local profiler_dirs_before=""
                 local profiler_dirs_after=""
@@ -333,8 +362,6 @@ run_benchmarks() {
                         rename_profiler_artifacts "${input_tokens}" "${output_tokens}" "${c}" "${num_prompts}" "${profiler_dirs_before}" "${profiler_dirs_after}"
                     fi
                 fi
-            else
-                echo "Found $logfile in ${FINISH_LOG}. Skipping."
             fi
         done
     done
@@ -352,8 +379,10 @@ BASE_LOG_DIR="$LOG_DIR"
 
 for PROF_MODE in "${PROF_SERVER_MODES[@]}"; do
     EXTRA_SERVER_ARGS=()
+    NOGRAPH_SUFFIX=""
     if [ "$PROF_MODE" == "no-cuda-graph" ]; then
         EXTRA_SERVER_ARGS=(--disable-cuda-graph)
+        NOGRAPH_SUFFIX="-NoGraph"
         LOG_DIR="${BASE_LOG_DIR}/no-cuda-graph"
         mkdir -p "$LOG_DIR"
         FINISH_LOG="$LOG_DIR/Finish.log"
