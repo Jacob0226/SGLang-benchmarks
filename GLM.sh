@@ -3,9 +3,6 @@
 # ./GLM.sh
 # ./GLM.sh --mtp --prof
 # ./GLM.sh 
-# ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-4.7
-# ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-4.7-FP8
-# ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-5 # B200 OOM
 # ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-5-FP8
 set -euo pipefail
 set -x
@@ -15,7 +12,7 @@ sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'
 MTP_ENABLED="false"
 PROF_ENABLED="false"
 MTP_TAG=""
-MODEL_PATH="/data/huggingface/hub/zai-org/GLM-4.7"
+MODEL_PATH="/data/huggingface/hub/zai-org/GLM-5-FP8"
 CURRENT_DIR=$(pwd)
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -41,33 +38,37 @@ done
 MODEL_NAME=$(basename "${MODEL_PATH%/}")
 if [[ "${MODEL_NAME}" == *GLM-5* ]]; then
     echo ">>> Detected GLM-5, ensuring transformers is up-to-date..."
-    pip install transformers==5.2.0 --break-system-packages
+    python3 -m pip install -U --no-cache-dir \
+        "git+https://github.com/huggingface/transformers.git@6ed9ee36f608fd145168377345bfc4a5de12e1e2"
 fi
 
 # ===================== Server and Benchmark Setting =====================
-# export ROCM_QUICK_REDUCE_QUANTIZATION=INT8 # Accuracy drop 0.95 --> 0.868
-if [[ "${MODEL_NAME}" == *GLM-4.7* ]]; then
-    unset ROCM_QUICK_REDUCE_QUANTIZATION
-fi
+# InferenceMax tuning (from InferenceX/glm5_fp8_mi355x.sh)
+export SAFETENSORS_FAST_GPU=1
+export SGLANG_ROCM_FUSED_DECODE_MLA=0
+export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
 HOST="localhost"
 PORT="8552"
 DATASET="random"
-in_out_tokens=("1000:1000" "8000:1000")
-random_range_ratio=1.0
+in_out_tokens=("1024:1024" "8192:1024")
+random_range_ratio=0.8
 concurrencies=(4 8 16 32 64)
-PROMPT_MULTIPLIER=8
+PROMPT_MULTIPLIER=10
 PROF_CMD=(--profile --profile-num-steps 5 --profile-by-stage)
 
 # ===================== Argument  =====================
-DOCKER="rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260222" # MI355
+DOCKER="rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260326" # MI355
 # DOCKER="lmsysorg/sglang:v0.5.9-cu130-runtime" # B200
 SPECIAL_TAG="-bench"
-SPECIAL_TAG2=""
+SPECIAL_TAG2="-InferenceMax-FP8Cache"
 if [ "$PROF_ENABLED" == "true" ]; then
     SPECIAL_TAG="-prof"
-    in_out_tokens=("1000:1000" "8000:1000")
     concurrencies=(4)
-    PROMPT_MULTIPLIER=2
+    PROMPT_MULTIPLIER=2 # Faster for no cuda graph profiling
+
+    # Debug
+    in_out_tokens=("1024:1024")
+    concurrencies=(4)
 fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
 LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}${MTP_TAG}${SPECIAL_TAG}${SPECIAL_TAG2}"
@@ -201,18 +202,22 @@ start_server() {
     echo ">>> Starting SGLang server" | tee "$logfile"
 
     local cmd=(
-        python3 -m sglang.launch_server 
+        python3 -m sglang.launch_server
             --model $MODEL_PATH
-            --tp 8 
+            --tp 8
             --host $HOST
             --port $PORT
-            --tool-call-parser glm47  
+            --tool-call-parser glm47
             --reasoning-parser glm45
+            --watchdog-timeout 1200
+            --mem-fraction-static 0.85
+            --kv-cache-dtype fp8_e4m3
             --disable-radix-cache
+            --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}'
             --watchdog-timeout 1200
     )
 
-    if [[ "${MODEL_NAME}" == *GLM-5* ]] && is_rocm_gpu_env; then
+    if is_rocm_gpu_env; then
         cmd+=(
             --nsa-prefill-backend tilelang
             --nsa-decode-backend tilelang
