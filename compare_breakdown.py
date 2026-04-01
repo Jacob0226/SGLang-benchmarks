@@ -334,9 +334,30 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
     arial_bold = Font(name="Arial", size=10, bold=True)
     header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2",
                               fill_type="solid")
-    subtotal_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA",
-                                fill_type="solid")
     thin_border = Border(bottom=Side(style="thin", color="CCCCCC"))
+
+    # Assign a distinct subtotal color per unique layer_type (in order of first appearance)
+    SUBTOTAL_PALETTE = [
+        "E2EFDA",  # green
+        "FCE4D6",  # orange
+        "EAD1DC",  # pink/rose
+        "D6DCE4",  # grey-blue
+        "E2D9F3",  # lavender
+        "D9F0D3",  # mint
+        "FFF2CC",  # yellow
+    ]
+    layer_type_color: dict[str, str] = {}
+
+    def _get_subtotal_fill(layer_type: str) -> PatternFill:
+        if layer_type not in layer_type_color:
+            idx = len(layer_type_color) % len(SUBTOTAL_PALETTE)
+            layer_type_color[layer_type] = SUBTOTAL_PALETTE[idx]
+        color = layer_type_color[layer_type]
+        return PatternFill(start_color=color, end_color=color, fill_type="solid")
+
+    # Pre-populate color map in section_meta order so colors are stable
+    for meta in section_meta:
+        _get_subtotal_fill(meta["layer_type"])
 
     COL_A_US = 7   # column G
     COL_B_US = 8   # column H
@@ -349,11 +370,18 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
         cell.alignment = Alignment(horizontal="center")
     ws.freeze_panes = "A2"
 
+    # Build a map from excel row -> layer_type for subtotal rows
+    subtotal_layer_type: dict[int, str] = {}
+    for meta in section_meta:
+        xl_sub = meta["subtotal_idx"] + 2  # +2: 1-indexed + header
+        subtotal_layer_type[xl_sub] = meta["layer_type"]
+
     # --- Write data rows ---
     for r, row_data in enumerate(rows, 2):
         is_separator = not any(row_data)
         is_subtotal = any(v in ("__SUM_A__", "__SUM_B__", "__RATIO__")
                           for v in row_data if isinstance(v, str))
+        row_fill = _get_subtotal_fill(subtotal_layer_type.get(r, "")) if is_subtotal else None
         for c, val in enumerate(row_data, 1):
             if val in ("__SUM_A__", "__SUM_B__", "__RATIO__"):
                 continue  # filled later with formulas
@@ -363,8 +391,8 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
                 pass
             cell = ws.cell(row=r, column=c, value=val if val != "" else None)
             cell.font = arial_bold if is_subtotal else arial
-            if is_subtotal:
-                cell.fill = subtotal_fill
+            if is_subtotal and row_fill:
+                cell.fill = row_fill
         if is_separator:
             for c in range(1, len(header) + 1):
                 ws.cell(row=r, column=c).border = thin_border
@@ -378,24 +406,25 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
         xl_row = meta["subtotal_idx"] + 2  # +2: 1-indexed + header
         data_start_xl = meta["data_start"] + 2
         data_end_xl = xl_row - 1  # row before subtotal
+        sfill = _get_subtotal_fill(meta["layer_type"])
 
         cell_a = ws.cell(row=xl_row, column=COL_A_US)
         cell_a.value = f"=SUM({ca}{data_start_xl}:{ca}{data_end_xl})"
         cell_a.font = arial_bold
-        cell_a.fill = subtotal_fill
+        cell_a.fill = sfill
         cell_a.number_format = "0.000"
 
         cell_b = ws.cell(row=xl_row, column=COL_B_US)
         cell_b.value = f"=SUM({cb}{data_start_xl}:{cb}{data_end_xl})"
         cell_b.font = arial_bold
-        cell_b.fill = subtotal_fill
+        cell_b.fill = sfill
         cell_b.number_format = "0.000"
 
         # Ratio in column J (10)
         cell_r = ws.cell(row=xl_row, column=10)
         cell_r.value = f"=IF({ca}{xl_row}>0,{cb}{xl_row}/{ca}{xl_row},\"\")"
         cell_r.font = arial_bold
-        cell_r.fill = subtotal_fill
+        cell_r.fill = sfill
         cell_r.number_format = "0%"
 
         subtotal_rows[meta["section"]] = xl_row
