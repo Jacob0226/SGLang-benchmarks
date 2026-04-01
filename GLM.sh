@@ -42,11 +42,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 MODEL_NAME=$(basename "${MODEL_PATH%/}")
-if [[ "${MODEL_NAME}" == *GLM-5* ]]; then
-    echo ">>> Detected GLM-5, ensuring transformers is up-to-date..."
-    python3 -m pip install -U --no-cache-dir \
-        "git+https://github.com/huggingface/transformers.git@6ed9ee36f608fd145168377345bfc4a5de12e1e2"
-fi
 
 # ===================== Server and Benchmark Setting =====================
 # InferenceMax tuning (from InferenceX/glm5_fp8_mi355x.sh)
@@ -72,7 +67,7 @@ fi
 DOCKER="rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260326" # MI355
 # DOCKER="lmsysorg/sglang:v0.5.9-cu130-runtime" # B200
 SPECIAL_TAG="-bench"
-SPECIAL_TAG2="-InferenceMax-KvFP8"
+SPECIAL_TAG2="-InferenceMax-KvFP8-SameSetting"
 if [ "$PROF_ENABLED" == "true" ]; then
     SPECIAL_TAG="-prof"
     concurrencies=(4)
@@ -234,6 +229,19 @@ start_server() {
             --nsa-prefill-backend tilelang
             --nsa-decode-backend tilelang
         )
+    else
+        # NVIDIA (B200) specific optimizations
+        cmd+=(
+            --quantization fp8
+            --attention-backend nsa
+            --nsa-prefill-backend trtllm
+            --nsa-decode-backend trtllm
+            --moe-runner-backend flashinfer_trtllm
+            --chunked-prefill-size 32768
+            --max-prefill-tokens 32768
+            --enable-flashinfer-allreduce-fusion
+            --stream-interval 30
+        )
     fi
 
     if [ "$MTP_ENABLED" == "true" ]; then
@@ -367,6 +375,19 @@ run_benchmarks() {
     done
 }
 
+
+# ===================== Package Setup =====================
+if [[ "${MODEL_NAME}" == *GLM-5* ]]; then
+    echo ">>> Installing transformers for GLM-5..."
+    if is_rocm_gpu_env; then
+        python3 -m pip install -U --no-cache-dir \
+            "git+https://github.com/huggingface/transformers.git@6ed9ee36f608fd145168377345bfc4a5de12e1e2"
+    else
+        pip install -q --no-deps --break-system-packages \
+            "transformers==5.2.0" "huggingface-hub==1.4.1"
+        export SGL_ENABLE_JIT_DEEPGEMM=1
+    fi
+fi
 
 # ------------------- Start -----------------
 if [ "$PROF_ENABLED" == "true" ]; then
