@@ -64,10 +64,10 @@ else
 fi
 
 # ===================== Argument  =====================
-DOCKER="rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260326" # MI355
+DOCKER="rocm/sgl-dev:v0.5.10rc0-rocm720-mi35x-20260406" # MI355
 # DOCKER="lmsysorg/sglang:v0.5.9-cu130-runtime" # B200
 SPECIAL_TAG="-bench"
-SPECIAL_TAG2="-InferenceMax-KvFP8-SameSetting"
+SPECIAL_TAG2="-Step10_Opt"
 if [ "$PROF_ENABLED" == "true" ]; then
     SPECIAL_TAG="-prof"
     concurrencies=(4)
@@ -378,13 +378,7 @@ run_benchmarks() {
 
 # ===================== Package Setup =====================
 if [[ "${MODEL_NAME}" == *GLM-5* ]]; then
-    echo ">>> Installing transformers for GLM-5..."
-    if is_rocm_gpu_env; then
-        python3 -m pip install -U --no-cache-dir \
-            "git+https://github.com/huggingface/transformers.git@6ed9ee36f608fd145168377345bfc4a5de12e1e2"
-    else
-        pip install -q --no-deps --break-system-packages \
-            "transformers==5.2.0" "huggingface-hub==1.4.1"
+    if ! is_rocm_gpu_env; then
         export SGL_ENABLE_JIT_DEEPGEMM=1
     fi
 fi
