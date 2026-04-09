@@ -76,7 +76,13 @@ def extract_gpu_kernels(trace: dict | list, stream: int | None = None) -> list[d
     return kernels
 
 
-def find_busiest_stream(trace: dict | list) -> int:
+def auto_detect_stream(trace: dict | list,
+                        single_stream_threshold: float = 0.8) -> int | None:
+    """Return a single dominant stream id, or None if kernels are spread
+    across many streams (e.g. GLM5 on B200 where each layer runs on its
+    own stream).  Passing stream=None to extract_gpu_kernels collects all
+    streams, which is the correct behaviour for multi-stream models.
+    """
     events = trace if isinstance(trace, list) else trace.get("traceEvents", [])
     counts: Counter = Counter()
     for ev in events:
@@ -87,7 +93,14 @@ def find_busiest_stream(trace: dict | list) -> int:
         counts[ev.get("tid")] += 1
     if not counts:
         sys.exit("[ERROR] No GPU kernels found in trace.")
-    return counts.most_common(1)[0][0]
+    total = sum(counts.values())
+    top_stream, top_count = counts.most_common(1)[0]
+    if top_count / total >= single_stream_threshold:
+        return top_stream
+    print(f"[INFO] Kernels spread across {len(counts)} streams "
+          f"(top stream has {top_count/total:.0%} of {total} kernels); "
+          f"collecting ALL streams.", file=sys.stderr)
+    return None
 
 
 def fmt_dur(us: float) -> str:
@@ -193,49 +206,114 @@ def write_step1(stats: list[dict], path: str) -> None:
     print(f"[INFO] Step 1 written to: {path}", file=sys.stderr)
 
 
-def write_step3(layer_types: list[dict], kernels: list[dict],
+def _strip_jit_hash(name: str) -> str:
+    """Strip JIT/Triton compilation hashes from kernel names.
+
+    JIT-compiled kernels (Triton, tilelang) often embed a run-specific
+    hex hash in their name so the same kernel may appear as:
+      graph-OFF:  act_quant_kernel_abc12345__kernel
+      graph-ON:   act_quant_kernel_def67890__kernel
+    Stripping the hash allows cross-trace name matching.
+    """
+    return re.sub(r'_[0-9a-fA-F]{6,}(?=_|$)', '', name)
+
+
+
+def _lookup_stat(name: str,
+                 stat_lookup: dict, stat_lookup_norm: dict) -> tuple[dict | None, str]:
+    """Three-level kernel stat lookup; returns (stat_dict_or_None, method_str)."""
+    s = stat_lookup.get(name)
+    if s is not None:
+        return s, "exact"
+    s = stat_lookup_norm.get(_strip_jit_hash(name))
+    if s is not None:
+        return s, "norm"
+    return None, ""
+
+
+def write_step3(layer_types: list[dict], kernels_off: list[dict],
                 kernel_stats: list[dict] | None, path: str,
                 callsite_map: dict | None = None) -> None:
-    """Export step 3 breakdown to Excel."""
-    stat_lookup = {}
+    """Export step 3 breakdown to Excel.
+
+    Structure comes from graph-OFF trace (layer types, kernel order, sections,
+    modules, call sites).  When graph-ON stats are available and a kernel name
+    can be matched (exact or hash-stripped), the graph-ON kernel name and
+    avg_dur are used as primary values; the graph-OFF name and single-pass
+    duration are kept as reference columns.
+
+    Output columns:
+      LayerType, LayerCount, Index, Section, LeafModule,
+      KernelName,       ← graph-ON name if matched, else graph-OFF name
+      AvgDuration_us,   ← graph-ON avg_dur if matched, else graph-OFF dur
+      Count, SumDuration_us, Percentage,  ← graph-ON stats (empty if not matched)
+      MatchMethod,      ← "exact" / "norm" / "none"
+      GraphOFF_KernelName, GraphOFF_Duration_us,  ← graph-OFF reference
+      CallSite
+    """
+    # Build stat lookups (exact + hash-normalized)
+    stat_lookup: dict[str, dict] = {}
+    stat_lookup_norm: dict[str, dict] = {}
     if kernel_stats:
         for s in kernel_stats:
             stat_lookup[s["name"]] = s
+            norm = _strip_jit_hash(s["name"])
+            if norm not in stat_lookup_norm:
+                stat_lookup_norm[norm] = s
 
-    headers = ["LayerType", "LayerCount", "Index",
-                "Section", "LeafModule",
-                "KernelName", "Duration_us"]
-    if kernel_stats:
-        headers += ["GraphON_AvgDuration_us", "GraphON_Count",
-                    "GraphON_SumDuration_us", "GraphON_Percentage"]
-    headers.append("CallSite")
+    headers = ["LayerType", "LayerCount", "Index", "Section", "LeafModule",
+               "KernelName", "AvgDuration_us",
+               "Count", "SumDuration_us", "Percentage",
+               "MatchMethod",
+               "GraphOFF_KernelName", "GraphOFF_Duration_us",
+               "CallSite"]
 
     rows = []
     for i, lt in enumerate(layer_types):
         if i > 0:
             rows.append([""] * len(headers))
-
         label = chr(ord("A") + i)
         sub_mod_str = " + ".join(lt["sub_modules"])
-        breakdown = lt.get("kernel_breakdown", [])
-        for pos, (kidx, top_mod, leaf) in enumerate(breakdown):
-            k = kernels[kidx]
-            cs = callsite_map.get(kidx, "") if callsite_map else ""
-            row = [f"{label}: {sub_mod_str}", lt["count"], pos,
-                   top_mod, leaf if leaf else "(self)",
-                   k["name"], round(k["dur"], 1)]
+        for pos, (kidx, top_mod, leaf) in enumerate(lt.get("kernel_breakdown", [])):
+            k = kernels_off[kidx]
+            off_name = k["name"]
+            off_dur = round(k["dur"], 1)
+            cs = (callsite_map or {}).get(kidx, "")
+
             if kernel_stats:
-                s = stat_lookup.get(k["name"])
-                if s:
-                    row += [round(s["avg_dur"], 3), s["count"],
-                            round(s["sum_dur"], 1), round(s["pct"], 2)]
-                else:
-                    row += ["", "", "", ""]
-            row.append(cs)
+                s, method = _lookup_stat(off_name, stat_lookup, stat_lookup_norm)
+            else:
+                s, method = None, "none"
+
+            if s:
+                kernel_name = s["name"]
+                avg_dur = round(s["avg_dur"], 3)
+                count = s["count"]
+                sum_dur = round(s["sum_dur"], 1)
+                pct = round(s["pct"], 2)
+            else:
+                kernel_name = off_name
+                avg_dur = off_dur
+                count = ""
+                sum_dur = ""
+                pct = ""
+                method = "none"
+
+            row = [f"{label}: {sub_mod_str}", lt["count"], pos,
+                   top_mod, leaf or "(self)",
+                   kernel_name, avg_dur,
+                   count, sum_dur, pct,
+                   method,
+                   off_name, off_dur,
+                   cs]
             rows.append(row)
 
     _write_xlsx(headers, rows, path)
-    print(f"[INFO] Step 3 written to: {path}", file=sys.stderr)
+    n_matched = sum(1 for r in rows if r and r[10] != "none" and r[10] != "")
+    n_total = sum(1 for r in rows if r and r[2] != "")
+    print(f"[INFO] Step 3 written to: {path} "
+          f"({n_total} kernels, {n_matched} matched to graph-ON)",
+          file=sys.stderr)
 
 
 # ===================================================================
@@ -802,7 +880,13 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
     # === Fallback: recover unlinked kernels via GPU-timestamp interpolation ===
     # Some kernels (e.g. launched via cudaLaunchKernelExC) lack matching
     # cuda_runtime events, so get_kernels_for_module cannot find them.
-    # Recover by locating them in the GPU timeline relative to linked kernels.
+    # We handle two sub-cases:
+    #   (a) Kernels that fall WITHIN the forward-pass GPU time window →
+    #       assign to the same layer/section as the nearest preceding linked kernel.
+    #   (b) Kernels that fall OUTSIDE (after) the forward-pass window →
+    #       these are inter-layer / model-level ops (allreduce, residual norms, etc.)
+    #       that execute between decoder layers.  Collect them into a synthetic
+    #       "(inter-layer)" layer_data entry so they show up labelled in Step 3.
     linked_entries = []  # (gpu_ts, kernel_idx, layer_data_idx, section)
     for ldi, ld in enumerate(layer_data):
         for ki, section, _leaf in ld["kernel_breakdown"]:
@@ -816,13 +900,19 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
         entry_ts = [e[0] for e in linked_entries]
 
         unlinked_by_layer: dict[int, list] = {}
+        inter_layer_kidxs: list[int] = []   # case (b): outside forward-pass window
+
         for ki in range(len(kernels)):
             if ki in assigned_kidxs:
                 continue
             k = kernels[ki]
-            if k["ts"] < fp_gpu_start or k["ts"] > fp_gpu_end:
+            if k["ts"] < fp_gpu_start:
+                continue  # before forward pass — ignore
+            if k["ts"] > fp_gpu_end:
+                # case (b): inter-layer / post-layer kernel
+                inter_layer_kidxs.append(ki)
                 continue
-            # Assign to same layer/section as nearest preceding linked kernel
+            # case (a): within window — assign to nearest preceding linked kernel
             pos = bisect.bisect_right(entry_ts, k["ts"]) - 1
             if pos < 0:
                 ldi = linked_entries[0][2]
@@ -846,6 +936,11 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
         if n_recovered:
             print(f"[INFO] Recovered {n_recovered} unlinked kernels via "
                   f"GPU-timestamp interpolation", file=sys.stderr)
+
+        if inter_layer_kidxs:
+            print(f"[INFO] Skipping {len(inter_layer_kidxs)} kernels outside "
+                  f"decoder-layer GPU window (inter-layer / post-layer ops)",
+                  file=sys.stderr)
 
     # Group by sub_module signature
     groups: OrderedDict = OrderedDict()
@@ -1008,6 +1103,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="GPU stream ID (default: auto-detect)")
     p.add_argument("--out", metavar="DIR",
                    help="Export Excel files to directory (step1_kernel_stats.xlsx, step3_layer_breakdown.xlsx)")
+    p.add_argument("--tag", metavar="TAG", default="",
+                   help="Append tag to output filenames, e.g. --tag _ATOM → step3_layer_breakdown_ATOM.xlsx")
     return p
 
 
@@ -1031,27 +1128,28 @@ def main() -> None:
     if args.graph_on:
         print(f"[INFO] Step 1: Loading graph-ON trace: {args.graph_on}", file=sys.stderr)
         trace_on = load_trace(args.graph_on)
-        stream_on = args.stream or find_busiest_stream(trace_on)
+        stream_on = args.stream if args.stream is not None else auto_detect_stream(trace_on)
         kernels_on = extract_gpu_kernels(trace_on, stream=stream_on)
-        print(f"[INFO] Found {len(kernels_on)} kernels on stream {stream_on}",
+        stream_desc = f"stream {stream_on}" if stream_on is not None else "all streams"
+        print(f"[INFO] Found {len(kernels_on)} kernels on {stream_desc}",
               file=sys.stderr)
 
         kernel_stats = compute_kernel_stats(kernels_on)
         print_step1(kernel_stats)
+        del trace_on, kernels_on  # free memory; stats are all we need
 
         if out_dir:
-            write_step1(kernel_stats, str(out_dir / "step1_kernel_stats.xlsx"))
-
-        del trace_on  # free memory
+            write_step1(kernel_stats, str(out_dir / f"step1_kernel_stats{args.tag}.xlsx"))
 
     # --- Step 2: Layer structure from graph-OFF trace ---
     if args.graph_off:
         print(f"[INFO] Step 2: Loading graph-OFF trace: {args.graph_off}",
               file=sys.stderr)
         trace_off = load_trace(args.graph_off)
-        stream_off = args.stream or find_busiest_stream(trace_off)
+        stream_off = args.stream if args.stream is not None else auto_detect_stream(trace_off)
         kernels_off = extract_gpu_kernels(trace_off, stream=stream_off)
-        print(f"[INFO] Found {len(kernels_off)} kernels on stream {stream_off}",
+        stream_desc = f"stream {stream_off}" if stream_off is not None else "all streams"
+        print(f"[INFO] Found {len(kernels_off)} kernels on {stream_desc}",
               file=sys.stderr)
 
         cls_name, layer_types, callsite_map = analyze_layer_structure(
@@ -1065,7 +1163,7 @@ def main() -> None:
                             callsite_map)
                 if out_dir:
                     write_step3(layer_types, kernels_off, kernel_stats,
-                                str(out_dir / "step3_layer_breakdown.xlsx"),
+                                str(out_dir / f"step3_layer_breakdown{args.tag}.xlsx"),
                                 callsite_map)
         else:
             print("[WARN] No nn.Module DecoderLayer events found.", file=sys.stderr)
