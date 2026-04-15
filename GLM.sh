@@ -3,6 +3,7 @@
 # ./GLM.sh
 # ./GLM.sh --mtp --prof
 # ./GLM.sh --prof-combined           # profile without splitting prefill/decode
+# ./GLM.sh --dual-stream-rocm        # disable shared-experts-fusion for dual stream on ROCm
 # ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-5-FP8
 set -euo pipefail
 set -x
@@ -12,6 +13,7 @@ sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'
 MTP_ENABLED="false"
 PROF_ENABLED="false"
 PROF_COMBINED="false"   # if true: single combined trace (no --profile-by-stage)
+DUAL_STREAM_ROCM="false"
 MTP_TAG=""
 MODEL_PATH="/data/huggingface/hub/zai-org/GLM-5-FP8"
 CURRENT_DIR=$(pwd)
@@ -31,6 +33,10 @@ while [[ $# -gt 0 ]]; do
         PROF_COMBINED="true"
         shift 1
         ;;
+    --dual-stream-rocm)
+        DUAL_STREAM_ROCM="true"
+        shift 1
+        ;;
     --model)
         MODEL_PATH="$2"
         shift 2
@@ -48,10 +54,11 @@ MODEL_NAME=$(basename "${MODEL_PATH%/}")
 export SAFETENSORS_FAST_GPU=1
 export SGLANG_ROCM_FUSED_DECODE_MLA=0
 export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
+# export AITER_ONLINE_TUNE=1
 HOST="localhost"
 PORT="8552"
 DATASET="random"
-in_out_tokens=("1024:1024" "8192:1024")
+in_out_tokens=("8192:1024" "1024:1024")
 random_range_ratio=0.8
 concurrencies=(4 8 16 32 64)
 PROMPT_MULTIPLIER=10
@@ -64,10 +71,10 @@ else
 fi
 
 # ===================== Argument  =====================
-DOCKER="rocm/sgl-dev:v0.5.10rc0-rocm720-mi35x-20260406" # MI355
+DOCKER="rocm/sgl-dev:v0.5.10rc0-rocm720-mi35x-20260412" # MI355
 # DOCKER="lmsysorg/sglang:v0.5.9-cu130-runtime" # B200
 SPECIAL_TAG="-bench"
-SPECIAL_TAG2="-Step10_Opt"
+SPECIAL_TAG2="-DualStream"
 if [ "$PROF_ENABLED" == "true" ]; then
     SPECIAL_TAG="-prof"
     concurrencies=(4)
@@ -229,6 +236,9 @@ start_server() {
             --nsa-prefill-backend tilelang
             --nsa-decode-backend tilelang
         )
+        if [ "$DUAL_STREAM_ROCM" == "true" ]; then
+            cmd+=(--disable-shared-experts-fusion)
+        fi
     else
         # NVIDIA (B200) specific optimizations
         cmd+=(
@@ -286,6 +296,7 @@ warmup() {
         --random-range-ratio "${random_range_ratio}"
         --max-concurrency 4 
         --num-prompt 8 
+        --output-file /dev/null
     )
     log_command "$warmup_log" "${warmup_cmd[@]}"
 }
@@ -327,6 +338,7 @@ run_benchmarks() {
                 --random-range-ratio "${random_range_ratio}"
                 --max-concurrency "${c}"
                 --num-prompt "${num_prompts}"
+                --output-file /dev/null
             )
             
             # Add profiling args
