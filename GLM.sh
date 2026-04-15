@@ -410,6 +410,7 @@ for PROF_MODE in "${PROF_SERVER_MODES[@]}"; do
     if [ "$PROF_MODE" == "no-cuda-graph" ]; then
         EXTRA_SERVER_ARGS=(--disable-cuda-graph)
         NOGRAPH_SUFFIX="-NoGraph"
+        PROMPT_MULTIPLIER=1
         LOG_DIR="${BASE_LOG_DIR}/no-cuda-graph"
         mkdir -p "$LOG_DIR"
         FINISH_LOG="$LOG_DIR/Finish.log"
