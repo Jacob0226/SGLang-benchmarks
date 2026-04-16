@@ -5,6 +5,7 @@
 # ./GLM.sh --prof-combined           # profile without splitting prefill/decode
 # ./GLM.sh --dual-stream-rocm        # disable shared-experts-fusion for dual stream on ROCm
 # ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-5-FP8
+# ./GLM.sh --prof --dual-stream-rocm --tag DualStream
 set -euo pipefail
 set -x
 ulimit -n 65535
@@ -15,6 +16,7 @@ PROF_ENABLED="false"
 PROF_COMBINED="false"   # if true: single combined trace (no --profile-by-stage)
 DUAL_STREAM_ROCM="false"
 MTP_TAG=""
+USER_TAG=""
 MODEL_PATH="/data/huggingface/hub/zai-org/GLM-5-FP8"
 CURRENT_DIR=$(pwd)
 while [[ $# -gt 0 ]]; do
@@ -39,6 +41,10 @@ while [[ $# -gt 0 ]]; do
         ;;
     --model)
         MODEL_PATH="$2"
+        shift 2
+        ;;
+    --tag)
+        USER_TAG="-$2"
         shift 2
         ;;
     *)
@@ -74,7 +80,6 @@ fi
 DOCKER="rocm/sgl-dev:v0.5.10rc0-rocm720-mi35x-20260412" # MI355
 # DOCKER="lmsysorg/sglang:v0.5.9-cu130-runtime" # B200
 SPECIAL_TAG="-bench"
-SPECIAL_TAG2="-DualStream"
 if [ "$PROF_ENABLED" == "true" ]; then
     SPECIAL_TAG="-prof"
     concurrencies=(4)
@@ -85,7 +90,7 @@ if [ "$PROF_ENABLED" == "true" ]; then
     concurrencies=(4)
 fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
-LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}${MTP_TAG}${SPECIAL_TAG}${SPECIAL_TAG2}"
+LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}${MTP_TAG}${SPECIAL_TAG}${USER_TAG}"
 FINISH_LOG="$LOG_DIR/Finish.log"
 mkdir -p "$LOG_DIR"
 touch "$FINISH_LOG"
