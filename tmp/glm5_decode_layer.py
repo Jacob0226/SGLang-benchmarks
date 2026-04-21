@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-GLM-5.1-FP8 single decode-layer micro-benchmark on MI355X (gfx95) — v3.
+GLM-5.1-FP8 single decode-layer micro-benchmark on MI355X (gfx95) — v5.
 
-Uses real aiter / CK / sgl-kernel / Triton kernels to match the actual
-SGLang decode trace as closely as possible.  Compared to bench.py this
-version adds:
-  - NSA Indexer RoPE (aiter.rotary_embedding_fwd)
-  - Indexer paged MQA logits (deepgemm_fp8_paged_mqa_logits)
-  - Indexer fill(-inf) + mul_unsqueeze before topk
-  - Correct topk_transform_decode dispatch for batch>1
+Uses real aiter / CK / TileLang / sgl-kernel / Triton kernels matching
+the actual SGLang decode trace with:
+  --nsa-decode-backend tilelang --disable-shared-experts-fusion
 
-Still uses bmm proxy for MLA decode attention because aiter mla_decode_fwd
-requires >=16 q-heads (TP=8 gives only 8 local heads).  TP allreduce is
-omitted (single-card benchmark).
+Key kernels (matching real SGLang trace):
+  - MLA decode: TileLang sparse_mla_fwd_decode_partial + combine (main_kernel ×2)
+  - NSA RoPE: rope_cached_positions_2c_fwd_inplace (kn_entry_2c_sbhd)
+  - weights_proj: F.linear → hipBLAS Cijk (FP32 weights)
+  - Router gate: wv_splitk_small_fp16_bf16
+  - kv_a_norm on alt stream (matching real stream placement)
+
+Allreduce and torch.compile fusions are not benchmarked (single-card).
 
 Usage:
-    python glm5_decode_layer_v3.py
-    python glm5_decode_layer_v3.py --profile --prof-tag v3
-    python glm5_decode_layer_v3.py --batch-size 1 --num-layers 3 --profile --prof-tag v3
+    python glm5_decode_layer.py
+    python glm5_decode_layer.py --profile --prof-tag v5
+    python glm5_decode_layer.py --batch-size 4 --num-layers 3 --profile
 """
 
 import os
@@ -96,10 +97,10 @@ from sgl_kernel import fast_topk_transform_fused
 # SGLang TileLang kernel (needs mocked sglang.srt.layers.quantization)
 from sglang.srt.layers.attention.nsa.tilelang_kernel import act_quant
 
-# Router GEMM (BF16 → FP32 via gemm_a16w16_atomic)
-from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
-# Skinny BF16 GEMM (weights_proj in NSA indexer)
+# Skinny BF16 GEMM: wv_splitk for router gate, F.linear for weights_proj
 from aiter import wv_splitk_small_fp16_bf16 as aiter_wv_splitk
+# TileLang sparse MLA decode attention kernel (matches --nsa-decode-backend tilelang)
+from sglang.srt.layers.attention.nsa.tilelang_kernel import tilelang_sparse_fwd
 
 # NSA indexer k cache store
 from sglang.srt.layers.attention.nsa.index_buf_accessor import _set_k_and_s_triton
@@ -114,9 +115,9 @@ except Exception:
 
 HAS_AITER_ROPE = False
 try:
-    _test_rope = aiter.rotary_embedding_fwd
+    from aiter.ops.rope import rope_cached_positions_2c_fwd_inplace
     HAS_AITER_ROPE = True
-except AttributeError:
+except Exception:
     pass
 
 
@@ -224,12 +225,10 @@ class IndexerWeights:
         self.k_norm_w = torch.ones(cfg.index_head_dim, dtype=BF16, device=device)
         self.k_norm_b = torch.zeros(cfg.index_head_dim, dtype=BF16, device=device)
 
+        # FP32 weights on HIP (matches real SGLang ReplicatedLinear params_dtype)
         self.weights_proj_w = (
-            torch.randn(cfg.index_n_heads, cfg.hidden_size, dtype=BF16, device=device)
+            torch.randn(cfg.index_n_heads, cfg.hidden_size, dtype=FP32, device=device)
             * 0.01
-        )
-        self.weights_proj_out = torch.empty(
-            cfg.batch_size, cfg.index_n_heads, dtype=BF16, device=device
         )
 
         INDEX_TOPK = 2048
@@ -281,13 +280,13 @@ class IndexerWeights:
         )
         self.nsa_k_loc = torch.arange(M, dtype=torch.long, device=device)
 
-        # RoPE cos/sin tables — RoPE applies to rope_head_dim (64), not full
-        # index_head_dim (128).  Real SGLang splits q/k into rope + nope slices.
+        # RoPE cos/sin caches — matches DeepseekScalingRotaryEmbedding format
+        # [max_pos, 1, 1, rope_dim//2].  The 2c kernel expects 4D cos/sin.
         self.rope_head_dim = cfg.qk_rope_head_dim  # 64
         max_pos = cfg.seq_len + 128
         rope_cos_dim = self.rope_head_dim // 2      # 32
-        self.rope_cos = torch.ones(max_pos, rope_cos_dim, dtype=BF16, device=device)
-        self.rope_sin = torch.zeros(max_pos, rope_cos_dim, dtype=BF16, device=device)
+        self.rope_cos = torch.ones(max_pos, 1, 1, rope_cos_dim, dtype=BF16, device=device)
+        self.rope_sin = torch.zeros(max_pos, 1, 1, rope_cos_dim, dtype=BF16, device=device)
         self.rope_positions = torch.randint(
             0, cfg.seq_len, (M,), dtype=torch.long, device=device
         )
@@ -304,9 +303,9 @@ class MoEWeights:
         self.correction_bias = torch.zeros(
             cfg.n_routed_experts, dtype=BF16, device=device
         )
-        # Pre-allocated router output buffer (avoids alloc in graph capture)
+        # Pre-allocated router output buffer (wv_splitk outputs BF16)
         self.router_out = torch.zeros(
-            cfg.batch_size, cfg.n_routed_experts, dtype=FP32, device=device
+            cfg.batch_size, cfg.n_routed_experts, dtype=BF16, device=device
         )
 
         # shared expert (TP-sharded)
@@ -331,13 +330,6 @@ class MoEWeights:
 
 
 # ── KV cache (decode attention) ──────────────────────────────────────────
-def _next_pow2_static(n):
-    p = 1
-    while p < n:
-        p <<= 1
-    return p
-
-
 class KVCache:
     def __init__(self, cfg: GLM5Config, batch_size: int, device="cuda"):
         S = cfg.seq_len
@@ -355,12 +347,6 @@ class KVCache:
             batch_size, 1, cfg.qk_rope_head_dim, dtype=BF16, device=device
         )
 
-        # Pre-allocated padded q_nope buffer (avoids alloc during graph capture)
-        d_nope_p2 = _next_pow2_static(cfg.qk_nope_head_dim)
-        self.q_nope_pad_buf = torch.zeros(
-            batch_size, cfg.num_local_heads, d_nope_p2, dtype=BF16, device=device
-        )
-
         # output (written by phase3_attn_core)
         self.attn_output = torch.zeros(
             batch_size, cfg.num_local_heads, cfg.kv_lora_rank, dtype=BF16, device=device
@@ -369,7 +355,8 @@ class KVCache:
 
 # ── Phase implementations ─────────────────────────────────────────────────
 def phase1_pre_attention(hidden, residual, attn_w, cfg, norm_w):
-    """fused_rms_fp8_group_quant (Triton: add+norm+FP8 quant) → fused_qkv_a_proj (CK FP8 GEMM)."""
+    """fused_rms_fp8_group_quant (Triton: add+norm+FP8 quant) → fused_qkv_a_proj (CK FP8 GEMM).
+    Returns pre-quantized (normed_fp8, normed_scale) so alt stream can reuse for wk proj."""
     (normed_fp8, normed_scale), normed_bf16, _, res_out = fused_rms_fp8_group_quant(
         hidden, norm_w, cfg.rms_norm_eps,
         inp2=None, inp2_weight=None, inp2_epsilon=None,
@@ -383,52 +370,53 @@ def phase1_pre_attention(hidden, residual, attn_w, cfg, norm_w):
     )
     q_lat = qkv[..., : cfg.q_lora_rank]
     kv_lat = qkv[..., cfg.q_lora_rank : cfg.q_lora_rank + cfg.kv_lora_rank]
-    return normed_bf16, res_out, q_lat, kv_lat
+    return normed_bf16, res_out, q_lat, kv_lat, normed_fp8, normed_scale
 
 
-def phase2_current(q_lat, kv_lat, attn_w, cfg):
-    """q_a_norm + kv_a_norm (separate aiter rmsnorm) → FP8 quant → q_b_proj CK GEMM."""
+def phase2_current(q_lat, attn_w, cfg):
+    """q_a_norm → FP8 quant → q_b_proj CK GEMM (kv_a_norm moved to alt stream)."""
     M = q_lat.shape[0]
 
     q_lora = aiter_rms_norm(q_lat, attn_w.q_a_ln_w, cfg.rms_norm_eps)
-    kv_normed = aiter_rms_norm(kv_lat, attn_w.kv_a_ln_w, cfg.rms_norm_eps)
 
     q_fp8, q_scale = per1x128_quant(q_lora, quant_dtype=FP8)
     q = ck_gemm_a8w8_blockscale(q_fp8, attn_w.q_b_w, q_scale, attn_w.q_b_s, dtype=BF16)
     q = q.view(M, cfg.num_local_heads, cfg.qk_head_dim)
-    return q, q_lora, kv_normed
+    return q, q_lora
 
 
-def phase2_alt(h_normed, q_lora, idx_w, cfg):
-    """NSA Indexer: wq_b → wk → k_norm → RoPE → hadamard → act_quant →
-    weights_proj → fill(-inf) → paged_mqa → topk_transform_decode."""
-    M = h_normed.shape[0]
+def phase2_alt(h_normed, h_fp8, h_scale, q_lora, kv_lat, attn_w, idx_w, cfg):
+    """kv_a_norm (moved here to match real trace) + NSA Indexer: wq_b → wk →
+    k_norm → RoPE → hadamard → act_quant → weights_proj → fill(-inf) →
+    paged_mqa → topk_transform_decode.
+    h_fp8/h_scale: pre-quantized h_normed from phase1 (avoids re-quantizing)."""
+    M = h_fp8.shape[0]
+
+    # kv_a_norm on alt stream (matches real SGLang stream 106 placement)
+    kv_normed = aiter_rms_norm(kv_lat, attn_w.kv_a_ln_w, cfg.rms_norm_eps)
 
     idx_q = fp8_gemm(q_lora, idx_w.wq_b_w, idx_w.wq_b_s)
     idx_q = idx_q.view(M, cfg.index_n_heads, cfg.index_head_dim)
 
-    idx_k = fp8_gemm(h_normed, idx_w.wk_w, idx_w.wk_s)
+    # Reuse pre-quantized h_normed from phase1 (no extra dynamic_per_group_quant)
+    idx_k = ck_gemm_a8w8_blockscale(h_fp8, idx_w.wk_w, h_scale, idx_w.wk_s, dtype=BF16)
     idx_k = aiter_layernorm2d(idx_k, idx_w.k_norm_w, idx_w.k_norm_b, 1e-5)
 
-    # RoPE on the rope-portion of q and k (real SGLang splits into rope/nope
-    # slices; RoPE only applies to the first rope_head_dim=64 dims).
-    # The kernel expects 2D [num_tokens, num_heads*head_size] tensors —
-    # passing 3D causes it to miscompute num_tokens and OOB-read positions.
+    # RoPE via rope_cached_positions_2c_fwd_inplace (in-place on 4D tensors,
+    # same kernel as real SGLang: kn_entry_2c_sbhd_cached_indirect_inplace).
+    # Reshape to [1, M, heads, head_dim] for the 2c kernel, slice rope portion.
     if HAS_AITER_ROPE:
         rd = idx_w.rope_head_dim  # 64
-        q_rope = idx_q[..., :rd].contiguous()                    # [M, n_heads, 64]
-        k_rope = idx_k[..., :rd].contiguous()                    # [M, 64]
-        q_rope_2d = q_rope.reshape(M, cfg.index_n_heads * rd)    # [M, n_heads*64]
-        k_rope_2d = k_rope.reshape(M, rd)                        # [M, 64]
-        aiter.rotary_embedding_fwd(
-            idx_w.rope_positions[:M], q_rope_2d, k_rope_2d,
-            rd,
-            idx_w.rope_cos, idx_w.rope_sin,
-            True, False,
+        idx_q_4d = idx_q.unsqueeze(0)               # [1, M, n_heads, head_dim]
+        idx_k_4d = idx_k.unsqueeze(0).unsqueeze(2)   # [1, M, 1, head_dim]
+        pos = idx_w.rope_positions[:M].unsqueeze(0)   # [1, M]
+        rope_cached_positions_2c_fwd_inplace(
+            idx_q_4d[..., :rd], idx_k_4d[..., :rd],
+            idx_w.rope_cos, idx_w.rope_sin, pos,
+            0, True, False,
         )
-        q_rope = q_rope_2d.view(M, cfg.index_n_heads, rd)
-        idx_q = torch.cat([q_rope, idx_q[..., rd:]], dim=-1)
-        idx_k = torch.cat([k_rope_2d.view(M, rd), idx_k[..., rd:]], dim=-1)
+        idx_q = idx_q_4d.squeeze(0)
+        idx_k = idx_k_4d.squeeze(0).squeeze(1)
 
     scale = cfg.index_head_dim**-0.5
     idx_q = hadamard_transform(idx_q.contiguous(), scale=scale)
@@ -448,11 +436,9 @@ def phase2_alt(h_normed, q_lora, idx_w, cfg):
         page_size=1,
     )
 
-    # weights_proj: wv_splitk BF16 GEMM → float → scale → unsqueeze
-    wp_out = idx_w.weights_proj_out[:M]
-    aiter_wv_splitk(idx_w.weights_proj_w, h_normed, wp_out, M, 256)
-    weights = wp_out.float()
-    weights = (weights * (cfg.index_n_heads**-0.5)).unsqueeze(1)  # [M, 1, n_heads]
+    # weights_proj: F.linear → hipBLAS GEMM (matches real SGLang trace: Cijk + PostGSU)
+    weights = F.linear(h_normed.to(idx_w.weights_proj_w.dtype), idx_w.weights_proj_w)
+    weights = (weights.float() * (cfg.index_n_heads**-0.5)).unsqueeze(1)  # [M, 1, n_heads]
 
     # Fill logits with -inf, then overwrite via paged MQA
     idx_w.topk_logits[:M].fill_(float("-inf"))
@@ -478,19 +464,13 @@ def phase2_alt(h_normed, q_lora, idx_w, cfg):
         idx_w.topk_page_table[:M], idx_w.topk_cu_seqlens_q,
         idx_w.topk_k,
     )
-    return topk_ids
+    return topk_ids, kv_normed
 
 
-def _next_pow2(n):
-    p = 1
-    while p < n:
-        p <<= 1
-    return p
-
-
-def phase3_attn_core(q, kv_normed, attn_w, cfg, kv_cache):
-    """fused_qk_rope_cat (padded) → w_kc batched GEMM → MLA decode attention (bmm proxy) →
-    w_vc batched GEMM → fused_flatten_fp8_group_quant → o_proj CK GEMM.
+def phase3_attn_core(q, kv_normed, attn_w, cfg, kv_cache, topk_ids):
+    """w_kc batched GEMM → fused_qk_rope_cat → cat q_all → TileLang sparse MLA decode
+    (partial + combine = 2× main_kernel) → w_vc batched GEMM →
+    fused_flatten_fp8_group_quant → o_proj CK GEMM.
     """
     M = q.shape[0]
     H = cfg.num_local_heads
@@ -500,17 +480,24 @@ def phase3_attn_core(q, kv_normed, attn_w, cfg, kv_cache):
     k_nope = kv_normed.unsqueeze(1)  # [M, 1, kv_lora]
     k_pe = kv_cache.k_pe_buf[:M]     # [M, 1, rope_dim]
 
-    # Pad q_nope to next power of 2 for Triton's tl.arange constraint
-    d_nope = cfg.qk_nope_head_dim
-    d_nope_p2 = _next_pow2(d_nope)
-    if d_nope != d_nope_p2:
-        q_nope_padded = kv_cache.q_nope_pad_buf[:M, :H, :d_nope_p2]
-        q_nope_padded[:, :, :d_nope] = q_nope
-    else:
-        q_nope_padded = q_nope
+    # batched GEMM w_kc FIRST (matches SGLang order: absorb before RoPE)
+    # [M, H, nope=192] → [H, M, kv_lora=512]
+    q_nope_absorbed = batched_fp8_gemm(
+        X=q_nope,
+        WQ=attn_w.w_kc.transpose(-1, -2),
+        w_scale=attn_w.w_scale,
+        group_size=128,
+        YQ=None,
+        transpose_bm=False,
+        transpose_bm_in=True,
+        dtype=BF16,
+    )
+    q_nope_absorbed = q_nope_absorbed.transpose(0, 1)  # [M, H, kv_lora=512]
 
+    # fused_qk_rope: RoPE on q_pe/k_pe + store k cache
+    # q_nope_absorbed is 512-dim (already power-of-2, no padding needed)
     q_out, _, _, _ = fused_qk_rope_cat_and_cache_mla(
-        q_nope_padded,
+        q_nope_absorbed,
         q_pe,
         k_nope,
         k_pe,
@@ -522,36 +509,27 @@ def phase3_attn_core(q, kv_normed, attn_w, cfg, kv_cache):
         attn_w.k_scale,
         True,  # is_neox
     )
-    q_nope_out = q_out[..., :d_nope]
 
-    # batched GEMM w_kc: [M, H, nope] → [H, M, kv_lora]
-    q_nope_out = batched_fp8_gemm(
-        X=q_nope_out,
-        WQ=attn_w.w_kc.transpose(-1, -2),
-        w_scale=attn_w.w_scale,
-        group_size=128,
-        YQ=None,
-        transpose_bm=False,
-        transpose_bm_in=True,
-        dtype=BF16,
+    # cat q_all (matches SGLang CatArrayBatchedCopy)
+    q_nope_out = q_out[..., : cfg.kv_lora_rank]   # [M, H, 512]
+    q_rope_out = q_out[..., cfg.kv_lora_rank :]    # [M, H, 64]
+    q_all = torch.cat([q_nope_out, q_rope_out], dim=-1)  # [M, H, 576]
+
+    # TileLang sparse MLA decode attention (matches --nsa-decode-backend tilelang)
+    # Produces 2× main_kernel: sparse_mla_fwd_decode_partial + combine
+    sm_scale = cfg.qk_head_dim ** -0.5
+    indices = topk_ids[:M].unsqueeze(1).to(torch.int32)  # [M, 1, 2048]
+    attn_output = tilelang_sparse_fwd(
+        q=q_all,                     # [M, H, 576]
+        kv=kv_cache.kv_buffer,       # [total, 1, 576]
+        indices=indices,             # [M, 1, 2048]
+        sm_scale=sm_scale,
+        d_v=cfg.kv_lora_rank,        # 512
     )
-    q_nope_out = q_nope_out.transpose(0, 1)  # [M, H, kv_lora]
-
-    q_rope_out = q_out[..., d_nope_p2:]
-    q_input = torch.cat([q_nope_out, q_rope_out], dim=-1)
-
-    # MLA decode attention (bmm proxy — real kernel aiter.mla_decode_fwd
-    # requires >=16 q-heads but TP=8 gives only 8 local heads).
-    scale = 1.0 / (cfg.qk_head_dim**0.5)
-    k = kv_cache.kv_buffer[:, 0, :]
-    v = kv_cache.kv_buffer[:, 0, : cfg.kv_lora_rank]
-
-    q_t = q_input.transpose(0, 1)
-    k_t = k.unsqueeze(0).expand(H, -1, -1).transpose(1, 2)
-    scores = torch.bmm(q_t, k_t) * scale
-    weights = F.softmax(scores, dim=-1)
-    v_t = v.unsqueeze(0).expand(H, -1, -1)
-    kv_cache.attn_output = torch.bmm(weights, v_t).transpose(0, 1)  # [M, H, Lv]
+    # tilelang returns [1, M, H, d_v]; squeeze batch dim
+    if attn_output.dim() == 4:
+        attn_output = attn_output.squeeze(0)
+    kv_cache.attn_output = attn_output  # [M, H, kv_lora_rank]
 
     # batched GEMM w_vc: [M, H, kv_lora] → [H, M, v_dim]
     attn_bmm = batched_fp8_gemm(
@@ -583,13 +561,14 @@ def phase4_shared(mlp_in, moe_w, cfg):
 
 
 def phase4_routed(mlp_in, moe_w, cfg):
-    """Router (gemm_a16w16_atomic) → biased_grouped_topk → aiter fused_moe (CK MoE GEMM)."""
+    """Router (wv_splitk) → biased_grouped_topk → aiter fused_moe (CK MoE GEMM)."""
     M = mlp_in.shape[0]
     dev = mlp_in.device
 
-    y = moe_w.router_out[:M]
-    y.zero_()
-    router_logits = gemm_a16w16_atomic(mlp_in, moe_w.gate_w, y=y).to(BF16)
+    # Router gate: wv_splitk BF16 GEMM (matches real SGLang trace)
+    router_out = moe_w.router_out[:M]
+    aiter_wv_splitk(moe_w.gate_w, mlp_in, router_out, M, 256)
+    router_logits = router_out.to(BF16)
 
     topk_w = torch.empty(M, cfg.num_experts_per_tok, dtype=FP32, device=dev)
     topk_ids = torch.empty(M, cfg.num_experts_per_tok, dtype=torch.int32, device=dev)
@@ -605,7 +584,10 @@ def phase4_routed(mlp_in, moe_w, cfg):
         cfg.routed_scaling_factor,
     )
 
-    topk_ids = topk_ids % cfg.n_local_experts
+    # n_local_experts == n_routed_experts (no TP sharding in benchmark), skip modulo
+    # routed_scaling_factor is already applied inside aiter_biased_grouped_topk
+    # (see its signature: routed_scaling_factor: float = 1.0  # mul to topk_weights)
+    # SGLang also skips post-multiply when _use_aiter=True (deepseek_v2.py L921-924)
     topk_w = topk_w.float()
 
     out = aiter_fused_moe(
@@ -619,7 +601,6 @@ def phase4_routed(mlp_in, moe_w, cfg):
         quant_type=QuantType.per_1x128,
         activation=ActivationType.Silu,
     )
-    out = out * cfg.routed_scaling_factor
     return out
 
 
@@ -640,23 +621,27 @@ def decode_layer_forward(
     cur = torch.cuda.current_stream()
 
     # ── Phase 1 ──
-    h_normed, res_out, q_lat, kv_lat = phase1_pre_attention(
+    h_normed, res_out, q_lat, kv_lat, h_fp8, h_scale = phase1_pre_attention(
         hidden, residual, attn_w, cfg, input_ln_w
     )
 
-    # ── Phase 2: dual-stream ──
+    # ── Phase 2: dual-stream (kv_a_norm runs on alt stream with indexer) ──
     if dual_stream and alt_stream is not None:
         alt_stream.wait_stream(cur)
-        q, q_lora, kv_normed = phase2_current(q_lat, kv_lat, attn_w, cfg)
+        q, q_lora = phase2_current(q_lat, attn_w, cfg)
         with torch.cuda.stream(alt_stream):
-            _ = phase2_alt(h_normed, q_lora, idx_w, cfg)
+            topk_ids, kv_normed = phase2_alt(
+                h_normed, h_fp8, h_scale, q_lora, kv_lat, attn_w, idx_w, cfg
+            )
         cur.wait_stream(alt_stream)
     else:
-        q, q_lora, kv_normed = phase2_current(q_lat, kv_lat, attn_w, cfg)
-        _ = phase2_alt(h_normed, q_lora, idx_w, cfg)
+        q, q_lora = phase2_current(q_lat, attn_w, cfg)
+        topk_ids, kv_normed = phase2_alt(
+            h_normed, h_fp8, h_scale, q_lora, kv_lat, attn_w, idx_w, cfg
+        )
 
     # ── Phase 3 ──
-    attn_out = phase3_attn_core(q, kv_normed, attn_w, cfg, kv_cache)
+    attn_out = phase3_attn_core(q, kv_normed, attn_w, cfg, kv_cache, topk_ids)
 
     # prepare_mlp: residual add + RMSNorm
     mlp_normed = torch.empty_like(attn_out)
@@ -689,7 +674,7 @@ def benchmark(
     device = "cuda"
 
     print(f"\n{'=' * 72}")
-    print("GLM-5.1-FP8 Decode Layer v3  (real kernels + HIP graph)")
+    print("GLM-5.1-FP8 Decode Layer v5  (TileLang sparse MLA + real kernels)")
     print(
         f"M={batch_size}  TP={cfg.tp_size}  layers={num_layers}  "
         f"seq_len={seq_len}  splits={cfg.num_kv_splits}"
@@ -790,7 +775,7 @@ def benchmark(
         os.makedirs(trace_dir, exist_ok=True)
         trace_path = os.path.join(
             trace_dir,
-            f"glm5_decode_M{batch_size}_L{num_layers}_{prof_tag}_v3_trace.json.gz",
+            f"glm5_decode_M{batch_size}_L{num_layers}_v5_trace_{prof_tag}.json.gz",
         )
         prof.export_chrome_trace(trace_path)
         print(f"\n{'*' * 72}")
@@ -802,7 +787,7 @@ def benchmark(
 # ── CLI ───────────────────────────────────────────────────────────────────
 def main():
     p = argparse.ArgumentParser(
-        description="GLM-5.1-FP8 decode-layer v3 (real kernels, NSA indexer)"
+        description="GLM-5.1-FP8 decode-layer v5 (TileLang sparse MLA, NSA indexer)"
     )
     p.add_argument("--batch-size", type=int, nargs="+", default=[1])
     p.add_argument("--num-layers", type=int, default=3)
