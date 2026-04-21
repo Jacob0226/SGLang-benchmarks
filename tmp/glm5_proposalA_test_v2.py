@@ -672,7 +672,7 @@ def benchmark_compare(cfg, warmup=20, iters=100, device="cuda",
 
     if profile or eager_profile:
         import os as _os
-        trace_dir = _os.path.expanduser("~/SGLang-benchmarks/tmp/trace")
+        trace_dir = _os.path.expanduser("~/SGLang-benchmarks/tmp/trace_v2")
         _os.makedirs(trace_dir, exist_ok=True)
 
         if profile:
