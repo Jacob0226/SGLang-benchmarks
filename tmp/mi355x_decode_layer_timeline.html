@@ -246,19 +246,19 @@ svg text { font-family:'JetBrains Mono',monospace; }
   <text x="470" y="995" text-anchor="middle" font-size="9" fill="#50fa7b">RoPE(Q_rope) + store kv_a/k_rope into MLA KV cache — 5.1μs</text>
 
   <rect x="220" y="1010" width="500" height="44" rx="6" fill="#ff79c6" fill-opacity="0.15" stroke="#ff79c6" stroke-width="1.2"/>
-  <text x="470" y="1028" text-anchor="middle" font-size="11" font-weight="600" fill="#ff79c6">attn_kernel_1 (Full MLA) — 10.6μs</text>
-  <text x="470" y="1046" text-anchor="middle" font-size="9" fill="#8892b0">Q'(B,128,512) @ kv_cache(B,S,512)ᵀ → softmax → weighted_sum → (B,128,512)</text>
+  <text x="470" y="1028" text-anchor="middle" font-size="11" font-weight="600" fill="#ff79c6">attn_kernel_1 (sparse_mla_partial) — 10.6μs</text>
+  <text x="470" y="1046" text-anchor="middle" font-size="9" fill="#8892b0">Split-k: 2048 top-k blocks ÷ 64 = 32 splits, each computes partial_o + partial_lse</text>
 
   <rect x="220" y="1062" width="500" height="44" rx="6" fill="#ff79c6" fill-opacity="0.15" stroke="#ff79c6" stroke-width="1.2"/>
-  <text x="470" y="1080" text-anchor="middle" font-size="11" font-weight="600" fill="#ff79c6">attn_kernel_2 (NSA Sparse) — 9.7μs</text>
-  <text x="470" y="1098" text-anchor="middle" font-size="9" fill="#8892b0">top-16 blocks only (2048 tokens) · full dim · indices from indexer</text>
+  <text x="470" y="1080" text-anchor="middle" font-size="11" font-weight="600" fill="#ff79c6">attn_kernel_2 (sparse_mla_combine) — 9.7μs</text>
+  <text x="470" y="1098" text-anchor="middle" font-size="9" fill="#8892b0">Log-sum-exp reduction: merge 32 partial results → final attention output (B,128,512)</text>
 
   <rect x="220" y="1114" width="500" height="24" rx="4" fill="#50fa7b" fill-opacity="0.1" stroke="#50fa7b" stroke-width="0.8"/>
-  <text x="470" y="1130" text-anchor="middle" font-size="9" fill="#50fa7b">gate_full × attn1 + gate_sparse × attn2 → combined (B, 128, 512)</text>
+  <text x="470" y="1130" text-anchor="middle" font-size="9" fill="#50fa7b">partial → combine (log-sum-exp reduction) → attn_output (B, 128, 512)</text>
 
   <rect x="220" y="1146" width="500" height="30" rx="6" fill="#64ffda" fill-opacity="0.12" stroke="#64ffda" stroke-width="1"/>
   <text x="470" y="1160" text-anchor="middle" font-size="10" font-weight="600" fill="#64ffda">bmm W_vc absorb — 7.7μs</text>
-  <text x="470" y="1172" text-anchor="middle" font-size="8" fill="#8892b0">combined(B,128,512) @ W_vc(128,128,512) → (B,128,128) → reshape (B,16384)</text>
+  <text x="470" y="1172" text-anchor="middle" font-size="8" fill="#8892b0">attn_output(B,128,512) @ W_vc(128,128,512) → (B,128,128) → reshape (B,16384)</text>
 
   <rect x="220" y="1182" width="500" height="26" rx="6" fill="#64ffda" fill-opacity="0.12" stroke="#64ffda" stroke-width="1"/>
   <text x="470" y="1200" text-anchor="middle" font-size="10" fill="#64ffda">o_proj W: (16384 × 7168) → (B, 7168) — 10.1μs</text>
@@ -475,8 +475,8 @@ const s113 = [
   {ts:218.7,dur:6.2,l:'bmm w_kc (absorb)',c:'attn',d:'Absorb W_kc into Q_nope: (B,128,128)@W_kc→(B,128,512)'},
   {ts:224.9,dur:5.1,l:'qk_rope + cache',c:'attn',d:'RoPE on Q_rope/K_rope + store kv_a+k_rope into MLA KV cache'},
   {ts:230.0,dur:7.3,l:'CatBatchCopy',c:'misc',d:'Concatenate attention Q components for batched kernel'},
-  {ts:237.3,dur:10.6,l:'attn_kernel_1',c:'attn',d:'Full MLA decode attention (128 heads, full KV cache seq)'},
-  {ts:247.9,dur:9.7,l:'attn_kernel_2',c:'attn',d:'NSA sparse attention using top-16 block indices from indexer'},
+  {ts:237.3,dur:10.6,l:'attn_kernel_1',c:'attn',d:'sparse_mla_fwd_decode_partial: split-k over 2048 top-k blocks (32 splits), writes partial_o + partial_lse'},
+  {ts:247.9,dur:9.7,l:'attn_kernel_2',c:'attn',d:'sparse_mla_fwd_decode_combine: log-sum-exp reduction of 32 partial results into final attn output'},
   {ts:257.5,dur:7.7,l:'bmm w_vc (absorb)',c:'attn',d:'Absorb W_vc: attn_out(512)×W_vc→V_out(128) per head'},
   {ts:265.2,dur:4.9,l:'fp8_quant',c:'quant',d:'FP8 quant attention output for o_proj'},
   {ts:270.1,dur:10.1,l:'o_proj (CK)',c:'gemm_ck',d:'Output projection: (B,128h×128d=16384)→(B,7168)'},

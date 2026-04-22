@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MI355X Dual-Stream: Baseline → Proposal A → HIP Graph Reality</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0e17;
+  --card-bg: #111827;
+  --border: #1e293b;
+  --text: #e2e8f0;
+  --text-dim: #94a3b8;
+  --accent-cur: #3b82f6;
+  --accent-alt: #f59e0b;
+  --accent-idle: #374151;
+  --accent-overlap: #10b981;
+  --accent-red: #ef4444;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--text);
+  font-family: 'DM Sans', sans-serif;
+  padding: 40px 32px;
+}
+h1 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 22px; font-weight: 700;
+  margin-bottom: 6px; color: #f8fafc;
+}
+.subtitle { color: var(--text-dim); font-size: 14px; margin-bottom: 36px; }
+.scenario {
+  background: var(--card-bg); border: 1px solid var(--border);
+  border-radius: 12px; padding: 24px 28px; margin-bottom: 24px;
+}
+.scenario-header {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 18px;
+}
+.scenario-number {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px; font-weight: 700;
+  background: var(--accent-cur); color: #fff;
+  width: 28px; height: 28px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 6px; flex-shrink: 0;
+}
+.scenario-number.orange { background: var(--accent-alt); }
+.scenario-number.red { background: var(--accent-red); }
+.scenario-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 15px; font-weight: 600;
+}
+.scenario-desc { color: var(--text-dim); font-size: 13px; margin-left: auto; }
+
+.stream-row { display: flex; align-items: center; margin-bottom: 6px; height: 44px; }
+.stream-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; font-weight: 600;
+  width: 72px; flex-shrink: 0; color: var(--text-dim);
+}
+.stream-label.cur { color: var(--accent-cur); }
+.stream-label.alt { color: var(--accent-alt); }
+
+.stream-track {
+  position: relative;
+  height: 36px;
+  background: rgba(255,255,255,0.02);
+  border-radius: 6px;
+  overflow: visible;
+}
+
+.k {
+  position: absolute; top: 2px; height: 32px;
+  display: flex; align-items: center; justify-content: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; font-weight: 600;
+  border-radius: 4px; color: #fff;
+  white-space: nowrap; padding: 0 4px;
+  overflow: hidden;
+}
+.k.phase1  { background: #1e40af; }
+.k.qbproj  { background: #2563eb; }
+.k.kvanorm { background: #7c3aed; }
+.k.wkc     { background: #0891b2; }
+.k.rope    { background: #0d9488; }
+.k.cat     { background: #059669; }
+.k.attn    { background: #dc2626; }
+.k.wvc     { background: #e11d48; }
+.k.oproj   { background: #be123c; }
+.k.indexer { background: #d97706; }
+.k.moe     { background: #4338ca; }
+.k.idle    { background: var(--accent-idle); color: var(--text-dim); font-style: italic; border: 1px dashed #4b5563; }
+.k.dots    { background: transparent; color: var(--text-dim); letter-spacing: 2px; }
+
+.annotation {
+  margin-top: 12px; padding: 10px 14px;
+  background: rgba(255,255,255,0.03); border-radius: 6px;
+  border-left: 3px solid var(--accent-cur);
+  font-size: 12px; color: var(--text-dim); line-height: 1.7;
+}
+.annotation.warn { border-left-color: var(--accent-red); }
+.annotation.good { border-left-color: var(--accent-overlap); }
+.annotation strong { color: var(--text); }
+
+.time-marker {
+  position: absolute; top: -14px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px; color: #475569;
+  transform: translateX(-50%);
+}
+
+.legend {
+  display: flex; gap: 14px; flex-wrap: wrap;
+  margin-top: 28px; padding: 14px 16px;
+  background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px;
+}
+.legend-item { display: flex; align-items: center; gap: 6px; font-size: 11px; font-family: 'JetBrains Mono', monospace; }
+.legend-color { width: 14px; height: 14px; border-radius: 3px; }
+
+.overlap-highlight {
+  position: absolute; top: -2px; bottom: -2px;
+  background: rgba(16,185,129,0.08);
+  border: 1.5px dashed var(--accent-overlap);
+  border-radius: 4px; z-index: 0;
+}
+</style>
+</head>
+<body>
+
+<h1>MI355X Decode Layer: Dual-Stream Analysis</h1>
+<p class="subtitle">GLM5-FP8 TP=8 M=1 — Baseline → Proposal A → HIP Graph Reality (from real HIP Graph traces)</p>
+
+<!--
+  Timing source: MI355X_UT_stream0.csv + MI355X_UT_stream3.csv (baseline HIP Graph)
+                 MI355X_PA_stream0.csv + MI355X_PA_stream4.csv (Proposal A HIP Graph)
+  Scale: 2.6 px per μs.  Origin = layer start (first kernel on current stream).
+  Baseline current stream 0: 0→69.5μs active, 69.5→200.1 IDLE, 200.1→270 attn core, 270→320 MLP
+  Baseline alt stream 3: 58.6→193.0μs (kv_a_norm 58.6→60.8, indexer 60.8→193.0)
+-->
+
+<!-- ═══════ Scenario 1: Baseline ═══════ -->
+<div class="scenario">
+  <div class="scenario-header">
+    <div class="scenario-number">1</div>
+    <div class="scenario-title">Baseline (Current SGLang)</div>
+    <div class="scenario-desc">~131μs IDLE waiting for indexer</div>
+  </div>
+  <!-- Scale: 2.6px/μs  |  track width = 340μs × 2.6 = 884px -->
+  <div style="position:relative; margin-top: 24px;">
+    <div class="stream-row">
+      <div class="stream-label cur">current</div>
+      <div class="stream-track" style="width:884px;">
+        <!-- phase1: 0→51.2μs = 0→133px -->
+        <div class="k phase1" style="left:0; width:133px;">phase1 ~51μs</div>
+        <!-- q_b_proj: 51.2→69.5 = 133→181px -->
+        <div class="k qbproj" style="left:134px; width:46px;">q_b_proj</div>
+        <!-- IDLE: 69.5→200.1 = 181→520px -->
+        <div class="k idle" style="left:181px; width:339px;">IDLE ~131μs</div>
+        <!-- W_kc: 200.1→207.2 = 520→539px -->
+        <div class="k wkc" style="left:521px; width:18px;"></div>
+        <!-- RoPE: 207.2→212.7 = 539→553px -->
+        <div class="k rope" style="left:540px; width:14px;"></div>
+        <!-- Cat: 212.7→219.6 = 553→571px -->
+        <div class="k cat" style="left:554px; width:18px;"></div>
+        <!-- attn×2: 219.6→243.3 = 571→632px -->
+        <div class="k attn" style="left:573px; width:62px;">attn ×2</div>
+        <!-- W_vc: 243.3→254.5 = 633→662px -->
+        <div class="k wvc" style="left:636px; width:29px;">W_vc</div>
+        <!-- flatten+o_proj: 254.5→269.9 = 662→702px -->
+        <div class="k oproj" style="left:666px; width:40px;">o_proj</div>
+        <!-- MLP: 269.9→320 = 702→832px -->
+        <div class="k moe" style="left:707px; width:130px;">MoE ~50μs</div>
+        <div class="k dots" style="left:838px; width:40px;">…</div>
+      </div>
+    </div>
+    <div class="stream-row">
+      <div class="stream-label alt">alt</div>
+      <div class="stream-track" style="width:884px;">
+        <!-- kv_a_norm: 58.6→60.8 = 152→158px (too small for text, use min 40px) -->
+        <div class="k kvanorm" style="left:152px; width:42px; font-size:8px;">kv_a_norm</div>
+        <!-- indexer: 60.8→193.0 = 158→502px -->
+        <div class="k indexer" style="left:195px; width:307px;">NSA indexer ~132μs</div>
+      </div>
+    </div>
+  </div>
+  <div class="annotation">
+    <strong>wait_stream(alt)</strong> 在 q_b_proj 之後 — current 空等 alt 完成。<br>
+    alt stream: kv_a_norm(2μs) + indexer(132μs) ≈ 134μs，q_b_proj ≈ 18μs → <strong>131μs IDLE</strong>。<br>
+    Indexer 做完後，current 才開始 W_kc → RoPE → Cat → attn core。
+  </div>
+</div>
+
+<!-- ═══════ Scenario 2: Proposal A intended ═══════ -->
+<div class="scenario">
+  <div class="scenario-header">
+    <div class="scenario-number orange">2</div>
+    <div class="scenario-title">Proposal A — Intended Design</div>
+    <div class="scenario-desc">kv_a_norm 搬到 current，填 IDLE gap</div>
+  </div>
+  <!--
+    Current: phase1(51) → q_b_proj(18) → kv_a_norm(2) → W_kc(7) → RoPE(6) → Cat(7) = 91μs
+    Alt: indexer only starts at ~59, runs ~132μs → ends ~191
+    IDLE = 191 - 91 = ~100μs
+    Then attn core at ~191
+  -->
+  <div style="position:relative; margin-top: 24px;">
+    <div class="stream-row">
+      <div class="stream-label cur">current</div>
+      <div class="stream-track" style="width:884px;">
+        <div class="k phase1" style="left:0; width:133px;">phase1 ~51μs</div>
+        <div class="k qbproj" style="left:134px; width:46px;">q_b_proj</div>
+        <!-- kv_a_norm moved here: 69.5→71.7 = 181→186px -->
+        <div class="k kvanorm" style="left:181px; width:42px; font-size:8px;">kv_a_norm</div>
+        <!-- W_kc: 71.7→78.8 = 186→205px -->
+        <div class="k wkc" style="left:224px; width:18px;"></div>
+        <!-- RoPE: 78.8→84.4 = 205→219px -->
+        <div class="k rope" style="left:243px; width:16px;"></div>
+        <!-- Cat: 84.4→91.2 = 219→237px -->
+        <div class="k cat" style="left:260px; width:18px;"></div>
+        <!-- IDLE: 91.2→191 = 237→497px -->
+        <div class="k idle" style="left:279px; width:218px;">IDLE ~100μs</div>
+        <!-- attn×2: 191→215 = 497→559px -->
+        <div class="k attn" style="left:498px; width:62px;">attn ×2</div>
+        <div class="k wvc" style="left:561px; width:29px;">W_vc</div>
+        <div class="k oproj" style="left:591px; width:40px;">o_proj</div>
+        <div class="k moe" style="left:632px; width:130px;">MoE ~50μs</div>
+        <div class="k dots" style="left:763px; width:40px;">…</div>
+      </div>
+    </div>
+    <div class="stream-row">
+      <div class="stream-label alt">alt</div>
+      <div class="stream-track" style="width:884px;">
+        <!-- indexer only (no kv_a_norm): ~59→191 = 153→497px -->
+        <div class="k indexer" style="left:153px; width:344px;">NSA indexer only ~132μs</div>
+      </div>
+    </div>
+  </div>
+  <div class="annotation good">
+    <strong>kv_a_norm 搬到 current</strong>，解鎖 W_kc + RoPE + Cat 也能在 wait 之前執行。<br>
+    IDLE 從 131μs → ~100μs，current 填入 ~31μs 有用的工作和 indexer 尾段並行。
+  </div>
+</div>
+
+<!-- ═══════ Scenario 3: HIP Graph actual ═══════ -->
+<div class="scenario">
+  <div class="scenario-header">
+    <div class="scenario-number red">3</div>
+    <div class="scenario-title">Proposal A — Actual (HIP Graph Remapped)</div>
+    <div class="scenario-desc">HIP Graph DAG optimizer 重新分配 physical stream</div>
+  </div>
+  <!--
+    From MI355X_PA_stream0.csv & stream4.csv:
+    Phys 0: phase1(0→69.5) → q_b_proj(→69.5) → kv_a_norm(→~78) → indexer(78→~175)
+            → attn(~177→~200) → W_vc(→~210) → o_proj(→~220) → MLP(→~295)
+    Phys 4: W_kc starts at ~87 → RoPE(~96) → Cat(~101)  ← overlaps with indexer tail
+    Scale: keep same 2.6px/μs for consistency
+    PA base ts=715.574, kv_a_norm at ~114.2μs, W_kc(phys4) at ~87.5
+  -->
+  <div style="position:relative; margin-top: 24px;">
+    <div class="stream-row">
+      <div class="stream-label" style="color:#64748b;">phys 0</div>
+      <div class="stream-track" style="width:884px;">
+        <div class="k phase1" style="left:0; width:133px;">phase1</div>
+        <div class="k qbproj" style="left:134px; width:46px;">q_b_proj</div>
+        <div class="k kvanorm" style="left:181px; width:42px; font-size:8px;">kv_a_norm</div>
+        <!-- indexer on phys 0: kv_a_norm end → topk end ≈ 80→175 = 208→455px -->
+        <div class="k indexer" style="left:224px; width:246px;">NSA indexer ~95μs</div>
+        <!-- attn: ~177→200 = 460→520px -->
+        <div class="k attn" style="left:471px; width:59px;">attn ×2</div>
+        <div class="k wvc" style="left:531px; width:26px;">W_vc</div>
+        <div class="k oproj" style="left:558px; width:40px;">o_proj</div>
+        <div class="k moe" style="left:599px; width:130px;">MoE</div>
+        <div class="k dots" style="left:730px; width:40px;">…</div>
+      </div>
+    </div>
+    <div class="stream-row">
+      <div class="stream-label" style="color:#64748b;">phys 4</div>
+      <div class="stream-track" style="width:884px;">
+        <!-- W_kc starts ~87μs = 226px, overlapping with indexer -->
+        <div class="k wkc" style="left:226px; width:23px;"></div>
+        <div class="k rope" style="left:250px; width:13px;"></div>
+        <div class="k cat" style="left:264px; width:12px;"></div>
+      </div>
+    </div>
+  </div>
+  <div class="annotation warn">
+    <strong>HIP Graph 重新分配 stream：</strong><br>
+    • phase1, q_b_proj, <strong>kv_a_norm</strong>, NSA indexer, attn, W_vc, o_proj → 全在 <strong>phys 0</strong><br>
+    • <strong>W_kc + RoPE + Cat</strong> 被拆到 <strong>phys 4</strong>，和 indexer 尾段並行<br>
+    • <strong>Overlap ≈ 18μs</strong>（W_kc+RoPE+Cat 和 indexer 尾端重疊）<br>
+    • 結果：<strong>Proposal A 比 baseline 快 ~7μs</strong>（300.5μs → 293.7μs）
+  </div>
+</div>
+
+<!-- ═══════ Legend ═══════ -->
+<div class="legend">
+  <div class="legend-item"><div class="legend-color" style="background:#1e40af;"></div>phase1 (pre-attn serial)</div>
+  <div class="legend-item"><div class="legend-color" style="background:#2563eb;"></div>q_b_proj</div>
+  <div class="legend-item"><div class="legend-color" style="background:#7c3aed;"></div>kv_a_norm</div>
+  <div class="legend-item"><div class="legend-color" style="background:#0891b2;"></div>W_kc</div>
+  <div class="legend-item"><div class="legend-color" style="background:#0d9488;"></div>RoPE</div>
+  <div class="legend-item"><div class="legend-color" style="background:#059669;"></div>Cat</div>
+  <div class="legend-item"><div class="legend-color" style="background:#d97706;"></div>NSA indexer</div>
+  <div class="legend-item"><div class="legend-color" style="background:#dc2626;"></div>attn (partial+combine)</div>
+  <div class="legend-item"><div class="legend-color" style="background:#e11d48;"></div>W_vc / o_proj</div>
+  <div class="legend-item"><div class="legend-color" style="background:#4338ca;"></div>MoE</div>
+  <div class="legend-item"><div class="legend-color" style="background:#374151; border:1px dashed #4b5563;"></div>IDLE</div>
+</div>
+
+</body>
+</html>
