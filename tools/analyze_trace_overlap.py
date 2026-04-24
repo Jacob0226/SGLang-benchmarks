@@ -191,11 +191,7 @@ def pairwise_overlap(kernels: List[KernelEvent], min_us: float = 100) -> Dict[Tu
 # ──────────────────── Formatting ────────────────────
 
 def fmt(us: float) -> str:
-    if us >= 1_000_000:
-        return f"{us / 1_000_000:.3f} s"
-    if us >= 1_000:
-        return f"{us / 1_000:.3f} ms"
-    return f"{us:.1f} us"
+    return f"{us / 1_000:.3f} ms"
 
 
 def pct(part, total):
@@ -387,31 +383,27 @@ def main():
         print(f"  CSV → {args.csv}")
 
 
-def generate_html(results, out_path):
-    """Generate a self-contained HTML report with charts."""
-    import html as html_mod
+def _html_single(r, html_mod):
+    """Generate HTML card for a single trace."""
+    label, wall, busy, bubble, overlap, sum_all, conc_hist, stream_hist = r
+    speedup = sum_all / wall if wall > 0 else 0
+    overlap_pct = 100 * overlap / wall if wall else 0
+    busy_pct = 100 * busy / wall if wall else 0
+    bubble_pct = 100 * bubble / wall if wall else 0
+    safe_label = html_mod.escape(label)
 
-    cards_html = []
-    for label, wall, busy, bubble, overlap, sum_all, conc_hist, stream_hist in results:
-        speedup = sum_all / wall if wall > 0 else 0
-        overlap_pct = 100 * overlap / wall if wall else 0
-        busy_pct = 100 * busy / wall if wall else 0
-        bubble_pct = 100 * bubble / wall if wall else 0
-
-        safe_label = html_mod.escape(label)
-
-        def hist_rows(hist, unit):
-            rows = ""
-            for lv in sorted(hist):
-                d = hist[lv]
-                w = 100 * d / wall if wall else 0
-                lbl = "bubble" if lv == 0 else f"{lv} {unit}"
-                cls = "bg-bubble" if lv == 0 else ("bg-busy" if lv == 1 else "bg-overlap")
-                note = ""
-                if lv >= 2:
-                    saved = (lv - 1) * d
-                    note = f'<span class="hist-note">overlap saved {fmt(saved)}</span>'
-                rows += f"""
+    def hist_rows(hist, unit):
+        rows = ""
+        for lv in sorted(hist):
+            d = hist[lv]
+            w = 100 * d / wall if wall else 0
+            lbl = "bubble" if lv == 0 else f"{lv} {unit}"
+            cls = "bg-bubble" if lv == 0 else ("bg-busy" if lv == 1 else "bg-t1")
+            note = ""
+            if lv >= 2:
+                saved = (lv - 1) * d
+                note = f'<span class="hist-note">overlap saved {fmt(saved)}</span>'
+            rows += f"""
           <div class="hist-row">
             <span class="hist-label">{lbl}</span>
             <div class="hist-bar-wrap">
@@ -421,65 +413,25 @@ def generate_html(results, out_path):
             <span class="hist-pct">{100*d/wall:.1f}%</span>
             {note}
           </div>"""
-            return rows
+        return rows
 
-        cards_html.append(f"""
+    return f"""
     <div class="card">
       <h2>{safe_label}</h2>
-
       <div class="metric-grid">
-        <div class="metric">
-          <span class="metric-val">{fmt(wall)}</span>
-          <span class="metric-lbl">Wall time</span>
-        </div>
-        <div class="metric">
-          <span class="metric-val">{fmt(busy)}</span>
-          <span class="metric-lbl">Busy ({busy_pct:.1f}%)</span>
-        </div>
-        <div class="metric">
-          <span class="metric-val">{fmt(bubble)}</span>
-          <span class="metric-lbl">Bubble ({bubble_pct:.1f}%)</span>
-        </div>
-        <div class="metric">
-          <span class="metric-val">{speedup:.2f}x</span>
-          <span class="metric-lbl">Speedup (Sum/Wall)</span>
-        </div>
+        <div class="metric"><span class="metric-val">{fmt(wall)}</span><span class="metric-lbl">Wall time</span></div>
+        <div class="metric"><span class="metric-val">{fmt(busy)}</span><span class="metric-lbl">Busy ({busy_pct:.1f}%)</span></div>
+        <div class="metric"><span class="metric-val">{fmt(bubble)}</span><span class="metric-lbl">Bubble ({bubble_pct:.1f}%)</span></div>
+        <div class="metric"><span class="metric-val">{speedup:.2f}x</span><span class="metric-lbl">Speedup (Sum/Wall)</span></div>
       </div>
-
       <h3>Wall time breakdown</h3>
       <div class="waterfall">
-        <div class="wf-row">
-          <span class="wf-label">Sum of all kernels</span>
-          <div class="wf-bar-wrap">
-            <div class="wf-bar bg-sum" style="width:100%">{fmt(sum_all)}</div>
-          </div>
-        </div>
-        <div class="wf-row">
-          <span class="wf-label">Overlap saved</span>
-          <div class="wf-bar-wrap">
-            <div class="wf-bar bg-overlap" style="width:{100*overlap/sum_all:.1f}%">-{fmt(overlap)}</div>
-          </div>
-        </div>
-        <div class="wf-row">
-          <span class="wf-label">Busy time</span>
-          <div class="wf-bar-wrap">
-            <div class="wf-bar bg-busy" style="width:{100*busy/sum_all:.1f}%">{fmt(busy)}</div>
-          </div>
-        </div>
-        <div class="wf-row">
-          <span class="wf-label">Bubble time</span>
-          <div class="wf-bar-wrap">
-            <div class="wf-bar bg-bubble" style="width:{100*bubble/sum_all:.1f}%">{fmt(bubble)}</div>
-          </div>
-        </div>
-        <div class="wf-row">
-          <span class="wf-label">Wall time</span>
-          <div class="wf-bar-wrap">
-            <div class="wf-bar bg-wall" style="width:{100*wall/sum_all:.1f}%">{fmt(wall)}</div>
-          </div>
-        </div>
+        <div class="wf-row"><span class="wf-label">Sum of all kernels</span><div class="wf-bar-wrap"><div class="wf-bar bg-sum" style="width:100%">{fmt(sum_all)}</div></div></div>
+        <div class="wf-row"><span class="wf-label">Overlap saved</span><div class="wf-bar-wrap"><div class="wf-bar bg-overlap" style="width:{100*overlap/sum_all:.1f}%">-{fmt(overlap)}</div></div></div>
+        <div class="wf-row"><span class="wf-label">Busy time</span><div class="wf-bar-wrap"><div class="wf-bar bg-busy" style="width:{100*busy/sum_all:.1f}%">{fmt(busy)}</div></div></div>
+        <div class="wf-row"><span class="wf-label">Bubble time</span><div class="wf-bar-wrap"><div class="wf-bar bg-bubble" style="width:{100*bubble/sum_all:.1f}%">{fmt(bubble)}</div></div></div>
+        <div class="wf-row"><span class="wf-label">Wall time</span><div class="wf-bar-wrap"><div class="wf-bar bg-wall" style="width:{100*wall/sum_all:.1f}%">{fmt(wall)}</div></div></div>
       </div>
-
       <h3>GPU utilization</h3>
       <div class="stacked-bar">
         <div class="seg bg-busy" style="width:{busy_pct:.2f}%" title="Busy {busy_pct:.1f}%"></div>
@@ -490,46 +442,128 @@ def generate_html(results, out_path):
         <span><i class="dot bg-overlap"></i>Overlap saved {overlap_pct:.1f}%</span>
         <span><i class="dot bg-bubble"></i>Bubble {bubble_pct:.1f}%</span>
       </div>
-
       <h3>Kernel concurrency</h3>
       <div class="hist">{hist_rows(conc_hist, "kernel(s)")}</div>
-
       <h3>Stream concurrency</h3>
       <div class="hist">{hist_rows(stream_hist, "stream(s)")}</div>
-    </div>""")
+    </div>"""
 
-    # comparison table if 2 traces
-    cmp_html = ""
-    if len(results) == 2:
-        a, b = results[0], results[1]
-        metrics = [("Wall time", 1), ("Busy", 2), ("Bubble", 3), ("Overlap", 4), ("Sum all kernels", 5)]
-        rows = ""
-        for name, idx in metrics:
-            v0, v1 = a[idx], b[idx]
-            d = v1 - v0
+
+def _html_comparison(results, html_mod):
+    """Generate a single unified comparison card for 2 traces."""
+    a_label, a_wall, a_busy, a_bubble, a_overlap, a_sum, a_conc, a_stream = results[0]
+    b_label, b_wall, b_busy, b_bubble, b_overlap, b_sum, b_conc, b_stream = results[1]
+    a_spd = a_sum / a_wall if a_wall else 0
+    b_spd = b_sum / b_wall if b_wall else 0
+    al = html_mod.escape(a_label)
+    bl = html_mod.escape(b_label)
+
+    # paired bar: two bars per metric, same scale (max of both)
+    metrics = [
+        ("Sum of all kernels", a_sum, b_sum, "bg-sum"),
+        ("Overlap saved",      a_overlap, b_overlap, "bg-overlap"),
+        ("Busy time",          a_busy, b_busy, "bg-busy"),
+        ("Bubble time",        a_bubble, b_bubble, "bg-bubble"),
+        ("Wall time",          a_wall, b_wall, "bg-wall"),
+    ]
+    global_max = max(a_sum, b_sum)
+    bar_rows = ""
+    for name, va, vb, cls in metrics:
+        wa = 100 * va / global_max if global_max else 0
+        wb = 100 * vb / global_max if global_max else 0
+        d = vb - va
+        sign = "+" if d >= 0 else ""
+        dcls = "delta-pos" if d >= 0 else "delta-neg"
+        bar_rows += f"""
+      <div class="pair-group">
+        <span class="pair-metric">{name}</span>
+        <div class="pair-bars">
+          <div class="pair-row"><span class="pair-tag t1">T1</span><div class="pair-bar-wrap"><div class="pair-bar bg-t1" style="width:{wa:.2f}%"></div></div><span class="pair-val">{fmt(va)}</span></div>
+          <div class="pair-row"><span class="pair-tag t2">T2</span><div class="pair-bar-wrap"><div class="pair-bar bg-t2" style="width:{wb:.2f}%"></div></div><span class="pair-val">{fmt(vb)}</span></div>
+        </div>
+        <span class="pair-delta {dcls}">{sign}{fmt(d)}</span>
+      </div>"""
+
+    # delta table
+    tbl_metrics = [("Wall time", a_wall, b_wall), ("Busy", a_busy, b_busy),
+                   ("Bubble", a_bubble, b_bubble), ("Overlap", a_overlap, b_overlap),
+                   ("Sum all kernels", a_sum, b_sum), ("Speedup (Sum/Wall)", a_spd, b_spd)]
+    tbl_rows = ""
+    for name, va, vb in tbl_metrics:
+        if name.startswith("Speedup"):
+            va_s, vb_s = f"{va:.2f}x", f"{vb:.2f}x"
+            d = vb - va
             sign = "+" if d >= 0 else ""
-            cls = "delta-pos" if d >= 0 else "delta-neg"
+            dcls = "delta-neg" if d >= 0 else "delta-pos"
+            ds = f"{sign}{d:.2f}x"
+        else:
+            va_s, vb_s = fmt(va), fmt(vb)
+            d = vb - va
+            sign = "+" if d >= 0 else ""
+            dcls = "delta-pos" if d >= 0 else "delta-neg"
+            ds = f"{sign}{fmt(d)}"
+        tbl_rows += f'<tr><td>{name}</td><td class="num">{va_s}</td><td class="num">{vb_s}</td><td class="num {dcls}">{ds}</td></tr>'
+
+    # concurrency comparison (paired hist)
+    def paired_hist(hist_a, hist_b, unit, ref_wall_a, ref_wall_b):
+        all_levels = sorted(set(list(hist_a.keys()) + list(hist_b.keys())))
+        rows = ""
+        for lv in all_levels:
+            da = hist_a.get(lv, 0)
+            db = hist_b.get(lv, 0)
+            pct_a = 100 * da / ref_wall_a if ref_wall_a else 0
+            pct_b = 100 * db / ref_wall_b if ref_wall_b else 0
+            lbl = "bubble" if lv == 0 else f"{lv} {unit}"
             rows += f"""
-        <tr>
-          <td>{name}</td>
-          <td class="num">{fmt(v0)}</td>
-          <td class="num">{fmt(v1)}</td>
-          <td class="num {cls}">{sign}{fmt(d)}</td>
-        </tr>"""
-        cmp_html = f"""
+          <div class="pair-group narrow">
+            <span class="pair-metric">{lbl}</span>
+            <div class="pair-bars">
+              <div class="pair-row"><span class="pair-tag t1">T1</span><div class="pair-bar-wrap"><div class="pair-bar bg-t1" style="width:{pct_a:.2f}%"></div></div><span class="pair-val">{pct_a:.1f}% ({fmt(da)})</span></div>
+              <div class="pair-row"><span class="pair-tag t2">T2</span><div class="pair-bar-wrap"><div class="pair-bar bg-t2" style="width:{pct_b:.2f}%"></div></div><span class="pair-val">{pct_b:.1f}% ({fmt(db)})</span></div>
+            </div>
+          </div>"""
+        return rows
+
+    return f"""
     <div class="card">
       <h2>Comparison</h2>
+      <div class="trace-legend">
+        <span><i class="dot bg-t1"></i><b>T1</b> {al}</span>
+        <span><i class="dot bg-t2"></i><b>T2</b> {bl}</span>
+      </div>
+
+      <div class="metric-grid metric-grid-cmp">
+        <div class="metric"><span class="metric-val">{fmt(a_wall)}</span><span class="metric-lbl">T1 Wall</span></div>
+        <div class="metric"><span class="metric-val">{fmt(b_wall)}</span><span class="metric-lbl">T2 Wall</span></div>
+        <div class="metric"><span class="metric-val">{a_spd:.2f}x</span><span class="metric-lbl">T1 Speedup</span></div>
+        <div class="metric"><span class="metric-val">{b_spd:.2f}x</span><span class="metric-lbl">T2 Speedup</span></div>
+      </div>
+
+      <h3>Wall time breakdown (same scale)</h3>
+      <div class="pair-chart">{bar_rows}</div>
+
+      <h3>Delta table</h3>
       <table class="cmp">
-        <thead><tr>
-          <th>Metric</th>
-          <th class="num">{html_mod.escape(a[0])}</th>
-          <th class="num">{html_mod.escape(b[0])}</th>
-          <th class="num">Delta</th>
-        </tr></thead>
-        <tbody>{rows}
-        </tbody>
+        <thead><tr><th>Metric</th><th class="num">T1</th><th class="num">T2</th><th class="num">Delta</th></tr></thead>
+        <tbody>{tbl_rows}</tbody>
       </table>
+
+      <h3>Kernel concurrency</h3>
+      <div class="pair-chart">{paired_hist(a_conc, b_conc, "kernel(s)", a_wall, b_wall)}</div>
+
+      <h3>Stream concurrency</h3>
+      <div class="pair-chart">{paired_hist(a_stream, b_stream, "stream(s)", a_wall, b_wall)}</div>
     </div>"""
+
+
+def generate_html(results, out_path):
+    """Generate a self-contained HTML report with charts."""
+    import html as html_mod
+
+    if len(results) == 2:
+        body = _html_comparison(results, html_mod)
+    else:
+        body = "".join(_html_single(r, html_mod) for r in results)
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -543,6 +577,7 @@ def generate_html(results, out_path):
     --text: #e4e6ed; --muted: #8b8fa3; --accent: #6c9eff;
     --busy: #e85d5d; --overlap: #4da6ff; --bubble: #a06cd5;
     --sum: #e8a45d; --wall: #5de8a0;
+    --t1: #6c9eff; --t2: #ff9f6c;
   }}
   * {{ margin:0; padding:0; box-sizing:border-box; }}
   body {{
@@ -562,10 +597,15 @@ def generate_html(results, out_path):
   .card h3 {{ font-size: 0.85rem; color: var(--muted); margin: 1.2rem 0 0.6rem; text-transform: uppercase; letter-spacing: 0.05em; }}
 
   .metric-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 1rem; }}
+  .metric-grid-cmp {{ grid-template-columns: repeat(4, 1fr); }}
   .metric {{ text-align: center; }}
   .metric-val {{ display: block; font-size: 1.5rem; font-weight: 700; color: var(--text); }}
   .metric-lbl {{ display: block; font-size: 0.75rem; color: var(--muted); margin-top: 0.15rem; }}
 
+  .trace-legend {{ display: flex; gap: 2rem; margin-bottom: 1rem; font-size: 0.85rem; }}
+  .trace-legend b {{ margin-right: 0.3rem; }}
+
+  /* single-trace waterfall */
   .waterfall {{ display: flex; flex-direction: column; gap: 6px; }}
   .wf-row {{ display: flex; align-items: center; gap: 12px; }}
   .wf-label {{ width: 160px; text-align: right; font-size: 0.8rem; color: var(--muted); flex-shrink: 0; }}
@@ -581,6 +621,8 @@ def generate_html(results, out_path):
   .bg-busy {{ background: var(--busy); }}
   .bg-bubble {{ background: var(--bubble); }}
   .bg-wall {{ background: var(--wall); color: #111; }}
+  .bg-t1 {{ background: var(--t1); }}
+  .bg-t2 {{ background: var(--t2); }}
 
   .stacked-bar {{
     display: flex; height: 32px; border-radius: 6px; overflow: hidden;
@@ -589,6 +631,21 @@ def generate_html(results, out_path):
   .seg {{ transition: width 0.3s; }}
   .stacked-legend {{ display: flex; gap: 1.2rem; margin-top: 0.5rem; font-size: 0.78rem; color: var(--muted); }}
   .dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }}
+
+  /* paired comparison bars */
+  .pair-chart {{ display: flex; flex-direction: column; gap: 12px; }}
+  .pair-group {{ display: grid; grid-template-columns: 160px 1fr 100px; align-items: center; gap: 8px; }}
+  .pair-group.narrow {{ grid-template-columns: 100px 1fr; }}
+  .pair-metric {{ text-align: right; font-size: 0.8rem; color: var(--muted); }}
+  .pair-bars {{ display: flex; flex-direction: column; gap: 3px; }}
+  .pair-row {{ display: flex; align-items: center; gap: 6px; }}
+  .pair-tag {{ font-size: 0.65rem; font-weight: 700; width: 22px; text-align: center; border-radius: 3px; padding: 1px 0; }}
+  .pair-tag.t1 {{ background: var(--t1); color: #111; }}
+  .pair-tag.t2 {{ background: var(--t2); color: #111; }}
+  .pair-bar-wrap {{ flex: 1; height: 18px; background: var(--bg); border-radius: 3px; overflow: hidden; }}
+  .pair-bar {{ height: 100%; border-radius: 3px; }}
+  .pair-val {{ font-size: 0.75rem; white-space: nowrap; min-width: 80px; }}
+  .pair-delta {{ font-size: 0.78rem; font-weight: 600; text-align: right; }}
 
   .cmp {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
   .cmp th, .cmp td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }}
@@ -601,7 +658,7 @@ def generate_html(results, out_path):
   .hist-row {{ display: flex; align-items: center; gap: 8px; }}
   .hist-label {{ width: 100px; text-align: right; font-size: 0.78rem; color: var(--muted); flex-shrink: 0; }}
   .hist-bar-wrap {{ flex: 1; height: 22px; background: var(--bg); border-radius: 3px; overflow: hidden; }}
-  .hist-bar {{ height: 100%; border-radius: 3px; min-width: 2px; }}
+  .hist-bar {{ height: 100%; border-radius: 3px; }}
   .hist-val {{ width: 90px; text-align: right; font-size: 0.78rem; font-variant-numeric: tabular-nums; flex-shrink: 0; }}
   .hist-pct {{ width: 50px; text-align: right; font-size: 0.78rem; color: var(--muted); flex-shrink: 0; }}
   .hist-note {{ font-size: 0.72rem; color: var(--muted); font-style: italic; }}
@@ -609,8 +666,7 @@ def generate_html(results, out_path):
 </head>
 <body>
   <h1>Trace Overlap Report</h1>
-  {"".join(cards_html)}
-  {cmp_html}
+  {body}
   <div style="text-align:center; color:var(--muted); font-size:0.7rem; margin-top:2rem;">
     Generated by analyze_trace_overlap.py
   </div>
