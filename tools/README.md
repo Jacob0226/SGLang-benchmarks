@@ -25,3 +25,9 @@ Profiling, analysis, and micro-benchmark scripts for GLM-5 decode-layer optimiza
 | `test_dual_stream_sweep.py` | GLM5 MoE dual-stream unit test — replicates shared vs routed expert work on two streams. Compares single-stream vs dual-stream graph capture. | B200 / MI355X |
 | `test_gemm_vs_elemwise_overlap.py` | Diagnostic: measures dual-stream overlap with correct fork-join pattern for GEMM+GEMM, GEMM+elementwise, and elem+elem combos. | B200 / MI355X |
 | `test_graph_multi_stream_nv.py` | Test multi-stream GEMM overlap at various token counts (1–128). Each path simulates a full MLP: gate_up GEMM → mul → down GEMM. | B200 |
+
+## CI reproduction
+
+| Script | Description | Example |
+|--------|-------------|---------|
+| `repro_ci.sh` | Reproduce SGLang AMD CI jobs locally on this MI35x/MI325 box. Mirrors `.github/workflows/{pr-test-amd,nightly-test-amd*}.yml`: launches the same `rocm/sgl-dev:*` image, sets the same env vars (`SGLANG_IS_IN_CI*`, `SGLANG_USE_AITER`, `GPU_ARCHS`), and runs `test/run_suite.py` with the same suite/partition. By default uses the image's self-contained `/sgl-workspace/sglang` (no host mount); pass `--sglang-dir PATH` to test local sglang code changes. Generic version of `sglang/scripts/ci/amd/verify_aiter_2857_fix.sh` with no aiter#2857-specific bits. Run `bash repro_ci.sh --help` for full options. | `bash repro_ci.sh --docker rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211 --suite stage-b-test-small-1-gpu-amd --partition-id 5 --partition-size 14` |
