@@ -15,27 +15,163 @@
 # only the HF cache is mounted from the host. Pass --sglang-dir PATH if
 # you've made local sglang code changes that you want to test against.
 #
-# This is the de-aiter#2857-ified version of
-# sglang/scripts/ci/amd/verify_aiter_2857_fix.sh: it keeps the generic CI
-# repro plumbing and drops the Qwen3-235B smoke test, watchdog-symbol probe,
-# and Docker Hub push subcommand.
+# ============================================================================
+# QUICKSTART
+# ============================================================================
+# CI showed `python3 .../test_xxx.py` failed -> just rerun that one file.
+# 90% of the time this is what you want; you do NOT need --partition-*.
 #
-# Usage examples:
-#   # Reproduce a per-commit AMD stage (one partition):
+#     bash repro_ci.sh \
+#         --docker rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211 \
+#         --single-file registered/amd/test_qwen3_instruct_mxfp4.py
+#
+# Map "what CI showed me" -> "what to pass":
+#
+#   CI surface clue                     | Flags to pass
+#   ------------------------------------+-------------------------------------
+#   one test file failed                | --single-file PATH         (90%)
+#   whole nightly job failed (1 runner) | --suite NAME --nightly
+#   whole per-commit stage failed       | --suite NAME    (no partition)
+#   one shard of a partitioned stage    | --suite NAME --partition-id N \
+#     (e.g. "(...gpu-1, 5)")            |   --partition-size M
+#   multimodal-gen-test-*-gpu-amd       | not supported -- use --shell, see
+#                                       | MULTIMODAL-GEN NOTE below
+#
+# Add --sglang-dir $HOME/PR/sglang if you've edited host code and want those
+# edits picked up; otherwise the image's /sgl-workspace/sglang is used.
+#
+# ============================================================================
+# MULTIMODAL-GEN NOTE
+# ============================================================================
+# multimodal-gen-test-*-gpu-amd jobs use a different test driver
+# (python/sglang/multimodal_gen/test/run_suite.py) with different flags and
+# 8 extra diffusion env vars; this script does NOT wrap that driver. To repro
+# such a CI failure, use --shell to set up the container, then paste the
+# CI's docker exec command verbatim. Example for
+# "multimodal-gen-test-2-gpu-amd (linux-mi325-gpu-2, 2)" failure:
+#
+#   # 1. Open the container with host code mounted (so /sglang-checkout/python
+#   #    matches your branch) and a mi325 hostname for arch detection.
+#   bash repro_ci.sh \
+#       --docker rocm/sgl-dev:v0.5.8.post1-rocm700-mi30x-20260211 \
+#       --sglang-dir "$HOME/PR/sglang" \
+#       --hostname linux-mi325-gpu-2 \
+#       --shell
+#
+#   # 2. Inside the container shell, paste this (mirrors pr-test-amd.yml's
+#   #    "Run diffusion server tests" step). First time only, install the
+#   #    diffusion extras (~5-10 min); skip on subsequent runs:
+#   pip install --cache-dir=/sgl-data/pip-cache -e /sglang-checkout/python".[dev_hip,diffusion]"
+#
+#   # 3. Then run the failing partition (copy the CI command verbatim):
+#   cd /sglang-checkout/python
+#   SGLANG_E2E_TOLERANCE=0.3 \
+#   SGLANG_STAGE_TIME_TOLERANCE=0.2 \
+#   SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
+#   SGLANG_DENOISE_STEP_TOLERANCE=0.6 \
+#   SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
+#   SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
+#   AITER_JIT_DIR=/sgl-data/aiter-kernels \
+#   MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
+#   HF_HUB_ENABLE_HF_TRANSFER=1 \
+#   HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
+#   python3 sglang/multimodal_gen/test/run_suite.py \
+#       --suite 2-gpu --partition-id 2 --total-partitions 3 --continue-on-error
+#
+# ============================================================================
+# CONCEPT REFERENCE
+# ============================================================================
+#
+#   suite           A named group of test files (e.g. stage-b-test-small-1-gpu-amd,
+#                   nightly-8-gpu-mi35x-qwen3-235b-mxfp4). Defined in
+#                   sglang/test/run_suite.py. Each test file declares which suite
+#                   it belongs to via register_amd_ci(suite="...") in its body.
+#
+#   partition       (optional, niche) CI splits *some* per-commit suites across
+#                   N runners using an LPT heuristic (run_suite.py::auto_partition).
+#                   On GitHub the failure surface looks like
+#                   "stage-b-test-small-1-gpu-amd (linux-mi325-gpu-1, 5)" where
+#                   5 is the partition id; size = workflow matrix.part length
+#                   (see pr-test-amd.yml). Most nightly jobs run on a single
+#                   runner with NO partition. If you only care about the failing
+#                   file, use --single-file instead and ignore partitions
+#                   entirely.
+#
+#   --single-file   Skip run_suite.py and just `python3 <FILE>` directly. This
+#                   is exactly what run_suite.py does per file internally, so
+#                   it's the fastest fix-and-rerun loop.
+#
+#   --list-only     Print which files run_suite.py would execute for the given
+#                   --suite (+ --partition-id/-size if given) without running.
+#                   Useful before committing to a 30-minute test run.
+#
+#   --shell         Drop into bash with all CI env (SGLANG_IS_IN_CI=1,
+#                   SGLANG_USE_AITER=1, GPU_ARCHS=...) preset, for manual
+#                   debugging.
+#
+#   test tree       Where test files are read from inside the container.
+#                     image (default) -> /sgl-workspace/sglang/test
+#                     host (--sglang-dir + --use-host-tests)
+#                                     -> /sglang-checkout/test
+#                   Both trees have the same registered/ layout, so a single
+#                   --single-file path (e.g. registered/amd/test_xxx.py)
+#                   resolves correctly under either.
+#
+# ============================================================================
+# EXAMPLES
+# ============================================================================
+#
+#   # 1. (most common) Rerun ONE failing test file from the image.
+#   bash repro_ci.sh \
+#       --docker rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211 \
+#       --single-file registered/amd/test_qwen3_instruct_mxfp4.py
+#
+#   # 2. Same as (1) but pick up YOUR host sglang edits.
+#   bash repro_ci.sh \
+#       --docker rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211 \
+#       --sglang-dir "$HOME/PR/sglang" \
+#       --single-file registered/amd/test_qwen3_instruct_mxfp4.py
+#
+#   # 3. A whole nightly suite (1 runner, no partition).
+#   bash repro_ci.sh \
+#       --docker rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211 \
+#       --suite nightly-8-gpu-mi35x-qwen3-235b-mxfp4 --nightly
+#
+#   # 4. (niche) Reproduce ONE partition of a per-commit stage as CI ran it.
+#   #    GitHub UI: "stage-b-test-small-1-gpu-amd (linux-mi325-gpu-1, 5)"
+#   #    -> matrix.part: [0..13] = 14 partitions, failed part is 5.
 #   bash repro_ci.sh \
 #       --docker rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211-preview \
 #       --suite stage-b-test-small-1-gpu-amd \
 #       --partition-id 5 --partition-size 14
 #
-#   # Reproduce a nightly suite end-to-end:
+#   # 5. Peek at which files (4) would run before committing to it.
 #   bash repro_ci.sh \
-#       --docker rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211 \
-#       --suite nightly-8-gpu-mi35x-qwen3-235b-mxfp4 --nightly
+#       --docker rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211-preview \
+#       --suite stage-b-test-small-1-gpu-amd \
+#       --partition-id 5 --partition-size 14 --list-only
 #
-#   # Iterate on a single failing test file (fastest):
+#   # 6. Set env up but drop into a shell instead of running tests
+#   #    (e.g. to start the server manually and poke at it).
 #   bash repro_ci.sh \
 #       --docker rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211 \
+#       --shell
+#
+#   # 7. You changed sglang core / sgl-kernel / aiter and need a full rebuild
+#   #    before testing. Slow (~10-30 min).
+#   bash repro_ci.sh \
+#       --docker rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211 \
+#       --sglang-dir "$HOME/PR/sglang" --run-install \
 #       --single-file registered/amd/test_qwen3_instruct_mxfp4.py
+#
+#   # 8. Repro on a mi325 runner (per-commit suites usually run on mi325):
+#   bash repro_ci.sh \
+#       --docker rocm/sgl-dev:v0.5.8.post1-rocm700-mi30x-20260211 \
+#       --hostname linux-mi325-gpu-1 \
+#       --single-file registered/amd/test_xxx.py
+#
+#   # 9. multimodal-gen CI shard: see MULTIMODAL-GEN NOTE above (use --shell
+#   #    + paste CI command; this script doesn't wrap that driver).
 #
 # Required:
 #   --docker IMAGE         Docker image to use (no default).
