@@ -242,7 +242,20 @@ start_server() {
             --nsa-decode-backend tilelang
         )
         if [ "$DUAL_STREAM_ROCM" == "true" ]; then
+            # Two independent toggles must both be set for full ROCm dual-stream:
+            #   (a) --disable-shared-experts-fusion
+            #         Forces num_fused_shared_experts=0 so DeepseekV2MoE.forward
+            #         takes forward_normal_dual_stream (shared ∥ routed overlap)
+            #         instead of forward_normal which would use the fused
+            #         _fused_append_shared_experts_kernel.
+            #   (b) SGLANG_ENABLE_HIP_DUAL_STREAM=1
+            #         Required to actually create alt_stream on ROCm. Without
+            #         it, alt_stream=None on HIP and *both* the NSA-decode A_v4
+            #         layout and the MoE forward_normal_dual_stream are skipped.
+            #         (Default OFF because the layout regresses on MI355X — see
+            #         tools/dual_stream_regression_analysis.md for full analysis.)
             cmd+=(--disable-shared-experts-fusion)
+            export SGLANG_ENABLE_HIP_DUAL_STREAM=1
         fi
     else
         # NVIDIA (B200) specific optimizations

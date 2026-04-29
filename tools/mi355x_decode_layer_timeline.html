@@ -81,7 +81,8 @@ svg text { font-family:'JetBrains Mono',monospace; }
 <body>
 
 <h1>GLM5-FP8 Decode Layer — Architecture &amp; Kernel Stream Timeline</h1>
-<p class="sub">TP=8 · NSA tilelang · AMD MI355X (ROCm) vs NVIDIA B200 (CUDA)</p>
+<p class="sub">TP=8 · NSA tilelang · AMD MI355X (ROCm) vs NVIDIA B200 (CUDA)<br>
+MI355X timeline shows the <span style="color:#4ade80">SINGLE-STREAM winning layout</span> (PR #23562 base + cat-skip optimization). Dual-stream A_v4 was attempted but regresses ~30 μs / layer on this hardware due to HBM contention + HIP-graph AllReduce slowdown — see callout in Tab 2.</p>
 
 <!-- ═══════════ NAV TABS ═══════════ -->
 <div class="nav">
@@ -168,24 +169,34 @@ svg text { font-family:'JetBrains Mono',monospace; }
   <rect x="30" y="410" width="1040" height="455" rx="12" fill="rgba(100,255,218,0.03)" stroke="#64ffda" stroke-width="1" stroke-dasharray="5,4"/>
   <text x="550" y="435" text-anchor="middle" font-size="14" font-weight="700" fill="#64ffda">2. ATTENTION DUAL-STREAM — FORK</text>
 
-  <!-- LEFT: q_b_proj -->
-  <rect x="55" y="455" width="370" height="195" rx="10" fill="#141828" stroke="#8be9fd" stroke-width="1.5"/>
-  <text x="240" y="477" text-anchor="middle" font-size="12" font-weight="700" fill="#8be9fd">Current Stream — q_b_proj</text>
-  <text x="240" y="492" text-anchor="middle" font-size="10" fill="#8892b0">12μs active, then IDLE 127μs</text>
+  <!-- LEFT: q_b_proj + bmm W_kc + fused_qk_rope_cat (post-A_v4: gap-fill pulled into dual-stream window) -->
+  <rect x="55" y="455" width="370" height="280" rx="10" fill="#141828" stroke="#8be9fd" stroke-width="1.5"/>
+  <text x="240" y="477" text-anchor="middle" font-size="12" font-weight="700" fill="#8be9fd">Current Stream — q_b + W_kc + fused rope</text>
+  <text x="240" y="492" text-anchor="middle" font-size="10" fill="#8892b0">~16μs active, then IDLE ~85μs</text>
 
-  <rect x="80" y="508" width="320" height="34" rx="6" fill="#64ffda" fill-opacity="0.12" stroke="#64ffda" stroke-width="1"/>
-  <text x="240" y="522" text-anchor="middle" font-size="10" font-weight="600" fill="#64ffda">q_b_proj W: (1536 × 24576) — 9.1μs</text>
-  <text x="240" y="536" text-anchor="middle" font-size="9" fill="#8892b0">(B, 1536) → (B, 24576)</text>
+  <rect x="80" y="508" width="320" height="32" rx="6" fill="#64ffda" fill-opacity="0.12" stroke="#64ffda" stroke-width="1"/>
+  <text x="240" y="522" text-anchor="middle" font-size="10" font-weight="600" fill="#64ffda">q_b_proj W: (1536 × 24576) — 7.6μs</text>
+  <text x="240" y="535" text-anchor="middle" font-size="9" fill="#8892b0">(B, 1536) → (B, 24576)</text>
 
-  <rect x="80" y="549" width="320" height="26" rx="6" fill="#50fa7b" fill-opacity="0.1" stroke="#50fa7b" stroke-width="0.8"/>
-  <text x="240" y="567" text-anchor="middle" font-size="9" fill="#50fa7b">reshape → (B, 128 heads, 192 dim)</text>
+  <rect x="80" y="546" width="320" height="22" rx="6" fill="#50fa7b" fill-opacity="0.1" stroke="#50fa7b" stroke-width="0.8"/>
+  <text x="240" y="561" text-anchor="middle" font-size="9" fill="#50fa7b">reshape → (B, 128h, 192d) → split [Q_nope, Q_rope]</text>
 
-  <rect x="80" y="582" width="150" height="22" rx="4" fill="#1c2240" stroke="#f1fa8c" stroke-width="0.8"/>
-  <text x="155" y="597" text-anchor="middle" font-size="9" fill="#f1fa8c">Q_nope (B,128,128)</text>
-  <rect x="240" y="582" width="150" height="22" rx="4" fill="#1c2240" stroke="#f1fa8c" stroke-width="0.8"/>
-  <text x="315" y="597" text-anchor="middle" font-size="9" fill="#f1fa8c">Q_rope (B,128,64)</text>
+  <rect x="80" y="574" width="150" height="22" rx="4" fill="#1c2240" stroke="#f1fa8c" stroke-width="0.8"/>
+  <text x="155" y="589" text-anchor="middle" font-size="9" fill="#f1fa8c">Q_nope (B,128,128)</text>
+  <rect x="240" y="574" width="150" height="22" rx="4" fill="#1c2240" stroke="#f1fa8c" stroke-width="0.8"/>
+  <text x="315" y="589" text-anchor="middle" font-size="9" fill="#f1fa8c">Q_rope (B,128,64)</text>
 
-  <text x="240" y="635" text-anchor="middle" font-size="11" font-weight="600" fill="#ff5555">IDLE 127μs</text>
+  <!-- NEW: bmm W_kc absorb (moved from Section 3 into dual-stream window) -->
+  <rect x="80" y="603" width="320" height="32" rx="6" fill="#64ffda" fill-opacity="0.12" stroke="#64ffda" stroke-width="1"/>
+  <text x="240" y="618" text-anchor="middle" font-size="10" font-weight="600" fill="#64ffda">bmm W_kc absorb — 4.4μs</text>
+  <text x="240" y="630" text-anchor="middle" font-size="8" fill="#8892b0">Q_nope(B,128,128) @ W_kc(128,128,512) → Q_nope_out(B,128,512)</text>
+
+  <!-- NEW: fused QK RoPE + cache (moved from Section 3 into dual-stream window) -->
+  <rect x="80" y="641" width="320" height="32" rx="6" fill="#ff79c6" fill-opacity="0.15" stroke="#ff79c6" stroke-width="1"/>
+  <text x="240" y="656" text-anchor="middle" font-size="10" font-weight="600" fill="#ff79c6">fused_qk_rope_cat_and_cache_mla — 3.7μs</text>
+  <text x="240" y="668" text-anchor="middle" font-size="8" fill="#8892b0">RoPE(Q,K) + write FP8 KV cache → q_cat (B,128,576) contiguous</text>
+
+  <text x="240" y="700" text-anchor="middle" font-size="11" font-weight="600" fill="#ff5555">IDLE ~85μs (waiting for indexer)</text>
 
   <!-- RIGHT: NSA Indexer -->
   <rect x="575" y="455" width="470" height="395" rx="10" fill="#141828" stroke="#ff79c6" stroke-width="1.5"/>
@@ -228,22 +239,21 @@ svg text { font-family:'JetBrains Mono',monospace; }
   <text x="950" y="562" text-anchor="middle" font-size="9" fill="#ffb86c">Indexer K: 1 head</text>
   <text x="950" y="580" text-anchor="middle" font-size="8" fill="#8892b0">(K shared by 8 Q heads)</text>
 
-  <line x1="240" y1="650" x2="240" y2="872" stroke="#8be9fd" stroke-width="1" stroke-dasharray="4,3"/>
+  <line x1="240" y1="735" x2="240" y2="872" stroke="#8be9fd" stroke-width="1" stroke-dasharray="4,3"/>
   <line x1="725" y1="850" x2="725" y2="872" stroke="#ff79c6" stroke-width="1"/>
   <line x1="240" y1="872" x2="480" y2="888" stroke="#8892b0" stroke-width="1.2"/>
   <line x1="725" y1="872" x2="480" y2="888" stroke="#8892b0" stroke-width="1.2"/>
   <text x="480" y="880" text-anchor="middle" font-size="11" font-weight="700" fill="#64ffda">JOIN — current.wait_stream(alt)</text>
 
-  <!-- ======= SECTION 3: ATTENTION CORE ======= -->
+  <!-- ======= SECTION 3: ATTENTION CORE (post-A_v4: bmm W_kc and fused rope moved to Section 2) ======= -->
   <rect x="180" y="895" width="740" height="310" rx="12" fill="#141828" stroke="#ff79c6" stroke-width="1.5"/>
-  <text x="550" y="920" text-anchor="middle" font-size="14" font-weight="700" fill="#ff79c6">3. ATTENTION CORE (serial) — 62μs — 128 MLA heads</text>
+  <text x="550" y="920" text-anchor="middle" font-size="14" font-weight="700" fill="#ff79c6">3. ATTENTION CORE (serial) — ~37μs — 128 MLA heads</text>
 
-  <rect x="220" y="935" width="500" height="36" rx="6" fill="#64ffda" fill-opacity="0.12" stroke="#64ffda" stroke-width="1"/>
-  <text x="470" y="950" text-anchor="middle" font-size="10" font-weight="600" fill="#64ffda">bmm W_kc absorb — 6.2μs</text>
-  <text x="470" y="964" text-anchor="middle" font-size="9" fill="#8892b0">Q_nope(B,128,128) @ W_kc(128,128,512) → Q'(B,128,512)</text>
-
-  <rect x="220" y="978" width="500" height="24" rx="6" fill="#50fa7b" fill-opacity="0.1" stroke="#50fa7b" stroke-width="0.8"/>
-  <text x="470" y="995" text-anchor="middle" font-size="9" fill="#50fa7b">RoPE(Q_rope) + store kv_a/k_rope into MLA KV cache — 5.1μs</text>
+  <!-- Note: q_cat (already concat'd in Section 2) is passed directly to attn_mqa with q_rope=None,
+       so nsa_backend reuses it as q_all via .contiguous().view() — no torch.cat / CatArrayBatchedCopy. -->
+  <rect x="220" y="935" width="500" height="40" rx="6" fill="rgba(74,222,128,0.08)" stroke="#4ade80" stroke-width="0.8" stroke-dasharray="3,3"/>
+  <text x="470" y="952" text-anchor="middle" font-size="10" font-weight="600" fill="#4ade80">q_cat reused directly (q_rope=None to attn_mqa)</text>
+  <text x="470" y="966" text-anchor="middle" font-size="8" fill="#8892b0">CatArrayBatchedCopy eliminated (was ~5μs/layer × 64 layers per token)</text>
 
   <rect x="220" y="1010" width="500" height="44" rx="6" fill="#ff79c6" fill-opacity="0.15" stroke="#ff79c6" stroke-width="1.2"/>
   <text x="470" y="1028" text-anchor="middle" font-size="11" font-weight="600" fill="#ff79c6">attn_kernel_1 (sparse_mla_partial) — 10.6μs</text>
@@ -392,8 +402,26 @@ svg text { font-family:'JetBrains Mono',monospace; }
 <div class="legend" id="legend"></div>
 
 <!-- ═══════════ MI355X ═══════════ -->
-<h2 style="color:var(--accent2)">AMD MI355X</h2>
-<p class="sub">Stream 113 (current) &amp; Stream 106 (alt) &nbsp;|&nbsp; ≈ 397 μs / layer &nbsp;|&nbsp; 2 streams, layers execute serially</p>
+<h2 style="color:var(--accent2)">AMD MI355X — single-stream (winner)</h2>
+<p class="sub">Stream 8 (single) &nbsp;|&nbsp; ≈ 285 μs / layer &nbsp;|&nbsp; 8k1k conc4 median TPOT 20.48 ms (faster than PR #23562 baseline 21.21 ms). <span style="color:#4ade80">CatArrayBatchedCopy eliminated via q_cat reuse.</span></p>
+
+<!-- ════ Dual-stream regression callout ════ -->
+<div style="background:rgba(248,113,113,0.06); border:1px solid #f87171; border-radius:8px; padding:14px 18px; margin-bottom:20px; font-family:'JetBrains Mono',monospace; font-size:11px; line-height:1.7;">
+<div style="color:#f87171; font-weight:700; font-size:13px; margin-bottom:8px;">⚠ Why the timeline below is single-stream</div>
+The A_v4 dual-stream layout (overlap NSA indexer on alt with [q_b_proj + bmm w_kc + fused_qk_rope_cat] on cur) <b>regressed ~30 μs / layer</b> on MI355X — measured by re-running the same code with alt_stream forced to None (MyBranch_NoDualStream).<br><br>
+<b>Measured kernel-duration deltas</b> (single → dual-stream):
+<ul style="margin:6px 0 6px 24px; line-height:1.8;">
+  <li>Memory-bound indexer kernels (Hadamard, act_quant, paged_mqa, topk_transform): each +0.5–2.4 μs, <b>+8 μs total / layer</b>.</li>
+  <li>Compute-bound kernels (main_kernel, bmm_w_vc, etc.): each +0.5–1.5 μs, <b>+5 μs total / layer</b>.</li>
+  <li><b>AllReduce</b>: <code>aiter::cross_device_reduce_1stage&lt;bf16,8&gt;</code> jumps from 9.5 μs (single) to 23 μs (dual), same kernel, same 8-rank topology, <b>+13 μs × 2 ARs = +26 μs / layer</b>.</li>
+</ul>
+<b>Hypothesised causes</b> (consistent with the data but not yet verified with rocprof HW counters):
+<ul style="margin:6px 0 6px 24px; line-height:1.8;">
+  <li>HBM (8 TB/s) channel / queue contention between concurrent kernels.</li>
+  <li>Per-stream peer-fence in aiter's cross_device_reduce extends when alt has outstanding writes.</li>
+</ul>
+A_v4's theoretical saving (gap-fill ∥ indexer ≈ −10 μs) is dwarfed by the cost. The dual-stream code is preserved behind <code style="color:#22d3ee">SGLANG_ENABLE_HIP_DUAL_STREAM=1</code> for future ROCm releases that may fix this.
+</div>
 <div class="tl-wrap" id="mi-wrap">
   <div class="phase-row" id="mi-phases"></div>
   <div class="row">
@@ -461,73 +489,72 @@ const catL = {
   norm:'Norm (RMS / Layer)', moe:'MoE Routing / Sort', misc:'Misc / Elementwise'
 };
 
-/* ═══════════ MI355X DATA ═══════════ */
-const MI_PPU = 3.0, MI_MAX = 400;
+/* ═══════════ MI355X DATA — SINGLE-STREAM WINNER ═══════════
+ * Source: results/.../GLM-5.1-FP8-prof-MyBranch_NoDualStream/prof_in8192_out1024_conc4_p8/
+ *         in8192_out1024_conc4_p8-TP-0-DECODE.trace.json.gz
+ *
+ * Configuration: PR #23562 base + cat-skip optimization, alt_stream=None on ROCm
+ * (i.e., dual-stream A_v4 disabled — see callout above for why).
+ *
+ *   - All kernels serial on a single stream (phys 8 here, was 113 in dual-stream)
+ *   - fused_append_shared_experts is the fast aiter fused shared-expert kernel
+ *     (~4 us, replaces unfused gate_up + silu + down chain)
+ *   - CatArrayBatchedCopy absent: nsa_backend.forward_decode reuses q_cat as a
+ *     zero-copy view because forward_absorb_core passes q_rope=None on decode
+ *   - AllReduce takes its normal ~10 us (vs 23 us under dual-stream graph)
+ *
+ * Layer length ≈ 285 us (alternating between input_layernorm and q_a/kv_a-fused-norm
+ * gives 25 + 260 us pattern — the 285 us is one full layer cycle).
+ */
+const MI_PPU = 3.5, MI_MAX = 290;
 
 const s113 = [
-  {ts:1.5,dur:3.8,l:'elem_add (prev join)',c:'misc',d:'Combine shared+routed MoE outputs from prev layer (line 578)'},
-  {ts:5.4,dur:15.0,l:'allreduce',c:'comm',d:'AllReduce MoE output across 8 TP ranks'},
-  {ts:20.4,dur:5.0,l:'rms+fp8_quant',c:'quant',d:'Fused: residual add + RMSNorm + FP8 quant for next GEMM'},
-  {ts:25.4,dur:40.7,l:'fused_qkv_a_proj (CK)',c:'gemm_ck',d:'(B,7168)@(7168,2112)→split(q_a[1536], kv_a[512], k_rope[64])'},
-  {ts:66.1,dur:4.4,l:'q_a / kv_a layernorm',c:'norm',d:'LayerNorm on q_a and kv_a latent vectors'},
-  {ts:79.7,dur:2.5,l:'quant (q_b_proj)',c:'quant',d:'FP8 quant q_a for q_b_proj GEMM'},
-  {ts:82.3,dur:9.1,l:'q_b_proj (CK)',c:'gemm_ck',d:'Expand q_a→full Q: (B,1536)→(B,128h,192d=24576)'},
-  {ts:218.7,dur:6.2,l:'bmm w_kc (absorb)',c:'attn',d:'Absorb W_kc into Q_nope: (B,128,128)@W_kc→(B,128,512)'},
-  {ts:224.9,dur:5.1,l:'qk_rope + cache',c:'attn',d:'RoPE on Q_rope/K_rope + store kv_a+k_rope into MLA KV cache'},
-  {ts:230.0,dur:7.3,l:'CatBatchCopy',c:'misc',d:'Concatenate attention Q components for batched kernel'},
-  {ts:237.3,dur:10.6,l:'attn_kernel_1',c:'attn',d:'sparse_mla_fwd_decode_partial: split-k over 2048 top-k blocks (32 splits), writes partial_o + partial_lse'},
-  {ts:247.9,dur:9.7,l:'attn_kernel_2',c:'attn',d:'sparse_mla_fwd_decode_combine: log-sum-exp reduction of 32 partial results into final attn output'},
-  {ts:257.5,dur:7.7,l:'bmm w_vc (absorb)',c:'attn',d:'Absorb W_vc: attn_out(512)×W_vc→V_out(128) per head'},
-  {ts:265.2,dur:4.9,l:'fp8_quant',c:'quant',d:'FP8 quant attention output for o_proj'},
-  {ts:270.1,dur:10.1,l:'o_proj (CK)',c:'gemm_ck',d:'Output projection: (B,128h×128d=16384)→(B,7168)'},
-  {ts:280.3,dur:23.4,l:'allreduce',c:'comm',d:'AllReduce attention output across 8 TP ranks'},
-  {ts:303.6,dur:5.3,l:'pre-MoE rmsnorm',c:'norm',d:'Fused: residual add + RMSNorm before MoE'},
-  {ts:309.0,dur:4.8,l:'shared quant',c:'quant',d:'FP8 quant hidden for shared expert gate_up'},
-  {ts:313.7,dur:22.6,l:'shared gate_up (CK)',c:'gemm_ck',d:'Shared expert FFN gate+up: (B,7168)→(B,4096=2×2048)'},
-  {ts:336.4,dur:4.4,l:'SiLU * gate',c:'misc',d:'SiLU(gate)×up activation: (B,4096)→(B,2048)'},
-  {ts:340.7,dur:4.4,l:'shared quant',c:'quant',d:'FP8 quant intermediate for shared expert down_proj'},
-  {ts:345.2,dur:5.2,l:'shared down (CK)',c:'gemm_ck',d:'Shared expert FFN down: (B,2048)→(B,7168)'},
-  {ts:394.2,dur:3.7,l:'elem_add (MoE join)',c:'misc',d:'Combine shared+routed outputs: final_hidden += shared_output'},
+  {ts:0.0,dur:4.2,l:'rms+fp8_quant',c:'quant',d:'fused_rms_fp8_group_quant: residual + RMSNorm + FP8 quant for qkv_a_proj input. Layer cycle starts here.'},
+  {ts:8.2,dur:6.6,l:'CK gemm (small)',c:'gemm_ck',d:'CK preshuffle GEMM (intermediate stage of qkv_a or related; 6.6μs each)'},
+  {ts:18.8,dur:6.8,l:'CK gemm (small)',c:'gemm_ck',d:'CK preshuffle GEMM (intermediate stage)'},
+  {ts:29.7,dur:16.2,l:'qkv_a_proj (CK)',c:'gemm_ck',d:'(B,7168)@(7168,2112)→split(q_a[1536], kv_a[512], k_rope[64]). Big CK preshuffle GEMM.'},
+  /* ── NSA indexer chain (entirely on cur because alt_stream=None on ROCm) ── */
+  {ts:45.9,dur:4.7,l:'indexer LN (k_norm)',c:'norm',d:'NSA indexer K layernorm'},
+  {ts:50.6,dur:8.5,l:'indexer RoPE',c:'attn',d:'kn_entry_2c_sbhd: cached RoPE on indexer Q,K (in-place)'},
+  {ts:59.1,dur:3.9,l:'hadamard_q',c:'misc',d:'Fast Hadamard transform on indexer Q for compression'},
+  {ts:63.0,dur:4.3,l:'hadamard_k',c:'misc',d:'Fast Hadamard transform on indexer K for compression'},
+  {ts:67.3,dur:4.8,l:'act_quant',c:'quant',d:'FP8 quant indexer Q/K after Hadamard'},
+  {ts:76.6,dur:5.6,l:'weights_proj (NSA score)',c:'gemm_rocblas',d:'wv_splitk_small_fp16_bf16: NSA block scoring GEMM Q×K→block_scores (B,8,n_blocks)'},
+  {ts:86.8,dur:4.3,l:'paged_mqa+topk',c:'attn',d:'paged_mqa logits + fast_topk_transform → topk_indices'},
+  /* ── attn core: bmm w_kc + fused_qk_rope_cat are serial here (no dual-stream) ── */
+  {ts:105.8,dur:4.5,l:'bmm w_kc (absorb)',c:'attn',d:'Absorb W_kc: Q_nope(B,128,128)@W_kc→Q_nope_out(B,128,512)'},
+  {ts:110.3,dur:4.2,l:'fused_qk_rope+cache',c:'attn',d:'fused_qk_rope_cat_and_cache_mla: RoPE Q,K + write FP8 KV cache → q_cat (B,128,576). Output q_cat is passed directly to attn_mqa with q_rope=None, eliminating the redundant CatArrayBatchedCopy that would otherwise rebuild q_all (~2.6 us / layer saved).'},
+  {ts:114.5,dur:10.2,l:'attn_kernel_1',c:'attn',d:'sparse_mla_fwd_decode_partial: split-k over top-K blocks. Reads q_cat directly via slice view (cat-skip applied).'},
+  {ts:124.7,dur:8.1,l:'attn_kernel_2',c:'attn',d:'sparse_mla_fwd_decode_combine: log-sum-exp reduction'},
+  {ts:132.8,dur:6.6,l:'bmm w_vc (absorb)',c:'attn',d:'Absorb W_vc: attn_out×W_vc per head'},
+  {ts:147.8,dur:7.0,l:'o_proj (CK)',c:'gemm_ck',d:'Output projection: (B,128h×128d=16384)→(B,7168)'},
+  {ts:154.8,dur:11.4,l:'allreduce (attn)',c:'comm',d:'aiter::cross_device_reduce_1stage<bf16,8>: AR attn output. ~10us under single-stream graph (vs ~23us under dual-stream — see callout above).'},
+  /* ── MoE phase: NO dual-stream (alt_stream=None). Uses fused_append_shared_experts kernel. ── */
+  {ts:166.2,dur:4.2,l:'pre-MoE rmsnorm',c:'norm',d:'add_rmsnorm_quant: residual + RMSNorm + FP8 quant before MoE'},
+  {ts:170.5,dur:6.5,l:'router gate',c:'gemm_rocblas',d:'aiter::bf16gemm_fp32bf16_tn_32x64_splitk: MoE router gate GEMM (B,7168)→(B,256) expert scores'},
+  {ts:177.0,dur:0.5,l:'fused_shared',c:'moe',d:'_fused_append_shared_experts_kernel: aiter\'s fused shared expert kernel — replaces serial gate_up + silu + down + add chain (saves ~44us vs unfused with --disable-shared-experts-fusion).'},
+  {ts:177.5,dur:5.2,l:'grouped_topk',c:'moe',d:'MoE: select top-8 experts per token'},
+  {ts:186.8,dur:9.1,l:'MoeSorting',c:'moe',d:'Sort tokens by expert assignment for dispatch'},
+  {ts:196.0,dur:9.0,l:'quant + fillBuffer',c:'quant',d:'dynamic_per_group_scaled_quant + memset for routed expert input'},
+  {ts:205.0,dur:18.2,l:'routed gate_up (MoE GEMM)',c:'gemm_ck',d:'kernel_moe_gemm: routed expert gate_up (B×8,7168)→(B×8,4096)'},
+  {ts:223.2,dur:4.4,l:'SiLU × gate',c:'misc',d:'SiLU(gate)×up activation'},
+  {ts:227.6,dur:4.7,l:'routed quant',c:'quant',d:'FP8 quant intermediate for routed expert down_proj'},
+  {ts:232.3,dur:11.1,l:'routed down (MoE GEMM)',c:'gemm_ck',d:'kernel_moe_gemm: routed expert down_proj (B×8,2048)→(B×8,7168)'},
+  {ts:243.4,dur:8.1,l:'allreduce (MoE)',c:'comm',d:'aiter AR: reduce MoE final_hidden_states across 8 TP ranks. Layer N ends at ~251.5us.'},
 ];
 
-const s106 = [
-  {ts:72.1,dur:2.1,l:'indexer rmsnorm',c:'norm',d:'LayerNorm on kv_a for NSA indexer path'},
-  {ts:79.6,dur:2.4,l:'indexer quant',c:'quant',d:'FP8 quant kv_a for indexer projections'},
-  {ts:82.0,dur:8.1,l:'wq_b GEMM (CK)',c:'gemm_ck',d:'NSA indexer Q proj: q_a(1536)→indexer_Q(8h×128d=1024)'},
-  {ts:90.1,dur:23.4,l:'wk GEMM (CK)',c:'gemm_ck',d:'NSA indexer K proj: hidden(7168)→indexer_K(1h×128d=128)'},
-  {ts:113.5,dur:4.6,l:'k_norm',c:'norm',d:'LayerNorm on indexer K before RoPE'},
-  {ts:118.1,dur:9.7,l:'RoPE (aiter)',c:'attn',d:'RoPE positional encoding on indexer Q and K'},
-  {ts:127.8,dur:4.7,l:'hadamard_q',c:'misc',d:'Fast Hadamard transform on indexer Q for compression'},
-  {ts:132.5,dur:4.8,l:'hadamard_k',c:'misc',d:'Fast Hadamard transform on indexer K for compression'},
-  {ts:137.3,dur:6.0,l:'act_quant_q',c:'quant',d:'FP8 quant indexer Q after Hadamard'},
-  {ts:143.3,dur:4.6,l:'act_quant_k',c:'quant',d:'FP8 quant indexer K after Hadamard'},
-  {ts:147.9,dur:4.8,l:'store_k_cache',c:'misc',d:'Store indexer K into NSA block-scoring KV cache'},
-  {ts:152.8,dur:4.6,l:'to_copy (triton)',c:'misc',d:'Copy/cast indexer data for scoring (Triton)'},
-  {ts:157.3,dur:7.7,l:'weights_proj (rocBLAS)',c:'gemm_rocblas',d:'NSA block scoring GEMM: Q×K→block_scores (B,8,n_blocks)'},
-  {ts:165.0,dur:6.4,l:'hipBLAS GEMM',c:'gemm_hipblas',d:'NSA scoring continuation GEMM (hipBLAS)'},
-  {ts:171.4,dur:4.9,l:'scale * mul',c:'misc',d:'Apply scaling factors to block scores'},
-  {ts:176.3,dur:5.9,l:'fill(-inf)',c:'misc',d:'Mask invalid positions with -inf before scoring'},
-  {ts:182.2,dur:9.9,l:'paged_mqa_logits',c:'attn',d:'Paged MQA attention: compute per-block logits for NSA'},
-  {ts:192.1,dur:21.2,l:'topk_transform',c:'moe',d:'Select top-16 KV blocks per head → sparse attention indices'},
-  {ts:314.3,dur:8.7,l:'wv_splitk (router)',c:'moe',d:'MoE router gate GEMM: (B,7168)→(B,256) expert scores'},
-  {ts:323.0,dur:5.2,l:'grouped_topk',c:'moe',d:'Select top-8 experts per token with group constraints'},
-  {ts:328.2,dur:8.0,l:'MoeSorting',c:'moe',d:'Sort tokens by expert assignment for dispatch'},
-  {ts:336.2,dur:4.7,l:'routed quant',c:'quant',d:'FP8 quant hidden for routed expert gate_up'},
-  {ts:340.8,dur:4.9,l:'Memset',c:'misc',d:'Zero output buffer before routed MoE accumulation'},
-  {ts:345.8,dur:21.9,l:'routed up (CK)',c:'gemm_ck',d:'Routed expert gate_up: (B×8,7168)→(B×8,4096) via CK MoE GEMM'},
-  {ts:367.7,dur:5.0,l:'SiLU * gate',c:'misc',d:'SiLU(gate)×up activation: (B×8,4096)→(B×8,2048)'},
-  {ts:372.6,dur:4.9,l:'routed quant',c:'quant',d:'FP8 quant intermediate for routed expert down_proj'},
-  {ts:377.6,dur:11.1,l:'routed down (CK)',c:'gemm_ck',d:'Routed expert down_proj: (B×8,2048)→(B×8,7168) via CK MoE GEMM'},
-];
+// alt_stream is not used in single-stream layout (alt_stream=None on ROCm by default)
+const s106 = [];
 
 const mi_ph = [
-  {s:0,e:66,l:'Pre-Attention (serial)',bg:'rgba(100,116,139,0.06)',lc:'#64748b'},
-  {s:66,e:218,l:'Attn Dual-Stream: q_b_proj ∥ NSA Indexer',bg:'rgba(34,211,238,0.07)',lc:'#22d3ee'},
-  {s:218,e:303,l:'Attn Core + AllReduce (serial)',bg:'rgba(248,113,113,0.05)',lc:'#f87171'},
-  {s:303,e:394,l:'MoE Dual-Stream: shared ∥ routed',bg:'rgba(232,121,249,0.07)',lc:'#e879f9'},
+  {s:0,e:46,l:'Pre-Attention (qkv_a + small CK gemms)',bg:'rgba(100,116,139,0.06)',lc:'#64748b'},
+  {s:46,e:106,l:'NSA Indexer (serial)',bg:'rgba(232,121,249,0.05)',lc:'#e879f9'},
+  {s:106,e:166,l:'Attn Core + AR (serial)',bg:'rgba(129,140,248,0.07)',lc:'#818cf8'},
+  {s:166,e:243,l:'MoE (serial, fused shared)',bg:'rgba(252,165,165,0.05)',lc:'#fca5a5'},
+  {s:243,e:285,l:'MoE AR + N+1 prep',bg:'rgba(248,113,113,0.05)',lc:'#f87171'},
 ];
-const mi_idle113 = [{s:91.3,e:218.7,l:'IDLE (waiting for indexer)'},{s:350.3,e:394.2,l:'IDLE (waiting for routed)'}];
-const mi_idle106 = [{s:213.4,e:314.3,l:'IDLE (waiting for attn core)'}];
+const mi_idle113 = [];  // Single-stream — no idle gaps
+const mi_idle106 = [{s:0,e:285,l:'alt_stream not created (set SGLANG_ENABLE_HIP_DUAL_STREAM=1 to enable A_v4 layout)'}];
 
 /* ═══════════ B200 DATA ═══════════ */
 const B2_PPU = 2.5, B2_MAX = 580;
@@ -782,12 +809,14 @@ function buildTimelines() {
   });
 
   buildStats('mi-stats', [
-    {l:'Total Layer',v:'~397',u:'μs',co:'var(--accent1)'},
-    {l:'Attn Dual (q_b_proj ∥ indexer)',v:'152',u:'μs',co:'var(--gemm-ck)'},
-    {l:'Attn Sequential (core+AR)',v:'85',u:'μs',co:'var(--attn)'},
-    {l:'MoE Dual (shared ∥ routed)',v:'91',u:'μs',co:'var(--moe)'},
-    {l:'AllReduce (pure serial)',v:'38',u:'μs total',co:'var(--comm)'},
-    {l:'Cross-Layer Overlap',v:'0',u:'μs (none)',co:'var(--fg2)'},
+    {l:'Total Layer',v:'~285',u:'μs (single-stream)',co:'var(--accent1)'},
+    {l:'Bench TPOT (8k1k conc4)',v:'20.48',u:'ms median (vs Thomas 21.21)',co:'#4ade80'},
+    {l:'GSM8K Accuracy',v:'~0.95',u:'(matches PR #23562 baseline)',co:'#4ade80'},
+    {l:'Indexer chain',v:'60',u:'μs (vs +8 under dual-stream)',co:'var(--moe)'},
+    {l:'AllReduce (attn)',v:'10',u:'μs (vs 23 under dual-stream graph)',co:'var(--comm)'},
+    {l:'CatArrayBatchedCopy',v:'eliminated',u:'~2.6 μs/layer saved',co:'#4ade80'},
+    {l:'Dual-stream A_v4 attempt',v:'+30',u:'μs/layer regression (disabled by default)',co:'#f87171'},
+    {l:'Cross-Layer Overlap',v:'0',u:'μs (single-stream baseline)',co:'var(--fg2)'},
   ]);
 
   buildStats('b2-stats', [
