@@ -478,7 +478,7 @@
     <div class="timeline-head">
       <div>
         <h3>Three traces, one full layer-pass each, same time scale.</h3>
-        <p>Top: MI355X single-stream. Middle: MI355X dual-stream HIP. Bottom: B200 dual-stream CUDA-graph (4 lanes from the stream pool). Hover any kernel for full name + duration. <span style="color:var(--rose-bright);font-weight:500">Red bands</span> = ≥2&nbsp;µs <em>real CPU stall</em> — only on MI355X dual-stream. <span style="color:var(--amber);font-weight:500">Amber bands</span> = 1–2&nbsp;µs small fences. <span style="color:var(--azure);font-weight:500">Faint azure</span> on B200 = CUPTI-reported per-kernel dispatch latency (a profiler-accounting artifact; roctracer hides this in MI355X — <em>not</em> a real GPU bubble). <span style="color:var(--amber);font-weight:500">Dashed amber outline</span> = AR kernels.</p>
+        <p>Top: MI355X single-stream. Middle: MI355X dual-stream HIP. Bottom: B200 dual-stream CUDA-graph (4 lanes from the stream pool). Hover any kernel for full name + duration. <span style="color:var(--rose-bright);font-weight:500">Red bands</span> = ≥2&nbsp;µs <em>real CPU stall</em> — only on MI355X dual-stream. <span style="color:var(--amber);font-weight:500">Amber bands</span> = 1–2&nbsp;µs small fences. <span style="color:var(--amber);font-weight:500">Dashed amber outline</span> = AR kernels. B200's sub-1&nbsp;µs gaps are a CUPTI vs roctracer profiler-accounting artifact (see decomposition card below) and are not visualized.</p>
       </div>
       <span class="timeline-axis-label">µs →</span>
     </div>
@@ -514,10 +514,10 @@
       <g id="row-baseline" transform="translate(150, 50)">
         <!-- baseline kernels -->
       </g>
-      <text x="20" y="50" class="row-label" style="fill:var(--green);">MI355X · single-stream</text>
-      <text x="20" y="65" class="row-sub">SGLang PR #21511</text>
-      <text x="20" y="79" class="row-sub">1 stream (phys 8) · 287 µs</text>
-      <text x="20" y="95" class="row-sub" style="fill:var(--green); font-weight:500;">★ 0 µs bubble · saturated</text>
+      <text x="20" y="44" class="row-label" style="fill:var(--green);">MI355X · single-stream</text>
+      <text x="20" y="62" class="row-sub">SGLang PR #21511</text>
+      <text x="20" y="76" class="row-sub">1 stream (phys 8) · 287 µs</text>
+      <text x="20" y="93" class="row-sub" style="fill:var(--green); font-weight:500;">★ 0 µs bubble · saturated</text>
 
       <!-- divider -->
       <line x1="20" y1="120" x2="1290" y2="120" stroke="var(--rule)" stroke-width="1" stroke-dasharray="4 4"/>
@@ -529,10 +529,10 @@
       <g id="row-dual-alt" transform="translate(150, 195)">
         <!-- dual alt stream -->
       </g>
-      <text x="20" y="145" class="row-label" style="fill:var(--rose-bright);">MI355X · dual-stream HIP</text>
+      <text x="20" y="139" class="row-label" style="fill:var(--rose-bright);">MI355X · dual-stream HIP</text>
       <text x="20" y="160" class="row-sub">cur (phys 113)</text>
-      <text x="20" y="200" class="row-sub">alt (phys 106)</text>
-      <text x="20" y="240" class="row-sub" style="fill:var(--rose-bright); font-weight:500;">★ 17.3 µs REAL stall · 312 µs</text>
+      <text x="20" y="210" class="row-sub">alt (phys 106)</text>
+      <text x="20" y="248" class="row-sub" style="fill:var(--rose-bright); font-weight:500;">★ 17.3 µs REAL stall · 312 µs</text>
 
       <!-- bubble overlay for MI355X dual — draws ON TOP -->
       <g id="row-dual-bubbles" transform="translate(150, 135)">
@@ -547,15 +547,15 @@
       <g id="row-b200-l1" transform="translate(150, 320)"></g>
       <g id="row-b200-l2" transform="translate(150, 345)"></g>
       <g id="row-b200-l3" transform="translate(150, 370)"></g>
-      <text x="20" y="295" class="row-label" style="fill:var(--azure);">B200 · CUDA-graph dual-stream</text>
+      <text x="20" y="289" class="row-label" style="fill:var(--azure);">B200 · CUDA-graph dual-stream</text>
       <text x="20" y="310" class="row-sub">lane 0 (tid 8251)</text>
       <text x="20" y="335" class="row-sub">lane 1 (tid 8253)</text>
       <text x="20" y="360" class="row-sub">lane 2 (tid 8254)</text>
       <text x="20" y="385" class="row-sub">lane 3 (tid 8255)</text>
-      <text x="20" y="408" class="row-sub" style="fill:var(--green); font-weight:500;">✓ 0 µs REAL stall</text>
-      <text x="20" y="423" class="row-sub" style="fill:var(--azure);">23.7 µs sub-1µs gaps =</text>
-      <text x="20" y="436" class="row-sub" style="fill:var(--azure);">CUPTI dispatch-latency artifact</text>
-      <text x="20" y="450" class="row-sub">303 µs · 4 lanes (pool)</text>
+      <text x="20" y="412" class="row-sub" style="fill:var(--green); font-weight:500;">✓ 0 µs REAL stall</text>
+      <text x="20" y="430" class="row-sub" style="fill:var(--azure);">23.7 µs sub-1µs gaps =</text>
+      <text x="20" y="444" class="row-sub" style="fill:var(--azure);">CUPTI artifact (hidden)</text>
+      <text x="20" y="461" class="row-sub">303 µs · 4 lanes (pool)</text>
 
       <!-- bubble overlay for B200 — should be visually subdued because all sub-1us -->
       <g id="row-b200-bubbles" transform="translate(150, 285)">
@@ -581,7 +581,6 @@
       <div class="item"><span class="swatch" style="background:#9aa3b0"></span>norm / quant / misc</div>
       <div class="item"><span class="swatch bubble"></span>≥2 µs real stall</div>
       <div class="item"><span class="swatch" style="background:rgba(245,166,35,0.3); background-image:repeating-linear-gradient(45deg, rgba(245,166,35,0.6) 0 2px, transparent 2px 5px)"></span>1–2 µs small fence</div>
-      <div class="item"><span class="swatch" style="background:rgba(121,192,255,0.15); border-color:#79c0ff;"></span>sub-1 µs CUPTI artifact (B200 only)</div>
     </div>
 
     <div class="bubble-detail">
@@ -3277,7 +3276,7 @@ function drawTimeline() {
   const b200BubbleG = svg.querySelector('#row-b200-bubbles');
   const b200TopY = 10;       // relative to row-b200-bubbles transform y=285
   const b200TotalH = (370 - 295) + B200_LANE_HEIGHT;  // 75 + 22 = 97 covers all 4 lanes
-  drawBubbles(b200BubbleG, B200.bubbles, b200TopY, b200TotalH, { showMicro: true });
+  drawBubbles(b200BubbleG, B200.bubbles, b200TopY, b200TotalH, { showMicro: false });
 }
 
 function showTtip(e) {
