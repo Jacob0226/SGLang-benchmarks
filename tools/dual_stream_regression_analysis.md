@@ -1,7 +1,9 @@
 # GLM-5-FP8 NSA Decode Dual-Stream Regression Analysis (MI355X / ROCm)
 
 **Date:** Apr 2026
-**Branch under test:** `jacob/glm5-multistream` (a6885fb1c) on top of PR #23562 + aiter PR #2879
+**Branches under test:**
+- `jacob/glm5-rocm-nsa-on-thomas` (c428a5dc3) — best-perf branch on top of PR #23562 + aiter PR #2879. Contains both cat-skip (default ON) and A_v4 dual-stream layout (opt-in via `SGLANG_ENABLE_HIP_DUAL_STREAM=1`). The dual-stream regression numbers in this doc were measured with the env var set.
+- `jacob/glm5-rocm-nsa-cat-skip` (8d4b57132) — upstream-bound PR branch, rebased onto `sgl-project/main`. Contains only the cat-skip optimization (no dual-stream code). Independent of Thomas's PR; ships the strict-improvement piece by itself.
 **TLDR:** A_v4 dual-stream layout (overlap NSA indexer with [q_b_proj + bmm w_kc + fused_qk_rope_cat]) **loses ~30 μs / layer** on MI355X due to HBM bandwidth contention and a HIP-graph-specific AllReduce slowdown. Single-stream + cat-skip optimization wins.
 
 ---
@@ -200,7 +202,7 @@ Bench TPOT regression: 24.45 − 21.21 = 3.24 ms / token = **+50.6 μs / layer**
 ## What does win on MI355X
 
 ```
-Branch: a6885fb1c (jacob/glm5-multistream)
+Branch: c428a5dc3 (jacob/glm5-rocm-nsa-on-thomas)
   + sed patch removing _is_hip from alt_stream gate at deepseek_v2.py:1925
         ↓
   alt_stream = None on ROCm
