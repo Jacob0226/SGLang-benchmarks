@@ -6,6 +6,7 @@
 # ./GLM.sh --dual-stream-rocm        # disable shared-experts-fusion for dual stream on ROCm
 # ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-5-FP8
 # ./GLM.sh --prof --dual-stream-rocm --tag DualStream
+# ./GLM.sh --docker rocm/sgl-dev:v0.5.10rc0-rocm720-mi35x-20260412   # tag results dir with docker image
 set -euo pipefail
 set -x
 ulimit -n 65535
@@ -18,6 +19,11 @@ DUAL_STREAM_ROCM="false"
 MTP_TAG=""
 USER_TAG=""
 MODEL_PATH="/data/huggingface/hub/zai-org/GLM-5-FP8"
+# DOCKER labels the results directory so different docker images don't clobber
+# each other. Override with --docker <image>. Known-good images:
+#   rocm/sgl-dev:v0.5.10rc0-rocm720-mi35x-20260412   # MI355
+#   lmsysorg/sglang:v0.5.9-cu130-runtime              # B200
+DOCKER="untagged-docker"
 CURRENT_DIR=$(pwd)
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -45,6 +51,10 @@ while [[ $# -gt 0 ]]; do
         ;;
     --tag)
         USER_TAG="-$2"
+        shift 2
+        ;;
+    --docker)
+        DOCKER="$2"
         shift 2
         ;;
     *)
@@ -77,8 +87,6 @@ else
 fi
 
 # ===================== Argument  =====================
-DOCKER="rocm/sgl-dev:v0.5.10rc0-rocm720-mi35x-20260412" # MI355
-# DOCKER="lmsysorg/sglang:v0.5.9-cu130-runtime" # B200
 SPECIAL_TAG="-bench"
 if [ "$PROF_ENABLED" == "true" ]; then
     SPECIAL_TAG="-prof"
