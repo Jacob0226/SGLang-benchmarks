@@ -2,9 +2,9 @@
 
 **Date:** Apr 2026
 **Branches under test:**
-- `jacob/glm5-rocm-nsa-on-thomas` (c428a5dc3) — best-perf branch on top of PR #23562 + aiter PR #2879. Contains both cat-skip (default ON) and A_v4 dual-stream layout (opt-in via `SGLANG_ENABLE_HIP_DUAL_STREAM=1`). The dual-stream regression numbers in this doc were measured with the env var set.
+- `jacob/glm5-rocm-nsa-on-thomas` (c428a5dc3) — best-perf branch on top of PR #23562 + aiter PR #2879. Contains both cat-skip (default ON) and dual-stream layout (opt-in via `SGLANG_ENABLE_HIP_DUAL_STREAM=1`). The dual-stream regression numbers in this doc were measured with the env var set.
 - `jacob/glm5-rocm-nsa-cat-skip` (8d4b57132) — upstream-bound PR branch, rebased onto `sgl-project/main`. Contains only the cat-skip optimization (no dual-stream code). Independent of Thomas's PR; ships the strict-improvement piece by itself.
-**TLDR:** A_v4 dual-stream layout (overlap NSA indexer with [q_b_proj + bmm w_kc + fused_qk_rope_cat]) **loses ~30 μs / layer** on MI355X due to HBM bandwidth contention and a HIP-graph-specific AllReduce slowdown. Single-stream + cat-skip optimization wins.
+**TLDR:** Dual-stream layout (overlap NSA indexer with [q_b_proj + bmm w_kc + fused_qk_rope_cat]) **loses ~30 μs / layer** on MI355X due to HBM bandwidth contention and a HIP-graph-specific AllReduce slowdown. Single-stream + cat-skip optimization wins.
 
 ---
 
@@ -12,32 +12,32 @@
 
 | Variant | Median TPOT | Δ vs Thomas |
 |---|---|---|
-| Thomas (PR #23562 only, no `--dual-stream-rocm`) | **21.21 ms** | baseline |
-| Mine + `--dual-stream-rocm` (A_v4 + dual-stream MoE, fused shared expert disabled) | 24.45 ms | **+15.3% (regression)** |
-| **Mine + nostream patch (A_v4 disabled, fused shared expert enabled, cat-skip kept)** | **20.48 ms** | **−3.4% (faster than Thomas)** |
+| Thomas (PR #23562 only) | **21.21 ms** | baseline |
+| Dual stream | 24.45 ms | **+15.3% (regression)** |
+| **Single stream + cat-skip** | **20.48 ms** | **−3.4% (faster than Thomas)** |
 
-The third row is the optimization we want to land. The dual-stream A_v4 layout is *available* (env var) but **not enabled by default** because it currently regresses on MI355X.
+The third row is the optimization we want to land. The dual-stream layout is *available* (env var) but **not enabled by default** because it currently regresses on MI355X.
 
 ---
 
 ## Per-Kernel Comparison (avg over 10 layers)
 
-| bucket | Thomas | Mine + dual-stream | Mine + nostream |
+| bucket | Thomas | Dual stream | Single stream + cat-skip |
 |---|---|---|---|
-| total layer dur | 143.7 μs * | 321.6 μs † | 140.4 μs * |
-| AllReduce (1 of 2 per layer) | 9.78 μs | **36.06 μs** ‡ | 9.51 μs |
+| total layer dur (real) | ~285 μs * | 321.6 μs | ~281 μs * |
+| AllReduce (1 of 2 per layer) | 9.78 μs | **36.06 μs** † | 9.51 μs |
 | indexer chain (sum of 10 kernels) | 59.8 μs | 68.0 μs | 59.8 μs |
 | CatArrayBatchedCopy (`concat_mla_absorb_q_general` fallback) | 2.6 μs | 0 μs | 0 μs |
-| `_fused_append_shared_experts_kernel` | 2.13 μs | 0 μs ‖ | 2.15 μs |
-| shared expert chain (gate_up + silu + down, unfused) | 0 μs ‖ | 47.9 μs | 0 μs ‖ |
+| `_fused_append_shared_experts_kernel` | 2.13 μs | 0 μs ‡ | 2.15 μs |
+| shared expert chain (gate_up + silu + down, unfused) | 0 μs ‡ | 47.9 μs | 0 μs ‡ |
 
-\* Thomas and Mine+nostream both have `fused_rms_fp8_group_quant` firing **twice per layer** (once for input layernorm, once for q_a/kv_a layernorm fused on the alt-stream-None ELSE branch). My script picks up both, giving alternating 25 / 260 μs "layer durs", so reported 143.7 μs is half-layer avg → real layer ≈ 285 μs.
+So real-layer regression of dual stream is `321.6 − 285 ≈ +37 μs/layer` (~13%), consistent with the observed +15.3% TPOT regression once you add the dual-stream-graph CPU overhead.
 
-† Mine + dual-stream fires `fused_rms_fp8_group_quant` only once per layer (because qk-norm fork takes the IF branch using separate `add_rmsnorm_quant` for q_a + kv_a), so real layer = 321.6 μs.
+\* Thomas and the single-stream variant both fire `fused_rms_fp8_group_quant` **twice per layer** (once for input layernorm, once for q_a/kv_a layernorm fused on the alt-stream-None ELSE branch). My layer-boundary script triggers on each firing, so it reports alternating 25 / 260 μs "layers" — the values shown are 2× the half-layer median (real per-layer duration). Dual stream takes the IF branch (separate `add_rmsnorm_quant` for q_a + kv_a) and fires `fused_rms_fp8_group_quant` only once per layer, so its 321.6 μs is the direct measurement.
 
-‡ Same `aiter::cross_device_reduce_1stage<bf16, 8>` kernel — yet **2.3× slower** under dual-stream HIP-graph capture. See "AllReduce slowdown" below.
+† Same `aiter::cross_device_reduce_1stage<bf16, 8>` kernel — yet much slower under dual-stream HIP-graph capture. See "AllReduce slowdown" below.
 
-‖ Determined by the `--disable-shared-experts-fusion` flag, which is implied by GLM.sh's `--dual-stream-rocm`. Without that flag, aiter uses the fused shared expert kernel (~4μs vs ~48μs unfused).
+‡ Determined by the `--disable-shared-experts-fusion` flag, which is implied by GLM.sh's `--dual-stream-rocm`. Without that flag, aiter uses the fused shared expert kernel (~4 μs vs ~48 μs unfused).
 
 ---
 
@@ -77,11 +77,10 @@ for GLM-5 decode: weights are multi-GB and don't fit in the 256 MB Infinity
 Cache regardless of single/dual-stream. KV cache + activations are GB-scale
 too. The cache mostly handles small intermediates, which fit either way.
 
-**What we actually measured** (on stream 113/106 alt-side vs Thomas single-
-stream phys 8):
+**What we actually measured** (cur+alt running concurrently on stream 113/106 vs Thomas's single-stream phys 8):
 
 ```
-                    Thomas (single)  Mine alt-side  Δ
+                    Thomas (single)  Dual stream    Δ
 indexer_layernorm      4.7 μs           5.8 μs    +1.1
 hadamard               4.2              4.6      +0.4
 hadamard               4.1              4.9      +0.8
@@ -94,28 +93,7 @@ topk_transform        15.2             17.6      +2.4
                                        +8.2 μs total
 ```
 
-GEMMs (q_b_proj, wq_b, wk) are basically unchanged. Memory-bound indexer
-kernels each pay 0.5-2.4 μs. The slowdown pattern is *consistent with* HBM
-contention but could also be e.g. memory-controller queue depth or HBM
-channel-bank conflicts. Verification needs hardware counters.
-
-Per-kernel measurements (cur+alt running concurrently vs cur alone):
-
-```
-                    Thomas (single)  Mine alt-side  Δ
-indexer_layernorm      4.7 μs           5.8 μs    +1.1
-hadamard               4.2              4.6      +0.4
-hadamard               4.1              4.9      +0.8
-act_quant              4.7              6.0      +1.3
-indexer_k_quant        4.4              4.6      +0.2
-wv_splitk (NSA score)  5.4              6.0      +0.6
-paged_mqa              4.1              4.9      +0.8
-topk_transform        15.2             17.6      +2.4
-                                  ───────────
-                                       +8.2 μs total
-```
-
-GEMM kernels (q_b_proj, wq_b, wk) are compute-bound and basically don't slow down (+0~0.1 μs). Only memory-bound kernels suffer.
+GEMMs (q_b_proj, wq_b, wk) are compute-bound and basically don't slow down (+0~0.1 μs); only memory-bound indexer kernels each pay 0.5-2.4 μs. The slowdown pattern is *consistent with* HBM contention but could also be e.g. memory-controller queue depth or HBM channel-bank conflicts. Verification needs hardware counters.
 
 ### 2. Infinity Cache thrashing (LIKELY NOT the cause, retracted)
 
@@ -155,7 +133,7 @@ Honestly, **this needs `rocprof-v3` HW counters to attribute properly**.
 - Single-stream HIP graph: AR ≈ 9.5 μs
 - Dual-stream HIP graph:  AR ≈ 23 μs
 - → **2.4× duration difference is real**, and disappears when alt_stream is
-  set to None (i.e., MyBranch_NoDualStream test variant).
+  set to None (i.e., the single stream + cat-skip variant).
 
 **What was NOT verified, just hypothesized**:
 
@@ -184,7 +162,7 @@ that disappears when dual-stream is off.
 
 ---
 
-## Total accounting (Mine dual-stream vs Thomas)
+## Total accounting (Dual stream vs Thomas)
 
 | source | μs / layer |
 |---|---|
@@ -192,10 +170,10 @@ that disappears when dual-stream is off.
 | Indexer kernels memory-bound contention | +8 |
 | Other small kernels (main_kernel, bmm_w_vc, …) compute split | +5 |
 | Layer structure (extra `add_rmsnorm_quant` for split q_a/kv_a vs fused) | ~0 (offset by saved fused_rms call) |
-| Theoretical A_v4 saving (gap-fill overlap with indexer) | −10 |
+| Theoretical dual-stream saving (gap-fill overlap with indexer) | −10 |
 | **Net regression** | **+29** |
 
-Bench TPOT regression: 24.45 − 21.21 = 3.24 ms / token = **+50.6 μs / layer** at TPOT level. 29 μs at GPU level + ~20 μs CPU/scheduler overhead under dual-stream graph (extra event records, larger graph, etc.) explains the gap.
+Bench TPOT regression: 24.45 − 21.21 = 3.24 ms / token = **+50.6 μs / layer** at TPOT level. 29 μs at GPU level + ~20 μs CPU/scheduler overhead under dual-stream graph (extra event records, larger graph, etc.) explains the gap. This is also broadly consistent with the real-layer comparison in the per-kernel table above (~+37 μs/layer measured directly).
 
 ---
 
@@ -235,9 +213,9 @@ Replace the current single squashed commit with a smaller commit that:
 
 - Keeps the cat-skip optimization on by default (HIP-only).
 - Restores the `_is_hip` alt_stream gate **only when an env var `SGLANG_ENABLE_HIP_DUAL_STREAM` is set** — default OFF.
-- Keeps the A_v4 dual-stream layout code in `forward_absorb_prepare` (preserved for future use, maybe a future ROCm release fixes the AR slowdown).
+- Keeps the dual-stream layout code in `forward_absorb_prepare` (preserved for future use, maybe a future ROCm release fixes the AR slowdown).
 
-Default behavior on ROCm: single-stream + cat-skip → matches `MyBranch_NoDualStream` test. Wins by 0.73 ms TPOT vs Thomas.
+Default behavior on ROCm: single stream + cat-skip → matches the winning variant in the bench table above. Wins by 0.73 ms TPOT vs Thomas.
 
 To experiment with dual-stream: `SGLANG_ENABLE_HIP_DUAL_STREAM=1 ./GLM.sh --dual-stream-rocm ...`
 
@@ -249,7 +227,7 @@ The claims in §1, §3, §4-mechanism above are *hypotheses* consistent with the
 observed kernel slowdowns but **not** verified with hardware counters or
 source inspection. Concrete next steps:
 
-1. **rocprof-v3 hardware counters** on MyBranch_NoDualStream vs DualStream0428_v2
+1. **rocprof-v3 hardware counters** on the single stream + cat-skip variant vs the dual stream variant
    for one decode step:
    - HBM bytes / cycle per kernel (verifies §1)
    - CU active rate / wavefront occupancy per kernel (verifies §3)
