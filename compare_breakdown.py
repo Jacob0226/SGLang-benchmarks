@@ -286,6 +286,13 @@ def build_comparison(rows_a, rows_b, label_a, label_b):
                 if src[0].get("LayerCount"):
                     layer_count = src[0]["LayerCount"]
                 break
+        # Coerce LayerCount to int so the data cell stores a number, allowing
+        # the Summary's `=D<row>` reference to participate in arithmetic.
+        if layer_count:
+            try:
+                layer_count = int(layer_count)
+            except (ValueError, TypeError):
+                pass
 
         # Detect section change → close previous section
         if parent != cur_section:
@@ -400,7 +407,6 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
     # --- Write subtotal formulas ---
     ca = get_column_letter(COL_A_US)
     cb = get_column_letter(COL_B_US)
-    subtotal_rows = {}  # section_name -> excel_row (for summary references)
 
     for meta in section_meta:
         xl_row = meta["subtotal_idx"] + 2  # +2: 1-indexed + header
@@ -426,8 +432,6 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
         cell_r.font = arial_bold
         cell_r.fill = sfill
         cell_r.number_format = "0%"
-
-        subtotal_rows[meta["section"]] = xl_row
 
     # --- Summary table ---
     summary_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC",
@@ -495,16 +499,21 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
     # Summary data rows
     data_first = r
     for meta in section_meta:
-        st_row = subtotal_rows.get(meta["section"], 0)
-        layer_count = meta["layer_count"]
-        try:
-            n_layers = int(layer_count)
-        except (ValueError, TypeError):
-            n_layers = 1
+        # Reference the source rows in the data table above instead of writing
+        # values directly, so edits to the table propagate to the summary.
+        # NOTE: use this meta's own subtotal_idx (not a section-name-keyed
+        # dict) since the same Section name can appear under multiple
+        # LayerType groups (e.g. prepare_attn shows up for both Layer A and B)
+        # and a flat dict would let the second occurrence overwrite the first.
+        st_row = meta["subtotal_idx"] + 2
+        data_start_xl = meta["data_start"] + 2
 
-        ws.cell(row=r, column=1, value=meta["layer_type"]).font = arial
-        ws.cell(row=r, column=2, value=meta["section"]).font = arial
-        ws.cell(row=r, column=4, value=n_layers).font = arial
+        ws.cell(row=r, column=1,
+                value=f"=A{data_start_xl}").font = arial
+        ws.cell(row=r, column=2,
+                value=f"=B{data_start_xl}").font = arial
+        ws.cell(row=r, column=4,
+                value=f"=D{data_start_xl}").font = arial
 
         ws.cell(row=r, column=6,
                 value=f"={ca}{st_row}").font = arial
