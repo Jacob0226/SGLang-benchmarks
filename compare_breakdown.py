@@ -234,13 +234,13 @@ def build_comparison(rows_a, rows_b, label_a, label_b):
             for r in srows:
                 output_rows.append(
                     ["", skey[0], skey[1], "", "",
-                     r.get("KernelName", ""), r.get("GraphON_AvgDuration_us", ""),
+                     r.get("KernelName", ""), r.get("AvgDuration_us", ""),
                      "", "", r.get("CallSite", ""), ""])
         for skey, srows in self_b.get(idx_b, []):
             for r in srows:
                 output_rows.append(
                     ["", skey[0], skey[1], "", "",
-                     "", "", r.get("GraphON_AvgDuration_us", ""),
+                     "", "", r.get("AvgDuration_us", ""),
                      r.get("KernelName", ""), "", r.get("CallSite", "")])
 
     def _close_section():
@@ -306,8 +306,8 @@ def build_comparison(rows_a, rows_b, label_a, label_b):
                 layer_count if i == 0 else "",
                 str(i),
                 ra.get("KernelName", ""),
-                ra.get("GraphON_AvgDuration_us", ""),
-                rb.get("GraphON_AvgDuration_us", ""),
+                ra.get("AvgDuration_us", ""),
+                rb.get("AvgDuration_us", ""),
                 rb.get("KernelName", ""),
                 ra.get("CallSite", ""),
                 rb.get("CallSite", ""),
