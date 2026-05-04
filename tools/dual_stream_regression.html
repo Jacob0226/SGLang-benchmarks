@@ -59,7 +59,7 @@
     mix-blend-mode: overlay;
     z-index: 0;
   }
-  main { position: relative; z-index: 1; max-width: 1320px; margin: 0 auto; padding: 56px 32px 96px; }
+  main { position: relative; z-index: 1; max-width: 1700px; margin: 0 auto; padding: 56px 24px 96px; }
 
   /* meta strip */
   .meta-strip {
@@ -407,7 +407,7 @@
     <div class="meta-cell"><b>Model</b><code>GLM-5.1-FP8 TP=8 fp8 KV</code></div>
     <div class="meta-cell"><b>Workload</b><code>8k1k cc4</code></div>
   </div>
-  <div style="font-family: var(--display); font-size: 13px; color: var(--rose-bright); font-weight: 600; letter-spacing: 0.04em;">Apr 2026</div>
+  <div style="font-family: var(--display); font-size: 13px; color: var(--rose-bright); font-weight: 600; letter-spacing: 0.04em;">Apr 2026 · <span style="color:var(--gold);">Updated May 2026 (ROCm 7.13)</span></div>
 </header>
 
 <!-- hero -->
@@ -477,8 +477,8 @@
   <div class="timeline-wrap">
     <div class="timeline-head">
       <div>
-        <h3>Three traces, one full layer-pass each, same time scale.</h3>
-        <p>Top: MI355X single-stream. Middle: MI355X dual-stream HIP. Bottom: B200 dual-stream CUDA-graph (4 lanes from the stream pool). Hover any kernel for full name + duration. <span style="color:var(--rose-bright);font-weight:500">Red bands</span> = ≥2&nbsp;µs <em>real CPU stall</em> — only on MI355X dual-stream. <span style="color:var(--amber);font-weight:500">Amber bands</span> = 1–2&nbsp;µs small fences. <span style="color:var(--amber);font-weight:500">Dashed amber outline</span> = AR kernels. B200's sub-1&nbsp;µs gaps are a CUPTI vs roctracer profiler-accounting artifact (see decomposition card below) and are not visualized.</p>
+        <h3>Four traces, one full layer-pass each, same time scale.</h3>
+        <p>Row 1: MI355X single-stream (baseline). Row 2: MI355X dual-stream HIP on ROCm 7.2 (2 streams: cur + alt). Row 3: B200 dual-stream CUDA-graph (4 lanes from the stream pool). Row 4: <b style="color:var(--gold)">NEW</b> — MI355X dual-stream HIP on <b>ROCm 7.13 (TheRock pip)</b> with 4 active streams. Hover any kernel for full name + duration. <span style="color:var(--rose-bright);font-weight:500">Red bands</span> = ≥2&nbsp;µs <em>real CPU stall</em> — present on MI355X dual-stream rows, absent on B200 / single-stream. <span style="color:var(--amber);font-weight:500">Amber bands</span> = 1–2&nbsp;µs small fences. <span style="color:var(--amber);font-weight:500">Dashed amber outline</span> = AR kernels. B200's sub-1&nbsp;µs gaps are a CUPTI vs roctracer profiler-accounting artifact (see decomposition card below) and are not visualized.</p>
       </div>
       <span class="timeline-axis-label">µs →</span>
     </div>
@@ -492,7 +492,7 @@
       <span class="hint">↔ scroll horizontally when zoomed in</span>
     </div>
 
-    <svg id="timeline" viewBox="0 0 1450 540" xmlns="http://www.w3.org/2000/svg" style="width:100%; height:auto;">
+    <svg id="timeline" viewBox="0 0 1600 840" xmlns="http://www.w3.org/2000/svg" style="width:100%; height:auto;">
       <defs>
         <pattern id="bubble-stripes" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
           <line x1="0" y1="0" x2="0" y2="6" stroke="rgba(0,0,0,0.4)" stroke-width="2.5"/>
@@ -504,70 +504,93 @@
 
       <!-- axis at top -->
       <g transform="translate(150, 18)">
-        <line x1="0" y1="14" x2="1280" y2="14" class="axis-tick"/>
+        <line x1="0" y1="14" x2="1480" y2="14" class="axis-tick"/>
         <g class="axis-label">
           <!-- generated below in JS -->
         </g>
       </g>
 
       <!-- ROW 1: MI355X baseline (1 stream) -->
-      <g id="row-baseline" transform="translate(150, 50)">
+      <g id="row-baseline" transform="translate(150, 60)">
         <!-- baseline kernels -->
       </g>
-      <text x="20" y="44" class="row-label" style="fill:var(--green);">MI355X · single-stream</text>
-      <text x="20" y="62" class="row-sub">SGLang PR #21511</text>
-      <text x="20" y="76" class="row-sub">1 stream (phys 8) · 287 µs</text>
-      <text x="20" y="93" class="row-sub" style="fill:var(--green); font-weight:500;">★ 0 µs bubble · saturated</text>
+      <text x="20" y="44" class="row-label" style="fill:var(--green);"><tspan style="font-weight:800;font-size:15px;">1</tspan>  ·  MI355X · single-stream</text>
+      <text x="20" y="72" class="row-sub">SGLang PR #21511</text>
+      <text x="20" y="86" class="row-sub">1 stream (phys 8) · 287 µs</text>
+      <text x="20" y="103" class="row-sub" style="fill:var(--green); font-weight:500;">★ 0 µs bubble · saturated</text>
 
       <!-- divider -->
-      <line x1="20" y1="120" x2="1290" y2="120" stroke="var(--rule)" stroke-width="1" stroke-dasharray="4 4"/>
+      <line x1="20" y1="130" x2="1290" y2="130" stroke="var(--rule)" stroke-width="1" stroke-dasharray="4 4"/>
 
       <!-- ROW 2: MI355X dual stream (2 streams) -->
-      <g id="row-dual-cur" transform="translate(150, 145)">
+      <g id="row-dual-cur" transform="translate(150, 190)">
         <!-- dual cur stream -->
       </g>
-      <g id="row-dual-alt" transform="translate(150, 195)">
+      <g id="row-dual-alt" transform="translate(150, 240)">
         <!-- dual alt stream -->
       </g>
-      <text x="20" y="139" class="row-label" style="fill:var(--rose-bright);">MI355X · dual-stream HIP</text>
-      <text x="20" y="160" class="row-sub">cur (phys 113)</text>
-      <text x="20" y="210" class="row-sub">alt (phys 106)</text>
-      <text x="20" y="248" class="row-sub" style="fill:var(--rose-bright); font-weight:500;">★ 17.3 µs REAL stall · 312 µs</text>
+      <text x="20" y="174" class="row-label" style="fill:var(--rose-bright);"><tspan style="font-weight:800;font-size:15px;">2</tspan>  ·  MI355X · dual-stream HIP</text>
+      <text x="20" y="205" class="row-sub">cur (phys 113)</text>
+      <text x="20" y="255" class="row-sub">alt (phys 106)</text>
+      <text x="20" y="293" class="row-sub" style="fill:var(--rose-bright); font-weight:500;">★ 17.3 µs REAL stall · 312 µs</text>
 
       <!-- bubble overlay for MI355X dual — draws ON TOP -->
-      <g id="row-dual-bubbles" transform="translate(150, 135)">
+      <g id="row-dual-bubbles" transform="translate(150, 180)">
         <!-- bubbles span both dual streams -->
       </g>
 
       <!-- divider -->
-      <line x1="20" y1="270" x2="1290" y2="270" stroke="var(--rule)" stroke-width="1" stroke-dasharray="4 4"/>
+      <line x1="20" y1="315" x2="1290" y2="315" stroke="var(--rule)" stroke-width="1" stroke-dasharray="4 4"/>
 
       <!-- ROW 3: B200 (4 lanes from CUDA-graph stream pool) -->
-      <g id="row-b200-l0" transform="translate(150, 295)"></g>
-      <g id="row-b200-l1" transform="translate(150, 320)"></g>
-      <g id="row-b200-l2" transform="translate(150, 345)"></g>
-      <g id="row-b200-l3" transform="translate(150, 370)"></g>
-      <text x="20" y="289" class="row-label" style="fill:var(--azure);">B200 · CUDA-graph dual-stream</text>
-      <text x="20" y="310" class="row-sub">lane 0 (tid 8251)</text>
-      <text x="20" y="335" class="row-sub">lane 1 (tid 8253)</text>
-      <text x="20" y="360" class="row-sub">lane 2 (tid 8254)</text>
-      <text x="20" y="385" class="row-sub">lane 3 (tid 8255)</text>
-      <text x="20" y="412" class="row-sub" style="fill:var(--green); font-weight:500;">✓ 0 µs REAL stall</text>
-      <text x="20" y="430" class="row-sub" style="fill:var(--azure);">23.7 µs sub-1µs gaps =</text>
-      <text x="20" y="444" class="row-sub" style="fill:var(--azure);">CUPTI artifact (hidden)</text>
-      <text x="20" y="461" class="row-sub">303 µs · 4 lanes (pool)</text>
+      <g id="row-b200-l0" transform="translate(150, 365)"></g>
+      <g id="row-b200-l1" transform="translate(150, 390)"></g>
+      <g id="row-b200-l2" transform="translate(150, 415)"></g>
+      <g id="row-b200-l3" transform="translate(150, 440)"></g>
+      <text x="20" y="349" class="row-label" style="fill:var(--azure);"><tspan style="font-weight:800;font-size:15px;">3</tspan>  ·  B200 · CUDA-graph dual-stream</text>
+      <text x="20" y="380" class="row-sub">lane 0 (tid 8251)</text>
+      <text x="20" y="405" class="row-sub">lane 1 (tid 8253)</text>
+      <text x="20" y="430" class="row-sub">lane 2 (tid 8254)</text>
+      <text x="20" y="455" class="row-sub">lane 3 (tid 8255)</text>
+      <text x="20" y="482" class="row-sub" style="fill:var(--green); font-weight:500;">✓ 0 µs REAL stall</text>
+      <text x="20" y="500" class="row-sub" style="fill:var(--azure);">23.7 µs sub-1µs gaps =</text>
+      <text x="20" y="514" class="row-sub" style="fill:var(--azure);">CUPTI artifact (hidden)</text>
+      <text x="20" y="531" class="row-sub">303 µs · 4 lanes (pool)</text>
 
       <!-- bubble overlay for B200 — should be visually subdued because all sub-1us -->
-      <g id="row-b200-bubbles" transform="translate(150, 285)">
+      <g id="row-b200-bubbles" transform="translate(150, 355)">
         <!-- bubbles span all 4 b200 lanes -->
       </g>
 
-      <!-- bottom marker: 320 µs reference -->
-      <line x1="150" y1="475" x2="1430" y2="475" stroke="var(--rule)" stroke-width="0.5"/>
-      <text x="200" y="495" class="row-sub" style="font-size:11px;">Layer wall (µs):  </text>
-      <text x="298" y="495" class="row-sub" style="font-size:11px; fill:var(--green);">287 (baseline)</text>
-      <text x="430" y="495" class="row-sub" style="font-size:11px; fill:var(--rose-bright);">312 (MI355X dual; +25 µs at this layer-pass)</text>
-      <text x="800" y="495" class="row-sub" style="font-size:11px; fill:var(--azure);">303 (B200; clean dual-stream — 0 real stalls)</text>
+      <!-- divider before R713 -->
+      <line x1="20" y1="545" x2="1290" y2="545" stroke="var(--rule)" stroke-width="1" stroke-dasharray="4 4"/>
+
+      <!-- ROW 4: MI355X dual stream + ROCm 7.13 (4 streams) -->
+      <g id="row-r713-l0" transform="translate(150, 595)"></g>
+      <g id="row-r713-l1" transform="translate(150, 620)"></g>
+      <g id="row-r713-l2" transform="translate(150, 645)"></g>
+      <g id="row-r713-l3" transform="translate(150, 670)"></g>
+      <text x="20" y="579" class="row-label" style="fill:var(--gold);"><tspan style="font-weight:800;font-size:15px;">4</tspan>  ·  MI355X · dual-stream HIP · ROCm 7.13 (TheRock)</text>
+      <text x="20" y="610" class="row-sub">lane 0 (cur)</text>
+      <text x="20" y="635" class="row-sub">lane 1 (alt-A)</text>
+      <text x="20" y="660" class="row-sub">lane 2 (alt-B)</text>
+      <text x="20" y="685" class="row-sub">lane 3 (alt-C)</text>
+      <text x="20" y="712" class="row-sub" style="fill:var(--rose-bright); font-weight:500;">★ 16.3 µs REAL stall · 337 µs</text>
+      <text x="20" y="730" class="row-sub" style="fill:var(--text-soft);">torch 2.11+rocm7.13;</text>
+      <text x="20" y="744" class="row-sub" style="fill:var(--text-soft);">aiter rebuilt, no tuned cfg</text>
+
+      <!-- bubble overlay for R713 -->
+      <g id="row-r713-bubbles" transform="translate(150, 585)">
+        <!-- bubbles span all 4 R713 lanes -->
+      </g>
+
+      <!-- bottom marker -->
+      <line x1="150" y1="780" x2="1580" y2="780" stroke="var(--rule)" stroke-width="0.5"/>
+      <text x="200" y="800" class="row-sub" style="font-size:11px;">Layer wall (µs):  </text>
+      <text x="298" y="800" class="row-sub" style="font-size:11px; fill:var(--green);">287 (baseline)</text>
+      <text x="430" y="800" class="row-sub" style="font-size:11px; fill:var(--rose-bright);">312 (MI355X dual rocm7.2)</text>
+      <text x="700" y="800" class="row-sub" style="font-size:11px; fill:var(--azure);">303 (B200 clean)</text>
+      <text x="900" y="800" class="row-sub" style="font-size:11px; fill:var(--gold);">337 (MI355X dual rocm7.13 +4lane; +25 µs vs rocm7.2 dual)</text>
     </svg>
 
     <div class="legend">
@@ -584,16 +607,26 @@
     </div>
 
     <div class="bubble-detail">
-      <h4>Bubble decomposition by gap size — same trace, three views</h4>
+      <h4>Bubble decomposition by gap size — same trace, four views</h4>
       <p>The signal is the right-most column (<b class="red">≥ 2 µs real stall</b>). Sub-1 µs gaps look platform-different but it's a profiler-accounting artifact (see caveat below); ignore them. <b>Real stalls are what regress dual-stream</b>.</p>
       <table class="bubble-table">
         <thead><tr><th>trace</th><th>layer wall</th><th>total bubble</th><th>sub-1 µs (see caveat)</th><th>1–2 µs (small fence)</th><th class="red">≥2 µs (REAL stall) ★</th><th>verdict</th></tr></thead>
         <tbody>
           <tr><td>MI355X · single-stream</td><td>271 µs</td><td style="color:var(--green)">0 µs</td><td>0 µs</td><td>0 µs</td><td style="color:var(--green)"><b>0 µs</b></td><td style="color:var(--green)">clean</td></tr>
-          <tr><td>MI355X · dual-stream HIP</td><td>320 µs</td><td class="red">18.2 µs</td><td>~0 µs</td><td>1.7 µs (1 fence)</td><td class="red"><b>16.5 µs (3 stalls)</b></td><td class="red">real HIP-runtime overhead</td></tr>
+          <tr><td>MI355X · dual-stream HIP (ROCm 7.2, 2 streams)</td><td>320 µs</td><td class="red">18.2 µs</td><td>~0 µs</td><td>1.7 µs (1 fence)</td><td class="red"><b>16.5 µs (3 stalls)</b></td><td class="red">real HIP-runtime overhead</td></tr>
           <tr><td>B200 · CUDA-graph dual-stream</td><td>303 µs</td><td>23.4 µs</td><td>23.4 µs (65 gaps)</td><td>0 µs</td><td style="color:var(--green)"><b>0 µs</b></td><td style="color:var(--green)">clean</td></tr>
+          <tr style="background: rgba(245,166,35,0.06);"><td><b style="color:var(--gold)">MI355X · dual-stream + ROCm 7.13 (TheRock, 4 streams)</b></td><td><b style="color:var(--rose-bright)">337 µs</b> (this layer) / <b>366 µs</b> (median over 391)</td><td>18.2 µs</td><td>~0 µs</td><td>1.9 µs</td><td class="red"><b>16.3 µs (3 stalls)</b></td><td class="red"><b>bubble unchanged but kernels +30 µs slower</b></td></tr>
         </tbody>
       </table>
+
+      <p style="margin-top: 12px; padding: 10px 12px; background: rgba(245,166,35,0.08); border-left: 3px solid var(--gold); border-radius: 2px; font-size: 12px;">
+        <b style="color:var(--gold)">★ ROCm 7.13 + 4-stream: bubble unchanged, but kernels are slower</b><br>
+        Surprising finding from the trace below: <b>real-stall bubble is ~the same as ROCm 7.2 dual (16.3 vs 16.5 µs / layer)</b> — the HIP-graph fence overhead did not get worse with more streams. The +25–54 µs / layer regression comes from <b>kernels themselves running slower</b>:<br>
+        • <b>AR per call:</b> baseline 10.3 → ROCm 7.2 dual 18.2 → ROCm 7.13 dual <b>22.3 µs</b> at this layer (median over the trace 25.7 µs). +4–7 µs / call × 2 calls = <b>+8–15 µs / layer</b>.<br>
+        • <b>Indexer chain:</b> 70 → <b>91 µs / layer</b> (+21 µs). Memory-bound kernels (Hadamard, act_quant, paged_mqa, topk) each pay 0.5–2 µs more vs ROCm 7.2 dual; HBM contention with 4 concurrent streams is worse than 2.<br>
+        • <b>GEMMs (q_b_proj, w_kc, ck_gemm):</b> aiter rebuilt with <code>PREBUILD_KERNELS=1</code> but no tuned configs (<code>/tmp/aiter_configs/*.csv</code> empty), so first-touch shapes hit "torch solution:0" / "skinny solution:2" defaults. <b>+9 µs in 9 GEMMs</b> mostly from this.<br>
+        Net: dual-stream regression went from <b>+49 → +66–95 µs / layer</b> with the ROCm 7.13 stack. The 4-stream layout doesn't make the layout worse per se; the new user-space stack just hasn't had its tuned configs and warm-up complete.
+      </p>
 
       <p style="margin-top: 14px;"><b style="color:var(--azure)">⚠ Sub-1 µs caveat — profiler accounting, not GPU behavior</b></p>
       <p style="margin-top: 6px;">The naive reading "B200 has 23 µs / layer of launch micro-gaps, MI355X has 0 — MI355X packs kernels tighter" <b>is wrong</b>. The sub-1 µs column is a CUPTI vs roctracer accounting difference, not a real GPU-utilization gap.</p>
@@ -3011,6 +3044,637 @@ const B200 = {
 };
 
 
+const DUAL_R713 = {
+ "layer_dur": 336.7626953125,
+ "stream_count": 4,
+ "rects": [
+  {
+   "tid": 165,
+   "start": 0.0009765625,
+   "dur": 4.799,
+   "end": 4.7998046875,
+   "name": "24add_rmsnorm_quant_kernelIDF16b",
+   "raw_name": "_ZN5aiter24add_rmsnorm_quant_kernelIDF16bDF16bLi256ELi24ELb1ELb0ELb1ELi1EEEvPT0_PT_PfS4_S4_S4_diiiiiiib",
+   "cat": "norm",
+   "lane": 0
+  },
+  {
+   "tid": 165,
+   "start": 4.80078125,
+   "dur": 5.359,
+   "end": 10.15966796875,
+   "name": "37dynamic_per_group_scaled_quant",
+   "raw_name": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32EEEvPT0_PfPKT_PKfiliibPKii",
+   "cat": "indexer",
+   "lane": 0
+  },
+  {
+   "tid": 165,
+   "start": 10.16064453125,
+   "dur": 29.36,
+   "end": 39.5205078125,
+   "name": "kernel_gemm_xdl_cshuffle_v3_mult",
+   "raw_name": "void ck::kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffle<ck::GridwiseGemmMultiD_blockscale_xdl_cshuffle_v3_b_preshuf",
+   "cat": "gemm",
+   "lane": 0
+  },
+  {
+   "tid": 157,
+   "start": 11.24072265625,
+   "dur": 8.159,
+   "end": 19.39990234375,
+   "name": "bf16gemm_fp32bf16_tn_32x64_split",
+   "raw_name": "aiter::bf16gemm_fp32bf16_tn_32x64_splitk_clean",
+   "cat": "misc",
+   "lane": 2
+  },
+  {
+   "tid": 157,
+   "start": 19.40087890625,
+   "dur": 7.199,
+   "end": 26.60009765625,
+   "name": "grouped_topk_kernel<>",
+   "raw_name": "void aiter::grouped_topk_kernel<c10::BFloat16, float __vector(4), 1, true, true, false>(c10::BFloat16*, c10::BFloat16 const*, fl",
+   "cat": "misc",
+   "lane": 2
+  },
+  {
+   "tid": 157,
+   "start": 26.60107421875,
+   "dur": 8.6,
+   "end": 35.201171875,
+   "name": "kentry<>",
+   "raw_name": "void ck_tile::kentry<2, ck_tile::MoeSortingKernel<ck_tile::MoeSortingProblemEx<int, float, 1, true, false, false, true, 0> >, ck",
+   "cat": "misc",
+   "lane": 2
+  },
+  {
+   "tid": 157,
+   "start": 35.20166015625,
+   "dur": 5.439,
+   "end": 40.640625,
+   "name": "37dynamic_per_group_scaled_quant",
+   "raw_name": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32EEEvPT0_PfPKT_PKfiliibPKii",
+   "cat": "indexer",
+   "lane": 2
+  },
+  {
+   "tid": 165,
+   "start": 39.52197265625,
+   "dur": 6.239,
+   "end": 45.7607421875,
+   "name": "_ZN7sgl_hip10activation18act_and",
+   "raw_name": "_ZN7sgl_hip10activation18act_and_mul_kernelI14__hip_bfloat16TnPFT_RKS3_EXadL_Z4siluIS2_ES3_S5_EEEEvPS3_PS4_i",
+   "cat": "silu",
+   "lane": 0
+  },
+  {
+   "tid": 165,
+   "start": 45.76171875,
+   "dur": 6.559,
+   "end": 52.32080078125,
+   "name": "37dynamic_per_group_scaled_quant",
+   "raw_name": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32EEEvPT0_PfPKT_PKfiliibPKii",
+   "cat": "indexer",
+   "lane": 0
+  },
+  {
+   "tid": 157,
+   "start": 46.162109375,
+   "dur": 19.239,
+   "end": 65.40087890625,
+   "name": "kernel_moe_gemm<>",
+   "raw_name": "void ck::kernel_moe_gemm<ck::GridwiseMoeGemmBlockScale<ck::tensor_layout::gemm::RowMajor, ck::tensor_layout::gemm::ColumnMajor, ",
+   "cat": "misc",
+   "lane": 2
+  },
+  {
+   "tid": 165,
+   "start": 52.32177734375,
+   "dur": 11.999,
+   "end": 64.32080078125,
+   "name": "kernel_gemm_xdl_cshuffle_v3_mult",
+   "raw_name": "void ck::kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffle<ck::GridwiseGemmMultiD_blockscale_xdl_cshuffle_v3_b_preshuf",
+   "cat": "gemm",
+   "lane": 0
+  },
+  {
+   "tid": 157,
+   "start": 65.40185546875,
+   "dur": 5.919,
+   "end": 71.32080078125,
+   "name": "18act_and_mul_kernelIfDF16bTnPFf",
+   "raw_name": "_ZN5aiter18act_and_mul_kernelIfDF16bTnPFfRKT_EXadL_ZNS_11silu_kernelIfEEfS3_EELi4EEEvPT0_PS2_i",
+   "cat": "silu",
+   "lane": 2
+  },
+  {
+   "tid": 157,
+   "start": 71.32177734375,
+   "dur": 5.959,
+   "end": 77.28076171875,
+   "name": "37dynamic_per_group_scaled_quant",
+   "raw_name": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32EEEvPT0_PfPKT_PKfiliibPKii",
+   "cat": "indexer",
+   "lane": 2
+  },
+  {
+   "tid": 157,
+   "start": 77.28173828125,
+   "dur": 9.519,
+   "end": 86.80078125,
+   "name": "kernel_moe_gemm<>",
+   "raw_name": "void ck::kernel_moe_gemm<ck::GridwiseMoeGemmBlockScale<ck::tensor_layout::gemm::RowMajor, ck::tensor_layout::gemm::ColumnMajor, ",
+   "cat": "misc",
+   "lane": 2
+  },
+  {
+   "tid": 165,
+   "start": 92.001953125,
+   "dur": 4.239,
+   "end": 96.24072265625,
+   "name": "vectorized_elementwise_kernel<>",
+   "raw_name": "void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul> >(int, at::",
+   "cat": "add",
+   "lane": 0
+  },
+  {
+   "tid": 165,
+   "start": 96.24169921875,
+   "dur": 19.199,
+   "end": 115.44091796875,
+   "name": "26cross_device_reduce_1stageIDF1",
+   "raw_name": "_ZN5aiter26cross_device_reduce_1stageIDF16bLi8ELb0EEEvPNS_8RankDataES2_NS_11RankSignalsEPNS_6SignalEPT_ii",
+   "cat": "ar",
+   "lane": 0
+  },
+  {
+   "tid": 165,
+   "start": 115.44189453125,
+   "dur": 5.199,
+   "end": 120.64111328125,
+   "name": "_fused_rms_fp8_group_quant_kerne",
+   "raw_name": "_fused_rms_fp8_group_quant_kernel",
+   "cat": "norm",
+   "lane": 0
+  },
+  {
+   "tid": 165,
+   "start": 120.64208984375,
+   "dur": 4.999,
+   "end": 125.64111328125,
+   "name": "elementwise_kernel_manual_unroll",
+   "raw_name": "void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda",
+   "cat": "misc",
+   "lane": 0
+  },
+  {
+   "tid": 165,
+   "start": 125.64208984375,
+   "dur": 14.68,
+   "end": 140.322265625,
+   "name": "kernel_gemm_xdl_cshuffle_v3_mult",
+   "raw_name": "void ck::kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffle<ck::GridwiseGemmMultiD_blockscale_xdl_cshuffle_v3_b_preshuf",
+   "cat": "gemm",
+   "lane": 0
+  },
+  {
+   "tid": 165,
+   "start": 140.32275390625,
+   "dur": 3.959,
+   "end": 144.28173828125,
+   "name": "24add_rmsnorm_quant_kernelIDF16b",
+   "raw_name": "_ZN5aiter24add_rmsnorm_quant_kernelIDF16bDF16bLi256ELi8ELb0ELb0ELb1ELi1EEEvPT0_PT_PfS4_S4_S4_diiiiiiib",
+   "cat": "norm",
+   "lane": 0
+  },
+  {
+   "tid": 156,
+   "start": 146.1630859375,
+   "dur": 3.199,
+   "end": 149.3623046875,
+   "name": "24add_rmsnorm_quant_kernelIDF16b",
+   "raw_name": "_ZN5aiter24add_rmsnorm_quant_kernelIDF16bDF16bLi64ELi8ELb0ELb0ELb1ELi1EEEvPT0_PT_PfS4_S4_S4_diiiiiiib",
+   "cat": "norm",
+   "lane": 3
+  },
+  {
+   "tid": 165,
+   "start": 155.123046875,
+   "dur": 3.679,
+   "end": 158.80224609375,
+   "name": "37dynamic_per_group_scaled_quant",
+   "raw_name": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32EEEvPT0_PfPKT_PKfiliibPKii",
+   "cat": "indexer",
+   "lane": 0
+  },
+  {
+   "tid": 155,
+   "start": 155.203125,
+   "dur": 4.799,
+   "end": 160.001953125,
+   "name": "37dynamic_per_group_scaled_quant",
+   "raw_name": "_ZN5aiter37dynamic_per_group_scaled_quant_kernelIDF16bDB8_Li32EEEvPT0_PfPKT_PKfiliibPKii",
+   "cat": "indexer",
+   "lane": 1
+  },
+  {
+   "tid": 165,
+   "start": 158.802734375,
+   "dur": 7.919,
+   "end": 166.7216796875,
+   "name": "kernel_gemm_xdl_cshuffle_v3_mult",
+   "raw_name": "void ck::kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffle<ck::GridwiseGemmMultiD_blockscale_xdl_cshuffle_v3_b_preshuf",
+   "cat": "gemm",
+   "lane": 0
+  },
+  {
+   "tid": 155,
+   "start": 160.0029296875,
+   "dur": 7.839,
+   "end": 167.841796875,
+   "name": "kernel_gemm_xdl_cshuffle_v3_mult",
+   "raw_name": "void ck::kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffle<ck::GridwiseGemmMultiD_blockscale_xdl_cshuffle_v3_b_preshuf",
+   "cat": "gemm",
+   "lane": 1
+  },
+  {
+   "tid": 165,
+   "start": 166.72265625,
+   "dur": 5.519,
+   "end": 172.24169921875,
+   "name": "_batched_gemm_a8w8_a_per_token_g",
+   "raw_name": "_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel_HAS_BIAS_0_BLOCK_SIZE_M_16_BLOCK_SIZE_N_128_BLOC",
+   "cat": "gemm",
+   "lane": 0
+  },
+  {
+   "tid": 155,
+   "start": 167.8427734375,
+   "dur": 4.519,
+   "end": 172.36181640625,
+   "name": "elementwise_kernel_manual_unroll",
+   "raw_name": "void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda",
+   "cat": "misc",
+   "lane": 1
+  },
+  {
+   "tid": 165,
+   "start": 172.24267578125,
+   "dur": 3.759,
+   "end": 176.00146484375,
+   "name": "_fused_qk_rope_cat_and_cache_mla",
+   "raw_name": "_fused_qk_rope_cat_and_cache_mla_kernel",
+   "cat": "indexer",
+   "lane": 0
+  },
+  {
+   "tid": 155,
+   "start": 172.36279296875,
+   "dur": 14.159,
+   "end": 186.52197265625,
+   "name": "kernel_gemm_xdl_cshuffle_v3_mult",
+   "raw_name": "void ck::kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffle<ck::GridwiseGemmMultiD_blockscale_xdl_cshuffle_v3_b_preshuf",
+   "cat": "gemm",
+   "lane": 1
+  },
+  {
+   "tid": 155,
+   "start": 186.52294921875,
+   "dur": 6.719,
+   "end": 193.2421875,
+   "name": "6kentryILi1ENS_14Layernorm2dFwdI",
+   "raw_name": "_ZN7ck_tile6kentryILi1ENS_14Layernorm2dFwdINS_29Layernorm2dFwdPipelineOnePassINS_29Layernorm2dFwdPipelineProblemIDF16bDF16bDF16b",
+   "cat": "norm",
+   "lane": 1
+  },
+  {
+   "tid": 155,
+   "start": 193.24267578125,
+   "dur": 9.039,
+   "end": 202.28173828125,
+   "name": "kn_entry_2c_sbhd_cached_indirect",
+   "raw_name": "void aiter::kn_entry_2c_sbhd_cached_indirect_inplace<aiter::OpCachedFwd, 1, true, false, true, true, 1, true, c10::BFloat16, c10",
+   "cat": "norm",
+   "lane": 1
+  },
+  {
+   "tid": 155,
+   "start": 202.28271484375,
+   "dur": 4.759,
+   "end": 207.04150390625,
+   "name": "fast_hadamard_transform_kernel<>",
+   "raw_name": "void fast_hadamard_transform_kernel<fast_hadamard_transform_kernel_traits<16, 7, c10::BFloat16> >(HadamardParamsBase)",
+   "cat": "indexer",
+   "lane": 1
+  },
+  {
+   "tid": 155,
+   "start": 207.04296875,
+   "dur": 5.599,
+   "end": 212.64208984375,
+   "name": "fast_hadamard_transform_kernel<>",
+   "raw_name": "void fast_hadamard_transform_kernel<fast_hadamard_transform_kernel_traits<16, 7, c10::BFloat16> >(HadamardParamsBase)",
+   "cat": "indexer",
+   "lane": 1
+  },
+  {
+   "tid": 155,
+   "start": 212.64306640625,
+   "dur": 5.919,
+   "end": 218.56201171875,
+   "name": "act_quant_kernel__kernel",
+   "raw_name": "act_quant_kernel__kernel",
+   "cat": "indexer",
+   "lane": 1
+  },
+  {
+   "tid": 155,
+   "start": 218.56298828125,
+   "dur": 6.799,
+   "end": 225.36181640625,
+   "name": "32indexer_k_quant_and_cache_kern",
+   "raw_name": "_ZN5aiter32indexer_k_quant_and_cache_kernelIDF16bDB8_LN4vllm18Fp8KVCacheDataTypeE1ELi8ELi8ELi16EEEvPKT_PT0_PKliiiiibb",
+   "cat": "indexer",
+   "lane": 1
+  },
+  {
+   "tid": 155,
+   "start": 225.36279296875,
+   "dur": 6.439,
+   "end": 231.8017578125,
+   "name": "wv_splitk_small_fp16_bf16_kernel",
+   "raw_name": "void aiter::wv_splitk_small_fp16_bf16_kernel<__hip_bfloat16, 64, 1, 1, 8, 4, 4>(int, int, __hip_bfloat16 const*, __hip_bfloat16 ",
+   "cat": "indexer",
+   "lane": 1
+  },
+  {
+   "tid": 155,
+   "start": 231.802734375,
+   "dur": 6.12,
+   "end": 237.9228515625,
+   "name": "triton_poi_fused_mul_unsqueeze_0",
+   "raw_name": "triton_poi_fused_mul_unsqueeze_0",
+   "cat": "indexer",
+   "lane": 1
+  },
+  {
+   "tid": 155,
+   "start": 237.923828125,
+   "dur": 6.279,
+   "end": 244.20263671875,
+   "name": "_gluon_deepgemm_fp8_paged_mqa_lo",
+   "raw_name": "_gluon_deepgemm_fp8_paged_mqa_logits_preshuffle",
+   "cat": "indexer",
+   "lane": 1
+  },
+  {
+   "tid": 155,
+   "start": 244.2041015625,
+   "dur": 13.839,
+   "end": 258.04296875,
+   "name": "FastTopKParams, int*, int const*",
+   "raw_name": "(anonymous namespace)::topk_transform_decode_kernel((anonymous namespace)::FastTopKParams, int*, int const*, long)",
+   "cat": "indexer",
+   "lane": 1
+  },
+  {
+   "tid": 165,
+   "start": 263.40380859375,
+   "dur": 12.519,
+   "end": 275.9228515625,
+   "name": "main_kernel",
+   "raw_name": "main_kernel",
+   "cat": "mqa_main",
+   "lane": 0
+  },
+  {
+   "tid": 165,
+   "start": 275.923828125,
+   "dur": 9.359,
+   "end": 285.28271484375,
+   "name": "main_kernel",
+   "raw_name": "main_kernel",
+   "cat": "mqa_main",
+   "lane": 0
+  },
+  {
+   "tid": 165,
+   "start": 285.28369140625,
+   "dur": 6.759,
+   "end": 292.04248046875,
+   "name": "_batched_gemm_a8w8_a_per_token_g",
+   "raw_name": "_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel_HAS_BIAS_0_BLOCK_SIZE_M_16_BLOCK_SIZE_N_128_BLOC",
+   "cat": "gemm",
+   "lane": 0
+  },
+  {
+   "tid": 165,
+   "start": 292.0439453125,
+   "dur": 6.119,
+   "end": 298.1630859375,
+   "name": "_fused_flatten_fp8_group_quant_k",
+   "raw_name": "_fused_flatten_fp8_group_quant_kernel",
+   "cat": "misc",
+   "lane": 0
+  },
+  {
+   "tid": 165,
+   "start": 298.1640625,
+   "dur": 5.719,
+   "end": 303.88330078125,
+   "name": "elementwise_kernel_manual_unroll",
+   "raw_name": "void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda",
+   "cat": "misc",
+   "lane": 0
+  },
+  {
+   "tid": 165,
+   "start": 303.8837890625,
+   "dur": 7.559,
+   "end": 311.44287109375,
+   "name": "kernel_gemm_xdl_cshuffle_v3_mult",
+   "raw_name": "void ck::kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffle<ck::GridwiseGemmMultiD_blockscale_xdl_cshuffle_v3_b_preshuf",
+   "cat": "gemm",
+   "lane": 0
+  },
+  {
+   "tid": 165,
+   "start": 311.44384765625,
+   "dur": 25.319,
+   "end": 336.7626953125,
+   "name": "26cross_device_reduce_1stageIDF1",
+   "raw_name": "_ZN5aiter26cross_device_reduce_1stageIDF16bLi8ELb0EEEvPNS_8RankDataES2_NS_11RankSignalsEPNS_6SignalEPT_ii",
+   "cat": "ar",
+   "lane": 0
+  }
+ ],
+ "bubbles": [
+  {
+   "start": 4.7999765625,
+   "dur": 0.0008046874999996234,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 10.15978125,
+   "dur": 0.0008632812500000142,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 45.76097265625,
+   "dur": 0.0007460937500027853,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 65.401109375,
+   "dur": 0.0007460937499956799,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 71.32085546875,
+   "dur": 0.0009218750000030695,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 77.28077734375,
+   "dur": 0.0009609374999968168,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 86.80073828125,
+   "dur": 5.2012148437499945,
+   "kind": "real_stall"
+  },
+  {
+   "start": 96.240953125,
+   "dur": 0.0007460937499956799,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 115.44069921875,
+   "dur": 0.0011953125000019327,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 120.64089453125,
+   "dur": 0.0011953125000019327,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 125.64108984375,
+   "dur": 0.0010000000000047748,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 140.32208984375,
+   "dur": 0.0006640624999931788,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 144.28175390625,
+   "dur": 1.8813320312499968,
+   "kind": "small_fence"
+  },
+  {
+   "start": 149.3620859375,
+   "dur": 5.760960937499988,
+   "kind": "real_stall"
+  },
+  {
+   "start": 186.52179296875,
+   "dur": 0.0011562500000081855,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 193.24194921875,
+   "dur": 0.0007265625000059117,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 202.28167578125,
+   "dur": 0.001039062500012733,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 207.04171484375001,
+   "dur": 0.001253906249985448,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 212.64196875,
+   "dur": 0.0010976562500104592,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 218.56206640625,
+   "dur": 0.0009218749999888587,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 225.36198828125,
+   "dur": 0.0008046874999934062,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 231.80179296875,
+   "dur": 0.0009414062500070486,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 237.922734375,
+   "dur": 0.0010937499999954525,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 244.202828125,
+   "dur": 0.001273437500003638,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 258.0431015625,
+   "dur": 5.360707031250001,
+   "kind": "real_stall"
+  },
+  {
+   "start": 275.92280859375,
+   "dur": 0.001019531249994543,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 285.282828125,
+   "dur": 0.0008632812500195541,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 292.04269140625,
+   "dur": 0.001253906249985448,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 298.1629453125,
+   "dur": 0.0011171874999718057,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 303.8830625,
+   "dur": 0.0007265625000059117,
+   "kind": "launch_micro"
+  },
+  {
+   "start": 311.4427890625,
+   "dur": 0.0010585937499740794,
+   "kind": "launch_micro"
+  }
+ ],
+ "bubble_summary": {
+  "total_us": 18.231230468749914,
+  "real_stall_us": 16.322882812499984,
+  "small_fence_us": 1.8813320312499968,
+  "sub1_us": 0.02619140624995797,
+  "n_real_stalls": 3
+ }
+};
+
 // Color mapping by category
 const COLOR = {
   ar:            '#f5a623',
@@ -3039,7 +3703,7 @@ function drawTimeline() {
   // Axis ticks
   const axisG = svg.querySelector('g[transform="translate(150, 18)"] .axis-label');
   const axisParent = svg.querySelector('g[transform="translate(150, 18)"]');
-  for (let t = 0; t <= 320; t += 25) {
+  for (let t = 0; t <= 380; t += 25) {
     const x = t * PX_PER_US;
     const tick = document.createElementNS('http://www.w3.org/2000/svg', 'line');
     tick.setAttribute('x1', x); tick.setAttribute('x2', x);
@@ -3060,7 +3724,7 @@ function drawTimeline() {
     // background
     const bg = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
     bg.setAttribute('x', 0); bg.setAttribute('y', 0);
-    bg.setAttribute('width', 1280); bg.setAttribute('height', height);
+    bg.setAttribute('width', 1480); bg.setAttribute('height', height);
     bg.setAttribute('class', 'timeline-bg');
     rowG.appendChild(bg);
 
@@ -3233,8 +3897,8 @@ function drawTimeline() {
   });
   // bubble overlay for dual
   const bubbleG = svg.querySelector('#row-dual-bubbles');
-  const dualTopY = 10;          // relative to row-dual-bubbles transform y=135
-  const dualTotalH = (195 - 145) + STREAM_HEIGHT;  // 50 (cur->alt offset) + 30 = 80
+  const dualTopY = 10;          // relative to row-dual-bubbles transform y=180
+  const dualTotalH = (240 - 190) + STREAM_HEIGHT;  // 50 (cur->alt offset) + 30 = 80
   drawBubbles(bubbleG, DUAL.bubbles, dualTopY, dualTotalH, { showMicro: false });
 
   // -------- ROW 3: B200 (4 lanes from CUDA-graph stream pool) --------
@@ -3274,9 +3938,26 @@ function drawTimeline() {
   });
   // B200 bubbles — show all sub-1us as subtle azure tint to communicate "65 micro-gaps, all <1us"
   const b200BubbleG = svg.querySelector('#row-b200-bubbles');
-  const b200TopY = 10;       // relative to row-b200-bubbles transform y=285
-  const b200TotalH = (370 - 295) + B200_LANE_HEIGHT;  // 75 + 22 = 97 covers all 4 lanes
+  const b200TopY = 10;       // relative to row-b200-bubbles transform y=355
+  const b200TotalH = (440 - 365) + B200_LANE_HEIGHT;  // 75 + 22 = 97 covers all 4 lanes
   drawBubbles(b200BubbleG, B200.bubbles, b200TopY, b200TotalH, { showMicro: false });
+
+  // ---- R713 (MI355X dual-stream + ROCm 7.13, 4 streams) ----
+  // Uses lanes 0..3 from DUAL_R713.rects
+  const R713_LANE_HEIGHT = 22;
+  const r713Lanes = [
+    svg.querySelector('#row-r713-l0'),
+    svg.querySelector('#row-r713-l1'),
+    svg.querySelector('#row-r713-l2'),
+    svg.querySelector('#row-r713-l3'),
+  ];
+  for (let i = 0; i < 4; i++) {
+    drawRow(r713Lanes[i], DUAL_R713.rects, R713_LANE_HEIGHT, i);
+  }
+  const r713BubbleG = svg.querySelector('#row-r713-bubbles');
+  const r713TopY = 10;       // relative to row-r713-bubbles transform y=585
+  const r713TotalH = (670 - 595) + R713_LANE_HEIGHT;  // span all 4 R713 lanes
+  drawBubbles(r713BubbleG, DUAL_R713.bubbles, r713TopY, r713TotalH, { showMicro: false });
 }
 
 function showTtip(e) {

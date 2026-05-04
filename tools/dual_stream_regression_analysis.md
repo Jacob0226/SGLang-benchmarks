@@ -20,10 +20,11 @@
 
 | Variant | Median TPOT | Δ vs Baseline |
 |---|---|---|
-| Baseline (SGLang PR #21511) | **21.21 ms** | — |
-| Dual stream | **24.45 ms** | **+15.3% (regression)** |
+| Baseline (SGLang PR #21511, ROCm 7.2) | **21.21 ms** | — |
+| Dual stream (ROCm 7.2) | **24.45 ms** | **+15.3% (regression)** |
+| Dual stream + ROCm 7.13 (TheRock pip; **NEW**) | **28.32 ms** | **+33.5% (worsens further)** |
 
-The dual-stream layout therefore **regresses by 3.24 ms / token = ~50.6 μs / layer at TPOT level** on this workload.
+The ROCm 7.2 dual-stream layout regresses by 3.24 ms / token = ~50.6 μs / layer at TPOT level. **Upgrading to ROCm 7.13 user-space (via TheRock pip stack) makes it worse, not better** — additional +3.87 ms / token, with the kernel timeline now using **4 active GPU streams** instead of 2.
 
 ---
 
@@ -64,6 +65,72 @@ Naively this looks like **+49 μs of extra shared-expert work per layer**, but t
 
 ---
 
+## ROCm 7.13 + 4-stream regression (NEW, May 2026)
+
+After upgrading to ROCm 7.13 user-space (via [TheRock](https://github.com/ROCm/TheRock) pip — torch 2.11.0+rocm7.13, rocm-sdk 7.13.0a20260426 with bundled libamdhip64.so.7.13.26162) and running the same dual-stream branch on a **fresh container** with rebuilt aiter / sgl-kernel / fast-hadamard-transform, the dual-stream layout uses **4 active GPU streams** (cur + 3 alt streams) instead of the 2 streams seen on ROCm 7.2 — yet wall-clock per layer **gets worse, not better**.
+
+### Direct measurement (8k1k conc4, GLM-5.1-FP8, TP=8)
+
+The trace has high layer-dur variance (min 290 / median 366 / max 636 μs across 391 layer windows). For a fair like-for-like comparison we use a "typical 4-stream layer" (#43, dur 337 μs, all 4 streams active) for kernel-level numbers, but quote the median 366 μs for the bench-aligned wall comparison.
+
+| Variant | Layer wall (this layer / median) | AR mean | All-stream-idle bubble | Real-stall ≥2 μs / layer | Streams |
+|---|---|---|---|---|---|
+| MI355X single-stream (ROCm 7.2) | 271 / 271 μs | 10.26 μs | 0 μs | 0 μs | 1 |
+| MI355X dual-stream HIP (ROCm 7.2) | 312 / 320 μs | 18.24 μs | 18.2 μs | 16.5 μs (3) | 2 |
+| **MI355X dual-stream HIP (ROCm 7.13)** | **337 / 366 μs** | **22.26 μs** (this) / **25.72 μs** (median) | **18.2 μs** | **16.3 μs (3)** | **4** |
+| B200 dual-stream CUDA-graph (reference) | 303 μs | n/a | 23.4 μs sub-1µs (artifact) | 0 μs | 4 (pool) |
+
+### Surprise: bubble didn't grow, kernels did
+
+**Trace-direct decomposition of the +25 μs / layer regression vs ROCm 7.2 dual-stream (using #43 layer):**
+
+| component | ROCm 7.2 dual | ROCm 7.13 dual (4-stream) | Δ |
+|---|---|---|---|
+| AllReduce per layer (× 2 calls) | 36.5 μs | **44.5 μs** (mean 22.26 × 2) | **+8.0 μs** |
+| Indexer chain | 70.3 μs | **91.3 μs** (15 kernels) | **+21.0 μs** |
+| GEMMs (9 ck_gemm + a8w8) | ~96 μs | **105.8 μs** | **+9.8 μs** |
+| All-stream-idle bubble | 18.2 μs | **18.2 μs** | **±0** |
+| Other (norm, silu, mqa, add, misc) | rest | rest | balance ~−14 μs |
+| **total layer wall** | **312 μs** | **337 μs** | **+25 μs** |
+
+The most striking finding: **the all-stream-idle bubble didn't get worse**. It's still ~18 μs / layer with 3 real stalls — exactly the same pattern as ROCm 7.2 dual-stream. **Adding 2 more streams (2 → 4) did NOT amplify HIP-graph fence cost** the way one might have feared. So this isn't a "more streams → more fences" story.
+
+The +25 μs / layer regression is entirely from **kernels running slower**:
+
+1. **AR per call slows another +4 μs** (18.24 → 22.26 μs at this layer; +7.5 μs at the median). Same `aiter::cross_device_reduce_1stage` kernel, same TP=8 topology. The kernel itself is taking longer in ROCm 7.13. With 2 AR per layer, **+8 μs / layer** here, more at median.
+
+2. **Indexer chain +21 μs** — memory-bound kernels (Hadamard, act_quant, indexer_layernorm, paged_mqa_logits, topk_transform) each pay 0.5–2 μs more. With 4 concurrent streams competing for the same 8 TB/s HBM pipe, contention is worse than 2-stream ROCm 7.2.
+
+3. **GEMMs +9.8 μs** — aiter rebuilt with `PREBUILD_KERNELS=1` but `/tmp/aiter_configs/*.csv` is empty after the rebuild. First-touch shapes hit "torch solution:0" / "skinny solution:2" defaults instead of tuned solutions (visible as warnings in server log). aiter autotune would likely recover most of this.
+
+### Comparison summary
+
+| Hypothesis | ROCm 7.2 dual analysis (original) | ROCm 7.13 dual (this run) |
+|---|---|---|
+| HIP-graph fence in critical path → bubble | ✓ confirmed | ✓ same magnitude (no worse) |
+| HBM contention slows memory-bound kernels | possible (+7 μs indexer) | ✓ amplified (+21 μs indexer; 4 streams worse than 2) |
+| AR fence slows AR kernel | ✓ +8 μs / call | ✓ another +4 μs / call (cumulative +12 vs baseline) |
+| Untuned kernels (aiter cache wiped) | n/a | **new contributor** (+10 μs in GEMMs) |
+
+### What's needed for ROCm 7.13 dual-stream to win
+
+- **Aiter autotune** on the fresh ROCm 7.13 stack: regenerate `/tmp/aiter_configs/*.csv` for all GEMM and quant shapes used by GLM-5.1-FP8 decode. Likely recovers 9–15 μs / layer (the "GEMMs +9.8" + part of "indexer +21" buckets).
+- **AR kernel tuning for ROCm 7.13**: the `aiter::cross_device_reduce_1stage` kernel's slowdown across versions deserves investigation — it's the same kernel with the same workload but +12 μs / call vs ROCm 7.2 single-stream. Either the kernel needs new tuning or the ROCm 7.13 runtime adds per-call setup.
+- **Memory bandwidth with 4 streams**: HBM3E saturation profile under 4 concurrent streams probably worse than 2. Could be measured with HIP profiler counters.
+- **Bench warm-up**: aiter JIT triggers many "first-touch" compilations during early server life. Forcing a longer pre-prof warmup (e.g., 3-5 min of varied request shapes) before the prof window should eliminate the "skinny solution:2" cold-cache penalty.
+
+### Validates the original hypothesis (with one caveat)
+
+The original ROCm 7.2 analysis blamed the regression on HIP-graph cross-stream fence cost in dual-stream replay. The ROCm 7.13 4-stream measurement **partially confirms and partially refines** that:
+- ✓ HIP-graph fence cost is real (~18 μs bubble per layer in BOTH 2-stream and 4-stream).
+- ✗ But fence cost did NOT scale linearly with stream count — adding 2 more streams kept the bubble flat. So "more streams → more fences in critical path" is wrong.
+- ✓ HBM contention IS worse with more streams. This is consistent with the original hypothesis but more pronounced.
+- New: **untuned aiter kernels** add a one-time penalty after stack rebuild that's separable from the dual-stream layout itself.
+
+The dual-stream layout regression is therefore mostly **kernel-level cost** (AR + memory-bound + untuned), not **layout-level cost** (fences). A future ROCm release that speeds up `aiter::cross_device_reduce_1stage` and memory-bound NSA kernels under HBM contention would close more of the gap than reducing fence cost would.
+
+---
+
 ## Bubble decomposition (kind classification) — what kind of GPU idle?
 
 The +18 μs / layer bubble in MI355X dual-stream is significant only if it's *real CPU stall*. To distinguish real stall from per-kernel dispatch latency, we classify each inter-kernel gap inside a layer-pass:
@@ -76,9 +143,10 @@ Direct trace measurement, 15 consecutive layer-passes per trace:
 
 | trace | layer wall | total bubble | sub-1 μs (see caveat) | 1–2 μs (small fence) | ≥ 2 μs (real stall) | verdict |
 |---|---|---|---|---|---|---|
-| MI355X · single-stream HIP | 271 μs | **0 μs** | 0 μs | 0 μs | 0 μs | clean |
-| MI355X · dual-stream HIP | 320 μs | 18.2 μs | ~0 μs | 1.7 μs (1 fence) | **16.5 μs (3 stalls)** | real HIP-runtime overhead |
+| MI355X · single-stream HIP (ROCm 7.2) | 271 μs | **0 μs** | 0 μs | 0 μs | 0 μs | clean |
+| MI355X · dual-stream HIP (ROCm 7.2, 2 streams) | 320 μs | 18.2 μs | ~0 μs | 1.7 μs (1 fence) | **16.5 μs (3 stalls)** | real HIP-runtime overhead |
 | B200 · CUDA-graph dual-stream | 303 μs | 23.4 μs | 23.4 μs (65 gaps) | 0 μs | **0 μs** | clean |
+| **MI355X · dual-stream HIP (ROCm 7.13, 4 streams)** | 337 μs (this) / 366 μs (median) | 18.2 μs | ~0 μs | 1.9 μs (1 fence) | **16.3 μs (3 stalls)** | **bubble unchanged but kernel costs grew (AR / indexer / untuned GEMM); see "ROCm 7.13 + 4-stream regression" section** |
 
 **The signal in this table is the right-most column** (≥ 2 μs real stall): MI355X dual-stream has 16.5 μs of real CPU stall per layer; both MI355X single-stream and B200 dual-stream have zero. The middle "sub-1 μs" column is misleading at first glance — see the caveat below.
 
