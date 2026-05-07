@@ -6,6 +6,7 @@
 # ./GLM.sh --dual-stream-rocm        # disable shared-experts-fusion for dual stream on ROCm
 # ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-5-FP8
 # ./GLM.sh --prof --dual-stream-rocm --tag DualStream
+# ./GLM.sh --tp 4 --tag 0507_TP4    # tensor parallel size (default 8)
 # ./GLM.sh --docker rocm/sgl-dev:v0.5.10rc0-rocm720-mi35x-20260412   # tag results dir with docker image
 set -euo pipefail
 set -x
@@ -18,6 +19,7 @@ PROF_COMBINED="false"   # if true: single combined trace (no --profile-by-stage)
 DUAL_STREAM_ROCM="false"
 MTP_TAG=""
 USER_TAG=""
+TP_SIZE=8
 MODEL_PATH="/data/huggingface/hub/zai-org/GLM-5-FP8"
 # DOCKER labels the results directory so different docker images don't clobber
 # each other. Override with --docker <image>. Known-good images:
@@ -49,6 +51,10 @@ while [[ $# -gt 0 ]]; do
         MODEL_PATH="$2"
         shift 2
         ;;
+    --tp)
+        TP_SIZE="$2"
+        shift 2
+        ;;
     --tag)
         USER_TAG="-$2"
         shift 2
@@ -76,8 +82,8 @@ PORT="8552"
 DATASET="random"
 in_out_tokens=("8192:1024" "1024:1024")
 random_range_ratio=0.8
-concurrencies=(4 8 16 32 64)
-PROMPT_MULTIPLIER=10
+concurrencies=(4 8 16 32 64 256)
+PROMPT_MULTIPLIER=5
 if [ "$PROF_COMBINED" == "true" ]; then
     PROF_CMD=(--profile --profile-num-steps 5)
     COMBINED_SUFFIX="_Combined"
@@ -95,7 +101,7 @@ if [ "$PROF_ENABLED" == "true" ]; then
 
     # Debug
     # in_out_tokens=("1024:1024")
-    concurrencies=(4)
+    concurrencies=(64 4)
 fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
 LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}${MTP_TAG}${SPECIAL_TAG}${USER_TAG}"
@@ -231,7 +237,7 @@ start_server() {
     local cmd=(
         python3 -m sglang.launch_server
             --model $MODEL_PATH
-            --tp 8
+            --tp $TP_SIZE
             --host $HOST
             --port $PORT
             --tool-call-parser glm47
@@ -281,14 +287,17 @@ start_server() {
     fi
 
     if [ "$MTP_ENABLED" == "true" ]; then
-        # ROCm GPU (MI355X) currently only support triton backend in speculative decoding
+        # EAGLE chain matches InferenceX glm5_fp8_mi355x_mtp.sh: (steps=3, topk=1, draft=4).
+        # SGLANG_ENABLE_SPEC_V2=1 enables sglang's new spec scheduler (also set by InferenceX).
+        # On MI355X we keep --nsa-{prefill,decode}-backend tilelang from above; do NOT
+        # override --attention-backend (InferenceX doesn't either, tilelang NSA + EAGLE works).
         echo ">>> Speculative Decoding (MTP) is ENABLED." | tee -a "$logfile"
+        export SGLANG_ENABLE_SPEC_V2=1
         cmd+=(
             --speculative-algorithm EAGLE
             --speculative-num-draft-tokens 4
             --speculative-num-steps 3
             --speculative-eagle-topk 1
-            --attention-backend triton
         )
     fi
 
