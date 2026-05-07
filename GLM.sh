@@ -82,7 +82,7 @@ PORT="8552"
 DATASET="random"
 in_out_tokens=("8192:1024" "1024:1024")
 random_range_ratio=0.8
-concurrencies=(4 8 16 32 64 256)
+concurrencies=(4 8 16 32 64 128 256)
 PROMPT_MULTIPLIER=5
 if [ "$PROF_COMBINED" == "true" ]; then
     PROF_CMD=(--profile --profile-num-steps 5)
