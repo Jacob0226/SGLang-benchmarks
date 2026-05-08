@@ -215,6 +215,22 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
     print(f"Wrote {out_path} ({len(runs)} curves)")
 
 
+def default_out_path(runs: list[dict], root: Path) -> Path:
+    """Pick a sensible default output location:
+      - 1 tag, 1 cache_mode → drop the PNG inside that bench folder
+      - multiple tags or modes → drop a comparison PNG in <root>/cascade/
+    """
+    tags  = sorted({r["tag"] for r in runs})
+    modes = sorted({r["cache_mode"] for r in runs})
+    if len(tags) == 1 and len(modes) == 1:
+        # use the parent of the bench dir (i.e. the size_N or cache_mode dir)
+        return runs[0]["path"].parent / f"cascade_{tags[0]}_{modes[0]}.png"
+    fname = "cascade_" + "_vs_".join(tags) + ".png"
+    out_dir = root / "cascade"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir / fname
+
+
 def main():
     p = argparse.ArgumentParser()
     default_root = Path(os.environ.get("HOME", "~")).expanduser() / "SGLang-benchmarks" / "results"
@@ -227,12 +243,17 @@ def main():
     p.add_argument("--hicache-size", type=int, default=None,
                    help="If set, only plot hicache_* runs at this --hicache-size GB")
     p.add_argument("--title", default=None, help="Optional plot title")
-    p.add_argument("--out", default="cascade.png", help="Output PNG path")
+    p.add_argument("--out", default=None,
+                   help="Output PNG path (default: inside the run's bench folder "
+                        "for single-tag/single-mode, else <root>/cascade/)")
     args = p.parse_args()
 
     root = Path(args.root_dir).expanduser().resolve()
     runs = discover_runs(root, args.tags, args.cache_modes, args.hicache_size)
-    plot_cascade(runs, Path(args.out), title=args.title)
+    if not runs:
+        raise SystemExit("No runs found matching filters")
+    out_path = Path(args.out) if args.out else default_out_path(runs, root)
+    plot_cascade(runs, out_path, title=args.title)
 
 
 if __name__ == "__main__":
