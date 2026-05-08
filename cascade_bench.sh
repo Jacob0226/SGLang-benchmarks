@@ -57,9 +57,15 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Cascade-tuned parameters. See header comment for the math.
+# Cascade-tuned parameters. See header comment for the math. Only the
+# hicache_file path is run because the cascade visualization compares
+# MI355X vs B200 *on the same full L1+L2+L3 stack* — which layer gets
+# hit at each round is read off the per-round TTFT shape (L1 ~50 ms,
+# L2 ~few-hundred ms, L3 ~sec). Pass --cache-modes-extra "no_radix
+# radix hicache" if you want the Mooncake-style 4-line figure too.
+CACHE_MODE="hicache_file"
 exec "$SCRIPT_DIR/HiCache.sh" \
-  --sweep \
+  --cache-mode "$CACHE_MODE" \
   --tag "$TAG" \
   --docker "$DOCKER" \
   --num-clients     300 \
@@ -68,5 +74,6 @@ exec "$SCRIPT_DIR/HiCache.sh" \
   --output-length   1 \
   --max-parallel    8 \
   --request-rate    32 \
-  --hicache-size-sweep "192" \
+  --hicache-size    192 \
+  --hicache-size-sweep "" \
   "${EXTRA_ARGS[@]}"
