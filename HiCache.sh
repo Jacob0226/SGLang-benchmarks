@@ -104,12 +104,20 @@ HICACHE_SIZE="auto"
 # Cross-platform fairness sweep: when comparing MI355X vs B200, fix
 # --hicache-size to the same set of values on both boxes so HiCache L2
 # capacity is identical between platforms (DRAM is an OEM choice, not a
-# GPU spec). Default sweeps 64 / 128 / 256 GB per rank; for each size
-# the script checks that size × TP_SIZE fits in MemAvailable minus the
-# 400 GB host headroom and skips (with a log entry) if it doesn't —
-# so the same line runs on a 3 TiB MI355X box and a 2 TB B200 box.
+# GPU spec). Default sweeps 192 / 256 / 320 GB per rank because:
+#   - SGLang HiCache asserts host KV pool > device KV pool
+#   - DSR1-0528 device KV pool ≈ 160 GB/rank on MI355X (288 GB HBM ×
+#     0.85 − 84 GB weights), so anything ≤ 160 will crash the server
+#   - DSR1 device pool ≈ 79 GB/rank on B200 (192 GB HBM × 0.85 − 84 GB)
+#   - 192 satisfies host > device on both; 256 / 320 satisfy MI355X,
+#     B200 will skip them via the DRAM check (size × TP > usable host)
+# For each size the script checks (a) size × TP_SIZE fits in MemAvailable
+# minus 400 GB host headroom, and (b) if the server fails to come up
+# within WAIT_FOR_SERVER_SEC (likely host>device violation), it logs
+# the reason in skipped.log and moves on — so the same line runs
+# end-to-end on a 3 TiB MI355X box and a 2 TB B200 box.
 # Pass an empty string ("") or a single-value list to disable sweep.
-HICACHE_SIZE_SWEEP="64 128 256"
+HICACHE_SIZE_SWEEP="192 256 320"
 
 # Multi-turn defaults (from LMSys blog reference run)
 NUM_CLIENTS=80
@@ -269,11 +277,23 @@ is_rocm_gpu_env() {
 }
 
 wait_for_server() {
+  # Polls /health until the server is up. Bails out after WAIT_FOR_SERVER_SEC
+  # if the server hasn't come up — this prevents the whole sweep from hanging
+  # when SGLang fails internally (e.g. AssertionError on the host>device
+  # constraint when --hicache-size is too small relative to the GPU KV pool).
+  # Returns 0 on success, non-zero on timeout. Caller is expected to handle
+  # the timeout gracefully (log skip, kill orphans, continue).
   local logfile=$1
-  echo ">>> Waiting for server to be ready (checking: '${logfile}')..." | tee -a "$logfile"
-  until [ "$(curl -s -o /dev/null -w "%{http_code}" "http://${HOST}:${PORT}/health")" -eq 200 ]; do
+  local deadline=$(( $(date +%s) + ${WAIT_FOR_SERVER_SEC:-900} ))
+  echo ">>> Waiting for server to be ready (timeout=${WAIT_FOR_SERVER_SEC:-900}s, log='${logfile}')..."
+  while [ "$(curl -s -o /dev/null -w "%{http_code}" "http://${HOST}:${PORT}/health" 2>/dev/null)" != "200" ]; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo ">>> ERROR: server did not come up within ${WAIT_FOR_SERVER_SEC:-900}s"
+      return 1
+    fi
     sleep 5
   done
+  return 0
 }
 
 flush_cache() {
@@ -567,7 +587,10 @@ build_server_cmd() {
   echo "${cmd[*]}" | tee -a "$logfile"
   "${cmd[@]}" 2>&1 | tee -a "$logfile" &
   SERVER_PID=$!
-  wait_for_server "$logfile"
+  if ! wait_for_server "$logfile"; then
+    return 1
+  fi
+  return 0
 }
 
 # ============================== Warmup ==============================
@@ -699,7 +722,27 @@ run_one() {
   snapshot_host_info "${LOG_DIR}/host_info.log"
 
   local server_log="${LOG_DIR}/server.log"
-  build_server_cmd "$cache_mode" "$server_log"
+  if ! build_server_cmd "$cache_mode" "$server_log"; then
+    # Server didn't come up within wait timeout. Most likely cause for
+    # hicache_* modes: SGLang's host>device assertion (host KV pool must
+    # be larger than device KV pool). Sniff the server log and record
+    # the reason in skipped.log so the rest of the sweep continues.
+    local reason
+    if grep -q "host memory should be larger than the device memory" "$server_log" 2>/dev/null; then
+      reason="host KV pool (${HICACHE_SIZE} GB/rank) <= GPU KV pool — SGLang requires host > device"
+    elif grep -q "AssertionError\|RuntimeError\|CUDA out of memory\|HIP out of memory" "$server_log" 2>/dev/null; then
+      reason="server crashed — see $server_log"
+    else
+      reason="server didn't become healthy within timeout — see $server_log"
+    fi
+    local sz_label="${HICACHE_SIZE:-N/A}"
+    [[ "$cache_mode" != hicache* ]] && sz_label=""
+    local msg="[skip] ${cache_mode}${sz_label:+/size_$sz_label}: ${reason}"
+    echo "$msg"
+    echo "$msg" >> "$SKIPPED_LOG"
+    stop_server
+    return 0
+  fi
   warmup
   case "$BENCH_MODE" in
     multiturn)   bench_multiturn ;;
