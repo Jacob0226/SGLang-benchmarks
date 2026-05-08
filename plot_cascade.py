@@ -189,11 +189,31 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
     ax_hit.set_ylim(-2, 102)
     ax_hit.grid(True, alpha=0.3)
 
+    # Distinct color per tag when only one cache_mode is plotted (cross-platform
+    # comparison); otherwise color encodes cache_mode and linestyle encodes tag.
+    distinct_modes = sorted({r["cache_mode"] for r in runs})
+    color_by_tag = len(distinct_modes) == 1 and len(tag_list) > 1
+    tag_palette = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b"]
+
+    def color_for_tag(tag: str) -> str | None:
+        """Tag-name-aware color so the assignment is stable across runs.
+        AMD platforms get warm colors (orange / red), NVIDIA cool (green / blue)."""
+        t = tag.lower()
+        if any(p in t for p in ("b200", "h200", "h800", "h100", "a100", "nvidia")):
+            return "#2ca02c"  # green for NVIDIA
+        if any(p in t for p in ("mi355", "mi325", "mi300", "mi250", "mi210", "amd", "rocm")):
+            return "#ff7f0e"  # orange for AMD
+        return None
+
     for r in runs:
         rounds = list(range(1, len(r["ttft"]) + 1))
-        color = CACHE_MODE_COLOR.get(r["cache_mode"], "black")
         tag_idx = tag_list.index(r["tag"])
-        linestyle, marker = TAG_LINESTYLE.get(tag_idx, ("solid", "o"))
+        if color_by_tag:
+            color = color_for_tag(r["tag"]) or tag_palette[tag_idx % len(tag_palette)]
+            linestyle, marker = "solid", ("o", "s", "^", "D")[tag_idx % 4]
+        else:
+            color = CACHE_MODE_COLOR.get(r["cache_mode"], "black")
+            linestyle, marker = TAG_LINESTYLE.get(tag_idx, ("solid", "o"))
 
         size_suffix = f"_{r['size']}" if r["size"] is not None else ""
         label = f"[{r['tag']}] {CACHE_MODE_LABEL.get(r['cache_mode'], r['cache_mode'])}{size_suffix}"
