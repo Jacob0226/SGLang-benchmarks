@@ -571,8 +571,19 @@ build_server_cmd() {
       )
       ;;
     hicache_file)
-      local store_dir="${LOG_DIR}/hicache_file_store"
+      # Put L3 cache pages in /tmp inside the container, NOT under
+      # $LOG_DIR (which is mounted from the host). With write_through,
+      # SGLang spills the entire working set to the L3 backend; for
+      # DSR1 that's ~50 GB per run, and on the host's 8× sweep that
+      # adds up to hundreds of GB of pollution under the user's home.
+      # /tmp on rocm/sgl-dev images is the container's overlay writable
+      # layer — disappears on docker rm, separate from host mounts.
+      # Per (cache_mode, size) unique path so different sweep entries
+      # don't share warm L3 state and confound the comparison.
+      local store_dir="/tmp/hicache_file_store/${MODEL_NAME}_${cache_mode}_size_${HICACHE_SIZE}"
+      rm -rf "$store_dir" 2>/dev/null
       mkdir -p "$store_dir"
+      HICACHE_FILE_STORE_DIR="$store_dir"   # exported to run_one for cleanup
       cmd+=(
         --enable-hierarchical-cache
         --hicache-size "$HICACHE_SIZE"
@@ -823,6 +834,16 @@ run_one() {
     *) echo "Unknown bench mode: $BENCH_MODE" >&2; stop_server; exit 1 ;;
   esac
   stop_server
+  # Wipe the per-run L3 file backend so /tmp doesn't fill up over a
+  # multi-mode / multi-size sweep. We deliberately keep the bench logs
+  # under $LOG_DIR; only the throwaway disk-resident KV pages go.
+  if [ -n "${HICACHE_FILE_STORE_DIR:-}" ] && [ -d "$HICACHE_FILE_STORE_DIR" ]; then
+    local sz_freed
+    sz_freed=$(du -sh "$HICACHE_FILE_STORE_DIR" 2>/dev/null | cut -f1)
+    rm -rf "$HICACHE_FILE_STORE_DIR" 2>/dev/null
+    echo ">>> cleaned hicache_file L3 store: ${HICACHE_FILE_STORE_DIR} (${sz_freed:-?})"
+    HICACHE_FILE_STORE_DIR=""
+  fi
 }
 
 # ============================== Main ==============================
