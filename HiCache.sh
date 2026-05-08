@@ -98,9 +98,12 @@ HICACHE_SIZE="auto"
 # Cross-platform fairness sweep: when comparing MI355X vs B200, fix
 # --hicache-size to the same set of values on both boxes so HiCache L2
 # capacity is identical between platforms (DRAM is an OEM choice, not a
-# GPU spec). --hicache-size-sweep "64 128 256" runs each hicache_* mode
-# with each size; non-hicache modes (no_radix, radix) are unaffected.
-HICACHE_SIZE_SWEEP=""
+# GPU spec). Default sweeps 64 / 128 / 256 GB per rank; for each size
+# the script checks that size × TP_SIZE fits in MemAvailable minus the
+# 400 GB host headroom and skips (with a log entry) if it doesn't —
+# so the same line runs on a 3 TiB MI355X box and a 2 TB B200 box.
+# Pass an empty string ("") or a single-value list to disable sweep.
+HICACHE_SIZE_SWEEP="64 128 256"
 
 # Multi-turn defaults (from LMSys blog reference run)
 NUM_CLIENTS=80
@@ -218,14 +221,21 @@ auto_hicache_size() {
   echo "$per_rank"
 }
 
+# Cache MemAvailable once at startup so the per-size DRAM check in the
+# sweep loop is consistent and cheap (no repeated /proc/meminfo reads).
+MEM_AVAIL_GB=$(awk '/^MemAvailable:/ {print int($2/1024/1024)}' /proc/meminfo)
+HOST_HEADROOM_GB=400
+USABLE_HOST_GB=$(( MEM_AVAIL_GB - HOST_HEADROOM_GB ))
+
 if [ -n "$HICACHE_SIZE_SWEEP" ]; then
-  echo ">>> --hicache-size-sweep: ${HICACHE_SIZE_SWEEP} GB per rank" \
-       "(each value will run once per hicache_* mode)"
+  echo ">>> --hicache-size-sweep: '${HICACHE_SIZE_SWEEP}' GB per rank" \
+       "(each value runs once per hicache_* mode; sizes that don't fit" \
+       "in MemAvailable=${MEM_AVAIL_GB} GB minus ${HOST_HEADROOM_GB} GB" \
+       "headroom across TP=${TP_SIZE} ranks will be skipped)"
 elif [ "$HICACHE_SIZE" = "auto" ]; then
   HICACHE_SIZE=$(auto_hicache_size) || exit 1
-  mem_avail_gb=$(awk '/^MemAvailable:/ {print int($2/1024/1024)}' /proc/meminfo)
   echo ">>> auto --hicache-size: ${HICACHE_SIZE} GB per rank" \
-       "(TP=${TP_SIZE}, MemAvailable=${mem_avail_gb} GB," \
+       "(TP=${TP_SIZE}, MemAvailable=${MEM_AVAIL_GB} GB," \
        "total host pool ≈ $(( HICACHE_SIZE * TP_SIZE )) GB)"
 else
   echo ">>> manual --hicache-size: ${HICACHE_SIZE} GB per rank" \
@@ -609,6 +619,9 @@ else
   SIZE_LIST=( "$HICACHE_SIZE" )
 fi
 
+SKIPPED_LOG="${BASE_LOG_DIR}/skipped.log"
+: > "$SKIPPED_LOG"
+
 for cm in "${CACHE_MODES[@]}"; do
   if [[ "$cm" == hicache* ]]; then
     sizes_to_run=( "${SIZE_LIST[@]}" )
@@ -617,6 +630,15 @@ for cm in "${CACHE_MODES[@]}"; do
   fi
   for sz in "${sizes_to_run[@]}"; do
     if [ "$sz" != "_unused_" ]; then
+      total_pool_gb=$(( sz * TP_SIZE ))
+      if [ "$total_pool_gb" -gt "$USABLE_HOST_GB" ]; then
+        msg="[skip] ${cm}/size_${sz}: needs ${total_pool_gb} GB host pool" \
+            "(${sz} × TP=${TP_SIZE}), only ${USABLE_HOST_GB} GB usable" \
+            "(MemAvailable=${MEM_AVAIL_GB} GB − ${HOST_HEADROOM_GB} GB headroom)"
+        echo "$msg"
+        echo "$msg" >> "$SKIPPED_LOG"
+        continue
+      fi
       HICACHE_SIZE="$sz"
       LOG_DIR="${BASE_LOG_DIR}/${cm}/size_${sz}"
       banner_size="  hicache_size=${sz} GB"
@@ -631,4 +653,8 @@ for cm in "${CACHE_MODES[@]}"; do
   done
 done
 
+if [ -s "$SKIPPED_LOG" ]; then
+  echo ">>> Skipped runs (DRAM insufficient) — see $SKIPPED_LOG"
+  cat "$SKIPPED_LOG"
+fi
 echo ">>> All done. Results under: $BASE_LOG_DIR"
