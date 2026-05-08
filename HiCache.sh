@@ -49,6 +49,7 @@
 #   ./HiCache.sh --bench longcontext                 # needs loogle dataset
 #   ./HiCache.sh --cache-mode hicache_file
 #   ./HiCache.sh --sweep                             # run all 4 cache modes back-to-back
+#   ./HiCache.sh --sweep --hicache-size-sweep "64 128 256"   # cross-platform fairness
 #   ./HiCache.sh --model-preset gpt-oss-120b
 #   ./HiCache.sh --model /data/path/to/MyModel       # override preset
 #   ./HiCache.sh --tp 4 --tag 0508_TP4
@@ -94,6 +95,13 @@ DATASET_PATH=""
 # [32, 512] GB (cache-hit returns flatten well before 512 GB per rank).
 HICACHE_SIZE="auto"
 
+# Cross-platform fairness sweep: when comparing MI355X vs B200, fix
+# --hicache-size to the same set of values on both boxes so HiCache L2
+# capacity is identical between platforms (DRAM is an OEM choice, not a
+# GPU spec). --hicache-size-sweep "64 128 256" runs each hicache_* mode
+# with each size; non-hicache modes (no_radix, radix) are unaffected.
+HICACHE_SIZE_SWEEP=""
+
 # Multi-turn defaults (from LMSys blog reference run)
 NUM_CLIENTS=80
 NUM_ROUNDS=10
@@ -125,6 +133,7 @@ while [[ $# -gt 0 ]]; do
     --docker)         DOCKER="$2"; shift 2;;
     --dataset-path)   DATASET_PATH="$2"; shift 2;;
     --hicache-size)   HICACHE_SIZE="$2"; shift 2;;
+    --hicache-size-sweep) HICACHE_SIZE_SWEEP="$2"; shift 2;;
     --num-clients)    NUM_CLIENTS="$2"; shift 2;;
     --num-rounds)     NUM_ROUNDS="$2"; shift 2;;
     --request-length) REQUEST_LENGTH="$2"; shift 2;;
@@ -209,7 +218,10 @@ auto_hicache_size() {
   echo "$per_rank"
 }
 
-if [ "$HICACHE_SIZE" = "auto" ]; then
+if [ -n "$HICACHE_SIZE_SWEEP" ]; then
+  echo ">>> --hicache-size-sweep: ${HICACHE_SIZE_SWEEP} GB per rank" \
+       "(each value will run once per hicache_* mode)"
+elif [ "$HICACHE_SIZE" = "auto" ]; then
   HICACHE_SIZE=$(auto_hicache_size) || exit 1
   mem_avail_gb=$(awk '/^MemAvailable:/ {print int($2/1024/1024)}' /proc/meminfo)
   echo ">>> auto --hicache-size: ${HICACHE_SIZE} GB per rank" \
@@ -562,8 +574,9 @@ bench_random_long() {
 
 # ============================== Run-one ==============================
 run_one() {
+  # Caller is expected to have set LOG_DIR and (for hicache_* modes)
+  # HICACHE_SIZE so build_server_cmd picks them up.
   local cache_mode=$1
-  LOG_DIR="${BASE_LOG_DIR}/${cache_mode}"
   mkdir -p "$LOG_DIR"
   if [ "$BENCH_MODE" = "multiturn" ] || [ "$BENCH_MODE" = "longcontext" ]; then
     export SGLANG_TORCH_PROFILER_DIR="$LOG_DIR"
@@ -588,11 +601,34 @@ else
   CACHE_MODES=("$CACHE_MODE")
 fi
 
+# When --hicache-size-sweep is set, hicache_* modes run once per size;
+# non-hicache modes (no_radix, radix) ignore size and run only once.
+if [ -n "$HICACHE_SIZE_SWEEP" ]; then
+  SIZE_LIST=( $HICACHE_SIZE_SWEEP )
+else
+  SIZE_LIST=( "$HICACHE_SIZE" )
+fi
+
 for cm in "${CACHE_MODES[@]}"; do
-  echo "================================================================"
-  echo ">>> [HiCache.sh] cache_mode=$cm  bench=$BENCH_MODE  model=$MODEL_NAME"
-  echo "================================================================"
-  run_one "$cm"
+  if [[ "$cm" == hicache* ]]; then
+    sizes_to_run=( "${SIZE_LIST[@]}" )
+  else
+    sizes_to_run=( "_unused_" )
+  fi
+  for sz in "${sizes_to_run[@]}"; do
+    if [ "$sz" != "_unused_" ]; then
+      HICACHE_SIZE="$sz"
+      LOG_DIR="${BASE_LOG_DIR}/${cm}/size_${sz}"
+      banner_size="  hicache_size=${sz} GB"
+    else
+      LOG_DIR="${BASE_LOG_DIR}/${cm}"
+      banner_size=""
+    fi
+    echo "================================================================"
+    echo ">>> [HiCache.sh] cache_mode=${cm}${banner_size}  bench=${BENCH_MODE}  model=${MODEL_NAME}"
+    echo "================================================================"
+    run_one "$cm"
+  done
 done
 
 echo ">>> All done. Results under: $BASE_LOG_DIR"
