@@ -122,14 +122,6 @@ HOST_HEADROOM_GB_DEFAULT=200
 # Pass an empty string ("") or a single-value list to disable sweep.
 HICACHE_SIZE_SWEEP="192 256 320"
 
-# Workload sweep: scale --num-clients so the multiturn working set hits a
-# target fraction of L1 (per-model, computed from KV cost / token / rank).
-# Empty = use --num-clients as-is. Example "0.5 1.0 2.0 4.0" runs the
-# benchmark four times: 0.5× L1 (small enough to test HiCache overhead),
-# 1.0× L1 (eviction boundary), 2.0× L1 (HiCache L2 starts mattering),
-# 4.0× L1 (heavy stress; will spill to L3 if a backend is configured).
-WORKLOAD_SWEEP=""
-
 # Multi-turn defaults (from LMSys blog reference run)
 NUM_CLIENTS=80
 NUM_ROUNDS=10
@@ -163,7 +155,6 @@ while [[ $# -gt 0 ]]; do
     --hicache-size)   HICACHE_SIZE="$2"; shift 2;;
     --hicache-size-sweep) HICACHE_SIZE_SWEEP="$2"; shift 2;;
     --host-headroom-gb)   HOST_HEADROOM_GB_OVERRIDE="$2"; shift 2;;
-    --workload-sweep) WORKLOAD_SWEEP="$2"; shift 2;;
     --no-numa-interleave) USE_NUMA_INTERLEAVE="false"; shift 1;;
     --num-clients)    NUM_CLIENTS="$2"; shift 2;;
     --num-rounds)     NUM_ROUNDS="$2"; shift 2;;
@@ -274,47 +265,16 @@ get_gpu_hbm_gb() {
   fi
 }
 HBM_GB=$(get_gpu_hbm_gb)
-# Per-model: weight footprint + per-token KV cost (per rank, FP8 KV cache).
-# KV cost depends on attention type:
-#   - MLA (DeepSeek):  KV cache REPLICATED across TP ranks. per-rank cost
-#     = full-model cost. DSR1: kv_lora 512 + qk_rope 64 = 576 elements × 61
-#     layers = 35136 elements × 1 byte = ~35 KB/token/rank.
-#   - GQA (GPT-OSS):   KV cache SHARDED by num_kv_heads across TP ranks
-#     (1 head per rank at TP=8). GPT-OSS: 8 KV heads × 64 head_dim × 2(K+V)
-#     × 18 full-attn layers (the other 18 are sliding-window so don't grow)
-#     = 18432 elements full / 8 = 2304 elements per rank × 1 byte ≈ 2.3 KB.
 case "$MODEL_FAMILY" in
-  deepseek)
-    PER_RANK_WEIGHT_GB=$(( 671 / TP_SIZE ))
-    KV_KB_PER_TOKEN_PER_RANK=35
-    ;;
-  gpt-oss)
-    PER_RANK_WEIGHT_GB=$(( 60  / TP_SIZE ))
-    KV_KB_PER_TOKEN_PER_RANK=3   # round up 2.3
-    ;;
-  *)
-    PER_RANK_WEIGHT_GB=0
-    KV_KB_PER_TOKEN_PER_RANK=0   # unknown → disable workload-sweep
-    ;;
+  deepseek) PER_RANK_WEIGHT_GB=$(( 671 / TP_SIZE )) ;;  # ~84 GB at TP=8
+  gpt-oss)  PER_RANK_WEIGHT_GB=$(( 60  / TP_SIZE )) ;;  # ~7  GB at TP=8
+  *)        PER_RANK_WEIGHT_GB=0 ;;
 esac
 # 0.85 mem-fraction-static * HBM, minus weights = device KV pool per rank.
 DEVICE_POOL_GB=$(( HBM_GB * 85 / 100 - PER_RANK_WEIGHT_GB ))
 [ "$DEVICE_POOL_GB" -lt 0 ] && DEVICE_POOL_GB=0
-
-# Tokens needed in working set to fill the GPU L1 cache to 100%.
-# With MLA-replicated cache: total-conversation tokens = L1_GB / KV_KB_per_token / 1024 / 1024 × 1024^3.
-# With GQA-sharded cache: same formula because per-rank cost already accounts for shard.
-if [ "$KV_KB_PER_TOKEN_PER_RANK" -gt 0 ]; then
-  TOKENS_FOR_L1=$(( DEVICE_POOL_GB * 1024 * 1024 / KV_KB_PER_TOKEN_PER_RANK ))
-else
-  TOKENS_FOR_L1=0
-fi
 echo ">>> est. per-rank GPU KV pool: ${DEVICE_POOL_GB} GB" \
      "(HBM=${HBM_GB} GB × 0.85 − ${PER_RANK_WEIGHT_GB} GB weights, model=${MODEL_FAMILY})"
-[ "$TOKENS_FOR_L1" -gt 0 ] && \
-  echo ">>> est. working-set tokens to fill L1 (1.0× L1):" \
-       "$(printf '%d\n' $TOKENS_FOR_L1) tokens" \
-       "(at ${KV_KB_PER_TOKEN_PER_RANK} KB/token per-rank)"
 
 if [ -n "$HICACHE_SIZE_SWEEP" ]; then
   echo ">>> --hicache-size-sweep: '${HICACHE_SIZE_SWEEP}' GB per rank" \
@@ -842,32 +802,6 @@ else
   SIZE_LIST=( "$HICACHE_SIZE" )
 fi
 
-# When --workload-sweep is set, every (cache_mode, hicache_size) pair runs
-# once per L1-multiplier, with NUM_CLIENTS auto-scaled to hit that target.
-# Empty list = single run with whatever --num-clients is set to.
-if [ -n "$WORKLOAD_SWEEP" ]; then
-  WORKLOAD_LIST=( $WORKLOAD_SWEEP )
-  if [ "$TOKENS_FOR_L1" -le 0 ]; then
-    echo "ERROR: --workload-sweep set but per-token KV cost unknown for" \
-         "model preset '${MODEL_PRESET}'. Use --model-preset deepseek-r1-0528" \
-         "or gpt-oss-120b, or omit --workload-sweep." >&2
-    exit 1
-  fi
-else
-  WORKLOAD_LIST=( "_unused_" )
-fi
-
-# Compute NUM_CLIENTS for a given L1 multiplier. Echoes the resolved
-# integer, or 0 if the result is below 1 (caller should skip).
-clients_for_workload() {
-  local mult=$1   # e.g. "1.0", "0.5", "2.0"
-  local round_x_req=$(( NUM_ROUNDS * REQUEST_LENGTH ))
-  [ "$round_x_req" -le 0 ] && { echo 0; return; }
-  # working_set_tokens = mult × TOKENS_FOR_L1 (integer math via *100)
-  awk -v m="$mult" -v t="$TOKENS_FOR_L1" -v r="$round_x_req" \
-      'BEGIN{nc = int(m * t / r); if (nc < 1) nc = 0; printf "%d\n", nc}'
-}
-
 SKIPPED_LOG="${BASE_LOG_DIR}/skipped.log"
 # Append to skipped.log instead of truncating, so re-runs preserve history.
 touch "$SKIPPED_LOG"
@@ -904,45 +838,22 @@ for cm in "${CACHE_MODES[@]}"; do
         continue
       fi
       HICACHE_SIZE="$sz"
-      LOG_DIR_BASE="${BASE_LOG_DIR}/${cm}/size_${sz}"
+      LOG_DIR="${BASE_LOG_DIR}/${cm}/size_${sz}"
       banner_size="  hicache_size=${sz} GB"
     else
-      LOG_DIR_BASE="${BASE_LOG_DIR}/${cm}"
+      LOG_DIR="${BASE_LOG_DIR}/${cm}"
       banner_size=""
     fi
-
-    # --- workload sweep: scale NUM_CLIENTS to hit a target × L1 working set ---
-    for wl in "${WORKLOAD_LIST[@]}"; do
-      ORIGINAL_NUM_CLIENTS=$NUM_CLIENTS
-      if [ "$wl" != "_unused_" ]; then
-        NUM_CLIENTS=$(clients_for_workload "$wl")
-        if [ "$NUM_CLIENTS" -le 0 ]; then
-          msg="[skip] ${cm}${banner_size:+/size_$sz}/wl_${wl}xL1:"
-          msg+=" 0 clients computed for ${wl}× L1 (TOKENS_FOR_L1=${TOKENS_FOR_L1},"
-          msg+=" rounds=${NUM_ROUNDS}, req_len=${REQUEST_LENGTH})"
-          skip_run "$msg"
-          NUM_CLIENTS=$ORIGINAL_NUM_CLIENTS
-          continue
-        fi
-        LOG_DIR="${LOG_DIR_BASE}/wl_${wl}xL1"
-        banner_wl="  workload=${wl}×L1 (num_clients=${NUM_CLIENTS})"
-      else
-        LOG_DIR="${LOG_DIR_BASE}"
-        banner_wl=""
-      fi
-      # --- idempotency: skip if a non-empty bench_multiturn.jsonl exists ---
-      if [ "$BENCH_MODE" = "multiturn" ] && [ -s "${LOG_DIR}/bench_multiturn.jsonl" ]; then
-        msg="[done] ${cm}${banner_size:+/size_${sz}}${banner_wl:+/wl_${wl}xL1}: already have bench_multiturn.jsonl, skipping"
-        echo "$msg"
-        NUM_CLIENTS=$ORIGINAL_NUM_CLIENTS
-        continue
-      fi
-      echo "================================================================"
-      echo ">>> [HiCache.sh] cache_mode=${cm}${banner_size}${banner_wl}  bench=${BENCH_MODE}  model=${MODEL_NAME}"
-      echo "================================================================"
-      run_one "$cm"
-      NUM_CLIENTS=$ORIGINAL_NUM_CLIENTS
-    done
+    # --- idempotency: skip if a non-empty bench_multiturn.jsonl exists ---
+    if [ "$BENCH_MODE" = "multiturn" ] && [ -s "${LOG_DIR}/bench_multiturn.jsonl" ]; then
+      msg="[done] ${cm}${banner_size:+/size_${sz}}: already have non-empty bench_multiturn.jsonl, skipping"
+      echo "$msg"
+      continue
+    fi
+    echo "================================================================"
+    echo ">>> [HiCache.sh] cache_mode=${cm}${banner_size}  bench=${BENCH_MODE}  model=${MODEL_NAME}"
+    echo "================================================================"
+    run_one "$cm"
   done
 done
 
