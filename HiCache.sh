@@ -11,8 +11,9 @@
 # Cache hierarchy (HiCache extends RadixCache: HiRadixCache(RadixCache) — the
 # two flags are mutually exclusive, so the modes below pick exactly one path):
 #   L1 = GPU HBM         (RadixAttention prefix tree)
-#   L2 = host DRAM       (--hicache-size 256 GB per rank ⇒ ~2 TB total on
-#                         this 8× MI355X / 3 TiB box; see HICACHE_SIZE note)
+#   L2 = host DRAM       (--hicache-size N GB per rank, default "auto" picks
+#                         a value that fits in detected MemAvailable; see
+#                         auto_hicache_size() — overridable via --hicache-size)
 #   L3 = external store  (file / hf3fs / mooncake / nixl)
 #
 # Cache modes (recommended sweep: no_radix → radix → hicache → hicache_file):
@@ -78,11 +79,13 @@ USER_TAG=""
 DOCKER="untagged-docker"
 DATASET_PATH=""
 
-# --hicache-size is per-TP-rank (in GB). On this 8× MI355X / 3 TiB CPU-RAM
-# box: per-rank GPU KV pool ≈ 160 GB (DSR1) / 237 GB (GPT-OSS), so 256 GB
-# beats GPU pool while keeping total host pool ≈ 2 TB (8 × 256), well within
-# the 2.9 TiB of available DRAM. Overrides --hicache-ratio when both are set.
-HICACHE_SIZE=256
+# --hicache-size is per-TP-rank (in GB). Default "auto" picks a value at
+# startup based on detected MemAvailable so the same script can run on
+# boxes with different DRAM (e.g. 3 TiB MI355X box vs 2 TB B200 server)
+# without manual tuning. The formula reserves 400 GB headroom for OS /
+# page cache / SGLang activations and divides the rest across TP ranks,
+# rounded down to the nearest 32 GB. Override with --hicache-size N.
+HICACHE_SIZE="auto"
 
 # Multi-turn defaults (from LMSys blog reference run)
 NUM_CLIENTS=80
@@ -171,6 +174,41 @@ if [[ "$MODEL_PATH" == /* ]] && [ ! -d "$MODEL_PATH" ]; then
   echo "ERROR: model path does not exist: $MODEL_PATH" >&2
   echo "       Pass --model PATH (local dir or HF identifier) to override." >&2
   exit 1
+fi
+
+# ============================== Resolve --hicache-size ==============================
+auto_hicache_size() {
+  # Pick a per-rank hicache-size (GB) that fits in the host's available
+  # DRAM with 400 GB headroom for OS / page cache / SGLang activations.
+  # Rounds down to nearest 32 GB; clamps to >=32 GB and <=512 GB so we
+  # don't blow past sensible per-rank pool sizes on huge-RAM machines.
+  local mem_avail_kb mem_avail_gb headroom_gb usable_gb per_rank
+  mem_avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+  mem_avail_gb=$(( mem_avail_kb / 1024 / 1024 ))
+  headroom_gb=400
+  usable_gb=$(( mem_avail_gb - headroom_gb ))
+  if [ "$usable_gb" -le 0 ]; then
+    echo "ERROR: only ${mem_avail_gb} GB MemAvailable, cannot reserve" >&2
+    echo "       ${headroom_gb} GB headroom for HiCache. Pass --hicache-size N" >&2
+    echo "       manually (per-rank, in GB) or free up DRAM." >&2
+    return 1
+  fi
+  per_rank=$(( usable_gb / TP_SIZE ))
+  per_rank=$(( per_rank / 32 * 32 ))
+  [ "$per_rank" -lt 32  ] && per_rank=32
+  [ "$per_rank" -gt 512 ] && per_rank=512
+  echo "$per_rank"
+}
+
+if [ "$HICACHE_SIZE" = "auto" ]; then
+  HICACHE_SIZE=$(auto_hicache_size) || exit 1
+  mem_avail_gb=$(awk '/^MemAvailable:/ {print int($2/1024/1024)}' /proc/meminfo)
+  echo ">>> auto --hicache-size: ${HICACHE_SIZE} GB per rank" \
+       "(TP=${TP_SIZE}, MemAvailable=${mem_avail_gb} GB," \
+       "total host pool ≈ $(( HICACHE_SIZE * TP_SIZE )) GB)"
+else
+  echo ">>> manual --hicache-size: ${HICACHE_SIZE} GB per rank" \
+       "(total host pool ≈ $(( HICACHE_SIZE * TP_SIZE )) GB)"
 fi
 
 # ============================== Output dirs ==============================
@@ -267,13 +305,11 @@ build_server_cmd() {
   # ---------- Model-family-specific tuning ----------
   case "$MODEL_FAMILY" in
     deepseek)
-      # DSR1-0528: native FP8 block-scale weights (auto-detected from
-      # config.json's quantization_config; --quantization fp8 here is the
-      # same defensive hint GLM.sh uses — redundant when config is right,
-      # harmless if it is, useful as fallback for non-standard checkpoints).
-      # MLA attention, 64-page for HiCache I/O efficiency, FP8 KV cache.
+      # DSR1-0528: native FP8 block-scale weights, auto-detected from
+      # config.json's quantization_config (quant_method=fp8, weight_block_
+      # size=[128,128]). MLA attention, 64-page for HiCache I/O efficiency,
+      # FP8 KV cache to halve KV memory.
       cmd+=(
-        --quantization fp8
         --kv-cache-dtype fp8_e4m3
         --page-size 64
         --context-length 65536
