@@ -89,17 +89,20 @@ USE_NUMA_INTERLEAVE="true"
 # --hicache-size is per-TP-rank (in GB). Default "auto" picks a value at
 # startup from detected MemAvailable so the same script runs on boxes
 # with different DRAM (e.g. 3 TiB MI355X vs 2 TB B200) without tuning.
-# The formula reserves 400 GB of host headroom — NOT for GPU activations
-# (those live on GPU and are bounded by --mem-fraction-static), but for
-# CPU-side things that compete with HiCache L2 for DRAM:
-#   - Linux page cache (dominates while loading hundreds of GB of weights
-#     from /data; getting squeezed slows model load to a crawl)
-#   - HiCache's own pinned-memory staging buffers for L1↔L2 / L2↔L3 DMA
-#   - NUMA-fragmentation slack across 8 ranks pinning DRAM concurrently
-#   - SGLang scheduler / tokenizer / HTTP server / per-batch host tensors
+#
+# Host headroom defaults to 200 GB (was 400 GB earlier; that was 3-4×
+# safety, lowered after measuring real usage):
+#   - Page cache after model load: ~50-100 GB
+#   - HiCache pinned-mem staging buffers: ~10-30 GB
+#   - SGLang process group (master + workers): ~10-20 GB
+#   - Per-batch host tensors: ~1-5 GB
+#   - NUMA fragmentation slack: ~5%
+#   total ~80-170 GB; 200 GB is a comfortable margin
+# Override with --host-headroom-gb if you need more (or less) reserved.
 # Per-rank pool is rounded down to a 32 GB multiple and clamped to
 # [32, 512] GB (cache-hit returns flatten well before 512 GB per rank).
 HICACHE_SIZE="auto"
+HOST_HEADROOM_GB_DEFAULT=200
 
 # Cross-platform fairness sweep: when comparing MI355X vs B200, fix
 # --hicache-size to the same set of values on both boxes so HiCache L2
@@ -151,6 +154,7 @@ while [[ $# -gt 0 ]]; do
     --dataset-path)   DATASET_PATH="$2"; shift 2;;
     --hicache-size)   HICACHE_SIZE="$2"; shift 2;;
     --hicache-size-sweep) HICACHE_SIZE_SWEEP="$2"; shift 2;;
+    --host-headroom-gb)   HOST_HEADROOM_GB_OVERRIDE="$2"; shift 2;;
     --no-numa-interleave) USE_NUMA_INTERLEAVE="false"; shift 1;;
     --num-clients)    NUM_CLIENTS="$2"; shift 2;;
     --num-rounds)     NUM_ROUNDS="$2"; shift 2;;
@@ -239,8 +243,38 @@ auto_hicache_size() {
 # Cache MemAvailable once at startup so the per-size DRAM check in the
 # sweep loop is consistent and cheap (no repeated /proc/meminfo reads).
 MEM_AVAIL_GB=$(awk '/^MemAvailable:/ {print int($2/1024/1024)}' /proc/meminfo)
-HOST_HEADROOM_GB=400
+HOST_HEADROOM_GB=${HOST_HEADROOM_GB_OVERRIDE:-$HOST_HEADROOM_GB_DEFAULT}
 USABLE_HOST_GB=$(( MEM_AVAIL_GB - HOST_HEADROOM_GB ))
+
+# Estimate the per-rank GPU KV cache pool that SGLang will allocate.
+# SGLang asserts host-pool > device-pool inside HiRadixCache, so we use
+# this estimate to fail-fast on hicache-size values that are guaranteed
+# to crash the server at startup. Overestimating slightly (and skipping
+# borderline configs) is much cheaper than waiting for wait_for_server
+# timeout. Per-model weight footprint is hard-coded for known presets
+# and skipped for `--model-preset custom` (let SGLang fail naturally).
+get_gpu_hbm_gb() {
+  if command -v rocm-smi >/dev/null 2>&1; then
+    rocm-smi --showmeminfo vram 2>/dev/null \
+      | awk '/VRAM Total Memory/ {print int($NF/1024/1024/1024); exit}'
+  elif command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
+      | head -1 | awk '{print int($1/1024)}'
+  else
+    echo 0
+  fi
+}
+HBM_GB=$(get_gpu_hbm_gb)
+case "$MODEL_FAMILY" in
+  deepseek) PER_RANK_WEIGHT_GB=$(( 671 / TP_SIZE )) ;;  # ~84 GB at TP=8
+  gpt-oss)  PER_RANK_WEIGHT_GB=$(( 60  / TP_SIZE )) ;;  # ~7  GB at TP=8
+  *)        PER_RANK_WEIGHT_GB=0 ;;
+esac
+# 0.85 mem-fraction-static * HBM, minus weights = device KV pool per rank.
+DEVICE_POOL_GB=$(( HBM_GB * 85 / 100 - PER_RANK_WEIGHT_GB ))
+[ "$DEVICE_POOL_GB" -lt 0 ] && DEVICE_POOL_GB=0
+echo ">>> est. per-rank GPU KV pool: ${DEVICE_POOL_GB} GB" \
+     "(HBM=${HBM_GB} GB × 0.85 − ${PER_RANK_WEIGHT_GB} GB weights, model=${MODEL_FAMILY})"
 
 if [ -n "$HICACHE_SIZE_SWEEP" ]; then
   echo ">>> --hicache-size-sweep: '${HICACHE_SIZE_SWEEP}' GB per rank" \
@@ -769,7 +803,14 @@ else
 fi
 
 SKIPPED_LOG="${BASE_LOG_DIR}/skipped.log"
-: > "$SKIPPED_LOG"
+# Append to skipped.log instead of truncating, so re-runs preserve history.
+touch "$SKIPPED_LOG"
+
+skip_run() {
+  # Args: $1 = msg
+  echo "$1"
+  echo "$1" >> "$SKIPPED_LOG"
+}
 
 for cm in "${CACHE_MODES[@]}"; do
   if [[ "$cm" == hicache* ]]; then
@@ -779,13 +820,21 @@ for cm in "${CACHE_MODES[@]}"; do
   fi
   for sz in "${sizes_to_run[@]}"; do
     if [ "$sz" != "_unused_" ]; then
+      # --- DRAM check ---
       total_pool_gb=$(( sz * TP_SIZE ))
       if [ "$total_pool_gb" -gt "$USABLE_HOST_GB" ]; then
-        msg="[skip] ${cm}/size_${sz}: needs ${total_pool_gb} GB host pool" \
-            "(${sz} × TP=${TP_SIZE}), only ${USABLE_HOST_GB} GB usable" \
-            "(MemAvailable=${MEM_AVAIL_GB} GB − ${HOST_HEADROOM_GB} GB headroom)"
-        echo "$msg"
-        echo "$msg" >> "$SKIPPED_LOG"
+        msg="[skip] ${cm}/size_${sz}: needs ${total_pool_gb} GB host pool"
+        msg+=" (${sz} × TP=${TP_SIZE}), only ${USABLE_HOST_GB} GB usable"
+        msg+=" (MemAvailable=${MEM_AVAIL_GB} GB - ${HOST_HEADROOM_GB} GB headroom)"
+        skip_run "$msg"
+        continue
+      fi
+      # --- host > device check ---
+      if [ "$DEVICE_POOL_GB" -gt 0 ] && [ "$sz" -le "$DEVICE_POOL_GB" ]; then
+        msg="[skip] ${cm}/size_${sz}: hicache-size ${sz} GB <= est. device pool"
+        msg+=" ${DEVICE_POOL_GB} GB (HBM=${HBM_GB} GB × 0.85 - ${PER_RANK_WEIGHT_GB} GB)."
+        msg+=" SGLang HiRadixCache asserts host > device."
+        skip_run "$msg"
         continue
       fi
       HICACHE_SIZE="$sz"
@@ -795,6 +844,12 @@ for cm in "${CACHE_MODES[@]}"; do
       LOG_DIR="${BASE_LOG_DIR}/${cm}"
       banner_size=""
     fi
+    # --- idempotency: skip if a non-empty bench_multiturn.jsonl exists ---
+    if [ "$BENCH_MODE" = "multiturn" ] && [ -s "${LOG_DIR}/bench_multiturn.jsonl" ]; then
+      msg="[done] ${cm}${banner_size:+/size_${sz}}: already have non-empty bench_multiturn.jsonl, skipping"
+      echo "$msg"
+      continue
+    fi
     echo "================================================================"
     echo ">>> [HiCache.sh] cache_mode=${cm}${banner_size}  bench=${BENCH_MODE}  model=${MODEL_NAME}"
     echo "================================================================"
@@ -803,7 +858,7 @@ for cm in "${CACHE_MODES[@]}"; do
 done
 
 if [ -s "$SKIPPED_LOG" ]; then
-  echo ">>> Skipped runs (DRAM insufficient) — see $SKIPPED_LOG"
+  echo ">>> Skipped runs — see $SKIPPED_LOG"
   cat "$SKIPPED_LOG"
 fi
 echo ">>> All done. Results under: $BASE_LOG_DIR"
