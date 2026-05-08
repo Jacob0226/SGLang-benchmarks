@@ -3,35 +3,45 @@
 
 Reproduces the "Per-turn Performance" figure style of the Mooncake
 HiCache benchmark page (https://kvcache-ai.github.io/Mooncake/
-performance/sglang-hicache-benchmark-results-v1.html), but with multiple
-platform tags overlaid so MI355X-vs-B200 cascade through L1 → L2 → L3
-is visible at a glance.
+performance/sglang-hicache-benchmark-results-v1.html), with explicit
+MI355X vs B200 jsonl files passed in for a 1-vs-1 cross-platform
+comparison.
 
 Inputs:
-  Walks ~/SGLang-benchmarks/results/ for bench_multiturn.jsonl files
-  produced by HiCache.sh, grouped by (tag, cache_mode, hicache_size).
-  Each file's "round" dict provides per-round average_ttft and
-  cache_hit_rate that get plotted as one curve.
+  Each --MI355X / --B200 flag points at a single bench_multiturn.jsonl
+  produced by HiCache.sh. The first JSON line's "round" dict provides
+  per-round average_ttft and cache_hit_rate that get plotted as one
+  curve. Cache mode and hicache size are auto-extracted from the file
+  path if it follows HiCache.sh's
+    results/<docker>/<MODEL>-HiCache[-<tag>]/<cache_mode>/[size_N]/
+  layout; otherwise just the platform tag is shown in the legend.
+
+Paths:
+  All paths (--MI355X / --B200 / --out) are resolved to absolute at
+  parse time, so relative inputs still work but the rendered PNG always
+  lands in a predictable spot regardless of cwd. The success message
+  prints the resolved absolute path. Examples use $HOME-prefixed paths
+  for clarity.
 
 Usage:
-  # Plot all tags that contain "MI355X" or "B200":
-  python3 plot_cascade.py --tags MI355X_cascade B200_cascade --out cascade.png
+  # MI355X vs B200, same cache mode (auto-detected from path):
+  python3 plot_cascade.py \
+      --Title "DSR1-0528 HiCache L3_file (192 GB)" \
+      --MI355X $HOME/SGLang-benchmarks/results/<rocm-docker>/DeepSeek-R1-0528-cascade-MI355X_cascade/L3_file/size_192/bench_multiturn.jsonl \
+      --B200   $HOME/SGLang-benchmarks/results/<cuda-docker>/DeepSeek-R1-0528-cascade-B200_cascade/L3_file/size_192/bench_multiturn.jsonl \
+      --out    $HOME/SGLang-benchmarks/results/cascade_L3_file_192.png
 
-  # Plot only specific cache_modes (drop noise):
-  python3 plot_cascade.py --tags MI355X_cascade B200_cascade \
-                          --cache-modes radix hicache hicache_file \
-                          --hicache-size 192 \
-                          --out cascade.png
-
-  # Just one platform, all cache_modes:
-  python3 plot_cascade.py --tags MI355X_cascade --out mi355x.png
+  # Single platform also works (just drop the other flag):
+  python3 plot_cascade.py \
+      --Title "MI355X HiCache L2" \
+      --MI355X $HOME/SGLang-benchmarks/results/<rocm-docker>/DeepSeek-R1-0528-cascade-MI355X_cascade/L2/size_192/bench_multiturn.jsonl \
+      --out    $HOME/SGLang-benchmarks/results/mi355x_L2.png
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 from pathlib import Path
@@ -96,7 +106,13 @@ TAG_LINESTYLE = {
 }
 
 
-def parse_path(path: Path, root: Path) -> dict | None:
+def parse_path(path: Path) -> dict | None:
+    """Extract (tag, cache_mode, size) from a HiCache.sh-style results path.
+
+    Returns None when the path is anywhere outside results/ or doesn't
+    match the expected layout — caller is expected to fall back to a
+    minimal stub dict in that case.
+    """
     abs_str = str(path.resolve())
     idx = abs_str.find("/results/")
     if idx == -1:
@@ -135,31 +151,6 @@ def load_round_data(jsonl_path: Path) -> tuple[list[float], list[float]]:
             hit  = [r[k]["cache_hit_rate"]    for k in keys]
             return ttft, hit
     return [], []
-
-
-def discover_runs(root: Path, tags: list[str], cache_modes: list[str] | None,
-                  hicache_size: int | None) -> list[dict]:
-    runs = []
-    for path in root.rglob("bench_multiturn.jsonl"):
-        if path.stat().st_size == 0:
-            continue
-        meta = parse_path(path, root)
-        if not meta:
-            continue
-        if tags and meta["tag"] not in tags:
-            continue
-        if cache_modes and meta["cache_mode"] not in cache_modes:
-            continue
-        if hicache_size is not None and meta["cache_mode"].startswith("hicache") \
-                and meta["size"] != hicache_size:
-            continue
-        ttft, hit = load_round_data(path)
-        if not ttft:
-            continue
-        meta["ttft"] = ttft
-        meta["hit"] = hit
-        runs.append(meta)
-    return runs
 
 
 def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
@@ -215,8 +206,9 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
             color = CACHE_MODE_COLOR.get(r["cache_mode"], "black")
             linestyle, marker = TAG_LINESTYLE.get(tag_idx, ("solid", "o"))
 
-        size_suffix = f"_{r['size']}" if r["size"] is not None else ""
-        label = f"[{r['tag']}] {CACHE_MODE_LABEL.get(r['cache_mode'], r['cache_mode'])}{size_suffix}"
+        mode_label = CACHE_MODE_LABEL.get(r["cache_mode"], r["cache_mode"])
+        size_suffix = f" ({r['size']} GB)" if r["size"] is not None else ""
+        label = f"[{r['tag']}] {mode_label}{size_suffix}".strip()
 
         ax_ttft.plot(rounds, r["ttft"], label=label,
                      color=color, linestyle=linestyle, marker=marker, markersize=6)
@@ -235,45 +227,58 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
     print(f"Wrote {out_path} ({len(runs)} curves)")
 
 
-def default_out_path(runs: list[dict], root: Path) -> Path:
-    """Pick a sensible default output location:
-      - 1 tag, 1 cache_mode → drop the PNG inside that bench folder
-      - multiple tags or modes → drop a comparison PNG in <root>/cascade/
-    """
-    tags  = sorted({r["tag"] for r in runs})
-    modes = sorted({r["cache_mode"] for r in runs})
-    if len(tags) == 1 and len(modes) == 1:
-        # use the parent of the bench dir (i.e. the size_N or cache_mode dir)
-        return runs[0]["path"].parent / f"cascade_{tags[0]}_{modes[0]}.png"
-    fname = "cascade_" + "_vs_".join(tags) + ".png"
-    out_dir = root / "cascade"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    return out_dir / fname
-
-
 def main():
-    p = argparse.ArgumentParser()
-    default_root = Path(os.environ.get("HOME", "~")).expanduser() / "SGLang-benchmarks" / "results"
-    p.add_argument("--root-dir", default=str(default_root),
-                   help="Top-level results dir (default: %(default)s)")
-    p.add_argument("--tags", nargs="+", required=True,
-                   help="One or more --tag values to overlay (e.g. MI355X_cascade B200_cascade)")
-    p.add_argument("--cache-modes", nargs="+", default=None,
-                   help="Filter to specific cache modes (default: all found)")
-    p.add_argument("--hicache-size", type=int, default=None,
-                   help="If set, only plot hicache_* runs at this --hicache-size GB")
-    p.add_argument("--title", default=None, help="Optional plot title")
-    p.add_argument("--out", default=None,
-                   help="Output PNG path (default: inside the run's bench folder "
-                        "for single-tag/single-mode, else <root>/cascade/)")
+    p = argparse.ArgumentParser(
+        description="Plot per-round TTFT / cache-hit-rate from MI355X vs B200 "
+                    "bench_multiturn.jsonl files (HiCache.sh output).",
+    )
+    p.add_argument("--Title", default=None, help="Plot title")
+    p.add_argument("--MI355X", default=None,
+                   help="Path to MI355X bench_multiturn.jsonl")
+    p.add_argument("--B200", default=None,
+                   help="Path to B200 bench_multiturn.jsonl")
+    p.add_argument("--out", required=True, help="Output PNG path")
     args = p.parse_args()
 
-    root = Path(args.root_dir).expanduser().resolve()
-    runs = discover_runs(root, args.tags, args.cache_modes, args.hicache_size)
+    sources = [
+        ("MI355X", args.MI355X),
+        ("B200",   args.B200),
+    ]
+    runs: list[dict] = []
+    for tag, jsonl_path in sources:
+        if jsonl_path is None:
+            continue
+        p_jsonl = Path(jsonl_path).expanduser()
+        if not p_jsonl.is_file():
+            sys.exit(f"ERROR: file not found: {jsonl_path}")
+        if p_jsonl.stat().st_size == 0:
+            sys.exit(f"ERROR: empty file: {jsonl_path}")
+
+        # Recover cache_mode / size from the path when it follows HiCache.sh's
+        # results/<docker>/<MODEL>-HiCache[-<tag>]/<cache_mode>/[size_N]/
+        # layout. Falls back to a stub when the path lives elsewhere — the
+        # legend then shows just the platform tag without mode/size details.
+        meta = parse_path(p_jsonl) or {
+            "tag": "", "cache_mode": "", "size": None, "path": p_jsonl,
+        }
+        meta["tag"] = tag  # user-specified --MI355X / --B200 always wins
+
+        ttft, hit = load_round_data(p_jsonl)
+        if not ttft:
+            sys.exit(f"ERROR: no per-round data in {jsonl_path}")
+        meta["ttft"] = ttft
+        meta["hit"] = hit
+        runs.append(meta)
+
     if not runs:
-        raise SystemExit("No runs found matching filters")
-    out_path = Path(args.out) if args.out else default_out_path(runs, root)
-    plot_cascade(runs, out_path, title=args.title)
+        sys.exit("ERROR: pass at least one of --MI355X / --B200")
+
+    # Always resolve --out to an absolute path so the PNG lands in a
+    # predictable spot regardless of cwd. Relative inputs still work,
+    # they just get attached to the cwd at parse time.
+    out_path = Path(args.out).expanduser().resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plot_cascade(runs, out_path, title=args.Title)
 
 
 if __name__ == "__main__":

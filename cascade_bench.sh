@@ -27,10 +27,12 @@
 #     ./cascade_bench.sh --tag MI355X --docker rocm/sgl-dev:v0.5.11-rocm720-mi35x-20260507
 #   On the B200 box:
 #     ./cascade_bench.sh --tag B200   --docker lmsysorg/sglang:v0.5.9-cu130
-#   Then locally:
-#     python3 plot_cascade.py --tags MI355X B200 --hicache-size 192 \
-#         --out cascade.png \
-#         --title "DSR1-0528 cascade: MI355X (288 GB HBM, 3 TB DRAM) vs B200 (192 GB, 2 TB)"
+#   Then locally (point each flag at the platform's bench_multiturn.jsonl):
+#     python3 plot_cascade.py \
+#         --Title "DSR1-0528 cascade: MI355X (288 GB HBM, 3 TB DRAM) vs B200 (192 GB, 2 TB)" \
+#         --MI355X results/<rocm-docker>/DeepSeek-R1-0528-HiCache-MI355X/L3_file/size_192/bench_multiturn.jsonl \
+#         --B200   results/<cuda-docker>/DeepSeek-R1-0528-HiCache-B200/L3_file/size_192/bench_multiturn.jsonl \
+#         --out    cascade.png
 #
 # All flags after --tag/--docker are forwarded to HiCache.sh, so you can
 # override individual cascade parameters if needed:

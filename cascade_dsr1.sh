@@ -26,9 +26,14 @@
 #   ./cascade_dsr1.sh --tag B200_cascade --docker lmsysorg/sglang:v0.5.9-cu130
 #
 # Plot once both done (matplotlib needed; runs inside docker if local
-# python doesn't have it):
-#   docker exec <container> python3 plot_cascade.py \
-#       --tags MI355X_cascade B200_cascade --hicache-size 192
+# python doesn't have it). Pass each platform's bench_multiturn.jsonl
+# explicitly via --MI355X / --B200, and use absolute paths so the output
+# PNG lands in a predictable spot regardless of cwd:
+#   python3 plot_cascade.py \
+#       --Title "DSR1-0528 cascade L3_file: MI355X vs B200" \
+#       --MI355X $HOME/SGLang-benchmarks/results/<rocm-docker>/DeepSeek-R1-0528-cascade-MI355X_cascade/L3_file/size_<N>/bench_multiturn.jsonl \
+#       --B200   $HOME/SGLang-benchmarks/results/<cuda-docker>/DeepSeek-R1-0528-cascade-B200_cascade/L3_file/size_<N>/bench_multiturn.jsonl \
+#       --out    $HOME/SGLang-benchmarks/results/cascade_dsr1.png
 
 set -euo pipefail
 set -x
@@ -319,5 +324,24 @@ if [ -d "$HICACHE_FILE_STORE_DIR" ]; then
   echo ">>> cleaned L3 file store (${sz:-?} reclaimed)"
 fi
 
+# Auto-suggest the right --MI355X / --B200 flag for plot_cascade.py
+# based on the user's --tag (so the printed command can be copy-pasted
+# straight into a shell). Falls back to --MI355X for unknown tags.
+case "$TAG" in
+  *MI355X*|*MI300*|*MI325*|*MI250*|*MI210*|*ROCm*|*rocm*|*amd*) PLOT_FLAG="--MI355X" ;;
+  *B200*|*H200*|*H100*|*A100*|*L40*|*nvidia*|*NVIDIA*)          PLOT_FLAG="--B200"  ;;
+  *)                                                            PLOT_FLAG="--MI355X" ;;  # generic fallback
+esac
+
 echo ">>> done. results in: $LOG_DIR"
-echo "    plot: python3 plot_cascade.py --tags $TAG --hicache-size $HICACHE_SIZE"
+echo "    plot (single platform, paths resolved to absolute):"
+echo "      python3 plot_cascade.py \\"
+echo "          --Title \"${MODEL_NAME} cascade ${TAG} (hicache=${HICACHE_SIZE} GB)\" \\"
+echo "          ${PLOT_FLAG} ${LOG_DIR}/bench_multiturn.jsonl \\"
+echo "          --out ${LOG_DIR}/cascade_${TAG}.png"
+echo "    plot (cross-platform, after running on the OTHER box too):"
+echo "      python3 plot_cascade.py \\"
+echo "          --Title \"${MODEL_NAME} cascade: MI355X vs B200\" \\"
+echo "          --MI355X <path-to-MI355X-bench_multiturn.jsonl> \\"
+echo "          --B200   <path-to-B200-bench_multiturn.jsonl> \\"
+echo "          --out    \$HOME/SGLang-benchmarks/results/cascade_${MODEL_NAME}.png"
