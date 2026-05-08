@@ -37,6 +37,27 @@ PATH_RE = re.compile(
     r"(?:/size_(?P<size>\d+))?/bench_multiturn\.jsonl$"
 )
 
+# Logical ordering used in the CSV: baselines first (no caching → GPU radix
+# only), then HiCache variants in increasing capacity order (L1+L2 → L1+L2
+# +file L3 → L1+L2+RDMA L3). Modes not listed get a large index and sort
+# alphabetically at the end.
+CACHE_MODE_ORDER = [
+    "no_radix",
+    "radix",
+    "hicache",
+    "hicache_file",
+    "hicache_hf3fs",
+    "hicache_mooncake",
+    "hicache_nixl",
+]
+
+
+def cache_mode_rank(name: str) -> int:
+    try:
+        return CACHE_MODE_ORDER.index(name)
+    except ValueError:
+        return len(CACHE_MODE_ORDER) + hash(name) % 1000
+
 # Order of columns in the long-table CSV.
 LONG_COLS = [
     "docker",
@@ -172,7 +193,7 @@ def collect_rows(root: Path, tag_filter: str | None) -> list[dict]:
             x[1].get("docker", ""),
             x[1].get("model", ""),
             x[1].get("tag", ""),
-            x[1].get("cache_mode", ""),
+            cache_mode_rank(x[1].get("cache_mode", "")),
             int(x[1].get("hicache_size_gb") or 0),
         )
     )
