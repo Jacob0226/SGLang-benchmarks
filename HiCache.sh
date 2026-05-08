@@ -80,6 +80,12 @@ USER_TAG=""
 DOCKER="untagged-docker"
 DATASET_PATH=""
 
+# NUMA interleave: prepend `numactl --interleave=<all online NUMA nodes>`
+# to the SGLang server launch so the HiCache L2 pinned-memory pool is
+# spread across all NUMA nodes instead of landing on whichever node
+# happened to fault first. Disable with --no-numa-interleave.
+USE_NUMA_INTERLEAVE="true"
+
 # --hicache-size is per-TP-rank (in GB). Default "auto" picks a value at
 # startup from detected MemAvailable so the same script runs on boxes
 # with different DRAM (e.g. 3 TiB MI355X vs 2 TB B200) without tuning.
@@ -137,6 +143,7 @@ while [[ $# -gt 0 ]]; do
     --dataset-path)   DATASET_PATH="$2"; shift 2;;
     --hicache-size)   HICACHE_SIZE="$2"; shift 2;;
     --hicache-size-sweep) HICACHE_SIZE_SWEEP="$2"; shift 2;;
+    --no-numa-interleave) USE_NUMA_INTERLEAVE="false"; shift 1;;
     --num-clients)    NUM_CLIENTS="$2"; shift 2;;
     --num-rounds)     NUM_ROUNDS="$2"; shift 2;;
     --request-length) REQUEST_LENGTH="$2"; shift 2;;
@@ -280,6 +287,71 @@ stop_server() {
   sleep 10
 }
 
+# ============================== Host snapshot ==============================
+# Records lscpu / NUMA / GPU-to-NUMA / RAM into the per-run LOG_DIR so we
+# can always reconstruct what hardware a benchmark was taken on.
+snapshot_host_info() {
+  local logfile=$1
+  {
+    echo "=== HiCache.sh host snapshot @ $(date '+%F %T %Z') ==="
+    echo
+    echo "--- lscpu ---"
+    lscpu | grep -E "Architecture|Vendor|Model name|CPU\(s\)|Socket|Core|Thread|NUMA"
+    echo
+    echo "--- /proc/meminfo (selected) ---"
+    grep -E "^MemTotal:|^MemAvailable:|^MemFree:|^Cached:|^Buffers:|^Dirty:|^HugePages_Total" /proc/meminfo
+    echo
+    echo "--- NUMA per-node DRAM + CPU list ---"
+    for n in /sys/devices/system/node/node[0-9]*; do
+      [ -d "$n" ] || continue
+      local nid mem cpus
+      nid=$(basename "$n" | sed 's/node//')
+      mem=$(awk '/MemTotal/{print int($4/1024/1024)" GB"}' "$n/meminfo")
+      cpus=$(cat "$n/cpulist" 2>/dev/null)
+      printf "  node %s: DRAM=%s, CPUs=%s\n" "$nid" "$mem" "$cpus"
+    done
+    echo
+    echo "--- GPU → NUMA node ---"
+    for d in /sys/class/drm/card[0-9]*/device/numa_node; do
+      [ -f "$d" ] || continue
+      local card n
+      card=$(echo "$d" | sed 's|/device/numa_node||;s|.*/||')
+      n=$(cat "$d")
+      printf "  %-8s NUMA %s\n" "$card" "$n"
+    done | sort -u
+    echo
+    echo "--- numactl ---"
+    if command -v numactl >/dev/null 2>&1; then
+      numactl -H 2>&1 | head -20
+    else
+      echo "  numactl: NOT INSTALLED (apt-get install numactl)"
+    fi
+    echo "================================================="
+  } | tee "$logfile"
+}
+
+# ============================== NUMA interleave detection ==============================
+# List all online NUMA nodes as a comma-separated string ("0,1" or "0,1,2,3").
+detect_numa_nodes() {
+  ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null \
+    | sed 's|.*/node||' | sort -n | paste -sd,
+}
+
+NUMA_NODES=$(detect_numa_nodes)
+NUMACTL_PREFIX=()
+if [ "$USE_NUMA_INTERLEAVE" = "true" ]; then
+  if ! command -v numactl >/dev/null 2>&1; then
+    echo ">>> WARNING: numactl not installed; skipping NUMA interleave."
+    echo "    On a multi-NUMA box this can hurt HiCache L2 throughput."
+    echo "    Install with: apt-get install numactl  (or yum install numactl)"
+  elif [ -z "$NUMA_NODES" ] || [[ "$NUMA_NODES" != *,* ]]; then
+    echo ">>> Single NUMA node detected (${NUMA_NODES:-none}); no interleave needed."
+  else
+    NUMACTL_PREFIX=(numactl --interleave="$NUMA_NODES")
+    echo ">>> NUMA interleave: --interleave=${NUMA_NODES} (${NUMA_NODES//,/ + } nodes)"
+  fi
+fi
+
 # ============================== LooGLE auto-download ==============================
 # bench_long_context.py expects a flat JSON with keys {"queries", "contexts"}.
 # The original LooGLE distribution (bigai-nlco/LooGLE) ships .jsonl per task,
@@ -318,6 +390,7 @@ build_server_cmd() {
   # Args: $1=cache_mode  $2=logfile  ; sets global SERVER_CMD array
   local mode=$1 logfile=$2
   local cmd=(
+    "${NUMACTL_PREFIX[@]}"
     python3 -m sglang.launch_server
       --model-path "$MODEL_PATH"
       --tp "$TP_SIZE"
@@ -591,6 +664,8 @@ run_one() {
   if [ "$BENCH_MODE" = "multiturn" ] || [ "$BENCH_MODE" = "longcontext" ]; then
     export SGLANG_TORCH_PROFILER_DIR="$LOG_DIR"
   fi
+
+  snapshot_host_info "${LOG_DIR}/host_info.log"
 
   local server_log="${LOG_DIR}/server.log"
   build_server_cmd "$cache_mode" "$server_log"
