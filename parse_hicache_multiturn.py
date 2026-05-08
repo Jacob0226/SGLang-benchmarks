@@ -52,13 +52,20 @@ PATH_RE = re.compile(
 # +file L3 → L1+L2+RDMA L3). Modes not listed get a large index and sort
 # alphabetically at the end.
 CACHE_MODE_ORDER = [
+    "no_cache",
+    "L1",
+    "L2",
+    "L3_file",
+    "L3_hf3fs",
+    "L3_mooncake",
+    "L3_nixl",
+    # Legacy names kept for back-compat with older runs:
     "no_radix",
     "radix",
     "hicache",
     "hicache_file",
     "hicache_hf3fs",
     "hicache_mooncake",
-    "hicache_nixl",
 ]
 
 

@@ -16,15 +16,17 @@
 #                         auto_hicache_size() — overridable via --hicache-size)
 #   L3 = external store  (file / hf3fs / mooncake / nixl)
 #
-# Cache modes (recommended sweep: no_radix → radix → hicache → hicache_file):
-#   no_radix       --disable-radix-cache      no prefix sharing at all (lower
+# Cache modes (sort order matches caching hierarchy depth):
+#   no_cache       --disable-radix-cache      no prefix sharing at all (lower
 #                  bound; do NOT also pass --enable-hierarchical-cache)
-#   radix          (default SGLang)           L1 only (GPU radix cache)
-#   hicache        --enable-hierarchical-cache  L1 + L2 (no external store)
-#   hicache_file   above + --hicache-storage-backend file   (L3 = local files,
+#   L1             (default SGLang)           GPU radix cache only
+#                  ↳ Mooncake docs call this "GPU only"
+#   L2             --enable-hierarchical-cache  L1 + host KV pool (no external)
+#                  ↳ Mooncake docs call this "+L2"
+#   L3_file        L2 + --hicache-storage-backend file   (L3 = local files,
 #                  cheap and repeatable for sanity-checking the L3 code path)
-#   hicache_hf3fs  above + --hicache-storage-backend hf3fs  (L3 = DeepSeek 3FS)
-#   hicache_mooncake above + --hicache-storage-backend mooncake (L3 = Mooncake)
+#   L3_hf3fs       L2 + --hicache-storage-backend hf3fs  (L3 = DeepSeek 3FS)
+#   L3_mooncake    L2 + --hicache-storage-backend mooncake (L3 = Mooncake)
 #
 # Benchmarks (from sgl-project/sglang/benchmark/hicache/):
 #   multiturn      synthetic multi-turn conversations (recommended; primary
@@ -45,9 +47,9 @@
 #                  every prompt is fresh random tokens)
 #
 # Usage:
-#   ./HiCache.sh                                     # DS-R1-0528, hicache, multiturn
+#   ./HiCache.sh                                     # DS-R1-0528, L2, multiturn
 #   ./HiCache.sh --bench longcontext                 # needs loogle dataset
-#   ./HiCache.sh --cache-mode hicache_file
+#   ./HiCache.sh --cache-mode L3_file
 #   ./HiCache.sh --sweep                             # run all 4 cache modes back-to-back
 #   ./HiCache.sh --sweep --hicache-size-sweep "64 128 256"   # cross-platform fairness
 #   ./HiCache.sh --model-preset gpt-oss-120b
@@ -70,7 +72,7 @@ sh -c 'echo 0 > /proc/sys/kernel/numa_balancing' || true
 # ============================== Defaults ==============================
 MODEL_PRESET="deepseek-r1-0528"
 MODEL_PATH=""
-CACHE_MODE="hicache"
+CACHE_MODE="L2"
 BENCH_MODE="multiturn"
 SWEEP_MODES="false"
 TP_SIZE=8
@@ -555,13 +557,13 @@ build_server_cmd() {
 
   # ---------- Cache-mode-specific args ----------
   case "$mode" in
-    no_radix)
+    no_cache)
       cmd+=(--disable-radix-cache)
       ;;
-    radix)
+    L1)
       :
       ;;
-    hicache)
+    L2)
       cmd+=(
         --enable-hierarchical-cache
         --hicache-size "$HICACHE_SIZE"
@@ -570,11 +572,11 @@ build_server_cmd() {
         --hicache-write-policy write_through
       )
       ;;
-    hicache_file)
+    L3_file)
       # Put L3 cache pages in /tmp inside the container, NOT under
       # $LOG_DIR (which is mounted from the host). With write_through,
       # SGLang spills the entire working set to the L3 backend; for
-      # DSR1 that's ~50 GB per run, and on the host's 8× sweep that
+      # DSR1 that's ~50 GB per run, and on a multi-config sweep that
       # adds up to hundreds of GB of pollution under the user's home.
       # /tmp on rocm/sgl-dev images is the container's overlay writable
       # layer — disappears on docker rm, separate from host mounts.
@@ -595,7 +597,7 @@ build_server_cmd() {
       )
       export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$store_dir"
       ;;
-    hicache_hf3fs)
+    L3_hf3fs)
       # NOTE: requires 3FS cluster reachable from this host. The
       # `direct` I/O backend with `page_first_direct` is the recommended
       # combo (see best-practices doc).
@@ -609,7 +611,7 @@ build_server_cmd() {
         --hicache-storage-prefetch-policy wait_complete
       )
       ;;
-    hicache_mooncake)
+    L3_mooncake)
       # NOTE: requires Mooncake metadata server + RDMA NICs configured;
       # pre-set MOONCAKE_* env vars before running.
       cmd+=(
@@ -760,7 +762,7 @@ bench_random_long() {
 write_bench_meta() {
   local cache_mode=$1
   local size_arg="${HICACHE_SIZE:-}"
-  [[ "$cache_mode" != hicache* ]] && size_arg=""
+  [[ "$cache_mode" != L[23]* ]] && size_arg=""
   local meta="${LOG_DIR}/bench_meta.json"
   python3 - "$meta" <<PY
 import json, sys, os
@@ -819,7 +821,7 @@ run_one() {
       reason="server didn't become healthy within timeout — see $server_log"
     fi
     local sz_label="${HICACHE_SIZE:-N/A}"
-    [[ "$cache_mode" != hicache* ]] && sz_label=""
+    [[ "$cache_mode" != L[23]* ]] && sz_label=""
     local msg="[skip] ${cache_mode}${sz_label:+/size_$sz_label}: ${reason}"
     echo "$msg"
     echo "$msg" >> "$SKIPPED_LOG"
@@ -848,13 +850,13 @@ run_one() {
 
 # ============================== Main ==============================
 if [ "$SWEEP_MODES" = "true" ]; then
-  CACHE_MODES=("no_radix" "radix" "hicache" "hicache_file")
+  CACHE_MODES=("no_cache" "L1" "L2" "L3_file")
 else
   CACHE_MODES=("$CACHE_MODE")
 fi
 
-# When --hicache-size-sweep is set, hicache_* modes run once per size;
-# non-hicache modes (no_radix, radix) ignore size and run only once.
+# When --hicache-size-sweep is set, L2 / L3_* modes run once per size;
+# no_cache and L1 ignore --hicache-size and run only once.
 if [ -n "$HICACHE_SIZE_SWEEP" ]; then
   SIZE_LIST=( $HICACHE_SIZE_SWEEP )
 else
@@ -872,7 +874,7 @@ skip_run() {
 }
 
 for cm in "${CACHE_MODES[@]}"; do
-  if [[ "$cm" == hicache* ]]; then
+  if [[ "$cm" == L[23]* ]]; then
     sizes_to_run=( "${SIZE_LIST[@]}" )
   else
     sizes_to_run=( "_unused_" )

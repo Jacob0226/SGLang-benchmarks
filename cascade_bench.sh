@@ -63,7 +63,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # hit at each round is read off the per-round TTFT shape (L1 ~50 ms,
 # L2 ~few-hundred ms, L3 ~sec). Pass --cache-modes-extra "no_radix
 # radix hicache" if you want the Mooncake-style 4-line figure too.
-CACHE_MODE="hicache_file"
+CACHE_MODE="L3_file"
 exec "$SCRIPT_DIR/HiCache.sh" \
   --cache-mode "$CACHE_MODE" \
   --tag "$TAG" \

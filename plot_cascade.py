@@ -52,18 +52,35 @@ PATH_RE = re.compile(
     r"(?:/size_(?P<size>\d+))?/bench_multiturn\.jsonl$"
 )
 
-CACHE_MODE_ORDER = ["no_radix", "radix", "hicache", "hicache_file",
-                    "hicache_hf3fs", "hicache_mooncake"]
+CACHE_MODE_ORDER = [
+    "no_cache", "L1", "L2", "L3_file", "L3_hf3fs", "L3_mooncake",
+    # Legacy names from older runs (kept so the parser doesn't drop them):
+    "no_radix", "radix", "hicache", "hicache_file",
+    "hicache_hf3fs", "hicache_mooncake",
+]
 CACHE_MODE_LABEL = {
-    "no_radix":         "GPU only (no cache)",
-    "radix":            "GPU radix (L1)",
-    "hicache":          "+L2 host",
-    "hicache_file":     "+L3 file",
-    "hicache_hf3fs":    "+L3 hf3fs",
-    "hicache_mooncake": "+L3 Mooncake",
+    "no_cache":         "no cache",
+    "L1":               "L1 (GPU radix)",
+    "L2":               "L1+L2",
+    "L3_file":          "L1+L2+L3 (file)",
+    "L3_hf3fs":         "L1+L2+L3 (hf3fs)",
+    "L3_mooncake":      "L1+L2+L3 (Mooncake)",
+    # Legacy aliases:
+    "no_radix":         "no cache",
+    "radix":            "L1 (GPU radix)",
+    "hicache":          "L1+L2",
+    "hicache_file":     "L1+L2+L3 (file)",
+    "hicache_hf3fs":    "L1+L2+L3 (hf3fs)",
+    "hicache_mooncake": "L1+L2+L3 (Mooncake)",
 }
 # Distinct color per cache_mode; line style per platform tag.
 CACHE_MODE_COLOR = {
+    "no_cache":         "#888888",
+    "L1":               "#1f77b4",
+    "L2":               "#ff7f0e",
+    "L3_file":          "#2ca02c",
+    "L3_hf3fs":         "#d62728",
+    "L3_mooncake":      "#9467bd",
     "no_radix":         "#888888",
     "radix":            "#1f77b4",
     "hicache":          "#ff7f0e",
