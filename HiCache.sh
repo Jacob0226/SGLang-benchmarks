@@ -80,11 +80,18 @@ DOCKER="untagged-docker"
 DATASET_PATH=""
 
 # --hicache-size is per-TP-rank (in GB). Default "auto" picks a value at
-# startup based on detected MemAvailable so the same script can run on
-# boxes with different DRAM (e.g. 3 TiB MI355X box vs 2 TB B200 server)
-# without manual tuning. The formula reserves 400 GB headroom for OS /
-# page cache / SGLang activations and divides the rest across TP ranks,
-# rounded down to the nearest 32 GB. Override with --hicache-size N.
+# startup from detected MemAvailable so the same script runs on boxes
+# with different DRAM (e.g. 3 TiB MI355X vs 2 TB B200) without tuning.
+# The formula reserves 400 GB of host headroom — NOT for GPU activations
+# (those live on GPU and are bounded by --mem-fraction-static), but for
+# CPU-side things that compete with HiCache L2 for DRAM:
+#   - Linux page cache (dominates while loading hundreds of GB of weights
+#     from /data; getting squeezed slows model load to a crawl)
+#   - HiCache's own pinned-memory staging buffers for L1↔L2 / L2↔L3 DMA
+#   - NUMA-fragmentation slack across 8 ranks pinning DRAM concurrently
+#   - SGLang scheduler / tokenizer / HTTP server / per-batch host tensors
+# Per-rank pool is rounded down to a 32 GB multiple and clamped to
+# [32, 512] GB (cache-hit returns flatten well before 512 GB per rank).
 HICACHE_SIZE="auto"
 
 # Multi-turn defaults (from LMSys blog reference run)
@@ -178,10 +185,12 @@ fi
 
 # ============================== Resolve --hicache-size ==============================
 auto_hicache_size() {
-  # Pick a per-rank hicache-size (GB) that fits in the host's available
-  # DRAM with 400 GB headroom for OS / page cache / SGLang activations.
-  # Rounds down to nearest 32 GB; clamps to >=32 GB and <=512 GB so we
-  # don't blow past sensible per-rank pool sizes on huge-RAM machines.
+  # Pick a per-rank hicache-size (GB) that fits in detected MemAvailable
+  # with 400 GB host-side headroom (page cache during model load, pinned
+  # memory for transfers, NUMA fragmentation, scheduler/tokenizer/HTTP).
+  # Note: GPU-side activations are bounded by --mem-fraction-static and
+  # are NOT what this 400 GB is for. Rounds down to nearest 32 GB; clamps
+  # to [32, 512] GB so the pool stays in a sensible range on big-RAM boxes.
   local mem_avail_kb mem_avail_gb headroom_gb usable_gb per_rank
   mem_avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
   mem_avail_gb=$(( mem_avail_kb / 1024 / 1024 ))
