@@ -292,6 +292,13 @@ stop_server() {
 # can always reconstruct what hardware a benchmark was taken on.
 snapshot_host_info() {
   local logfile=$1
+  # set -e + pipefail + `| head -N` is a classic footgun: head closes its
+  # stdin after N lines, the upstream sed/rocm-smi/nvidia-smi gets SIGPIPE,
+  # the pipeline returns non-zero, and the whole script exits mid-snapshot.
+  # Snapshots are best-effort diagnostics, so suspend errexit/pipefail
+  # for this whole function and restore on return.
+  set +e +o pipefail
+  trap 'set -e -o pipefail' RETURN
   {
     echo "=== HiCache.sh host snapshot @ $(date '+%F %T %Z') ==="
     echo
