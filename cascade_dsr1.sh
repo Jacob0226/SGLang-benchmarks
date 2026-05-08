@@ -42,7 +42,15 @@ DOCKER="untagged-docker"
 TP_SIZE=8
 HOST="localhost"
 PORT="30000"
-HICACHE_SIZE=192            # per rank, GB
+# --hicache-size:
+#   "auto"   = pick the largest value that fits in this box's MemAvailable
+#              minus 200 GB host headroom, divided across TP ranks. Lets
+#              MI355X (3 TB DRAM) max out to ~320 GB/rank while B200 with
+#              2 TB DRAM lands around ~192 GB/rank automatically — same
+#              command line on both, each platform shows its real ceiling.
+#   <number> = explicit per-rank GB (override auto)
+HICACHE_SIZE="auto"
+HOST_HEADROOM_GB=200
 NUM_CLIENTS=300
 NUM_ROUNDS=10
 REQUEST_LENGTH=4096
@@ -59,6 +67,7 @@ while [[ $# -gt 0 ]]; do
     --tp)             TP_SIZE="$2"; shift 2;;
     --port)           PORT="$2"; shift 2;;
     --hicache-size)   HICACHE_SIZE="$2"; shift 2;;
+    --host-headroom-gb) HOST_HEADROOM_GB="$2"; shift 2;;
     --num-clients)    NUM_CLIENTS="$2"; shift 2;;
     --num-rounds)     NUM_ROUNDS="$2"; shift 2;;
     --request-length) REQUEST_LENGTH="$2"; shift 2;;
@@ -78,6 +87,36 @@ if [ ! -d "$MODEL_PATH" ]; then
   exit 1
 fi
 MODEL_NAME=$(basename "${MODEL_PATH%/}")
+
+# ============================== Auto-size hicache ==============================
+# When --hicache-size is "auto", measure the box's actual MemAvailable and
+# size the host KV pool to its safe maximum. This is the whole point of the
+# cross-platform comparison: MI355X (3 TB DRAM) and B200 (~2 TB DRAM) each
+# get to use their own DRAM ceiling, so the cascade reflects true platform
+# capacity. Headroom (default 200 GB) covers OS page cache during model
+# load, HiCache pinned-memory staging buffers, NUMA fragmentation slack,
+# and the SGLang process group's anonymous memory.
+if [ "$HICACHE_SIZE" = "auto" ]; then
+  MEM_AVAIL_GB=$(awk '/^MemAvailable:/ {print int($2/1024/1024)}' /proc/meminfo)
+  USABLE_GB=$(( MEM_AVAIL_GB - HOST_HEADROOM_GB ))
+  if [ "$USABLE_GB" -le 0 ]; then
+    echo "ERROR: only ${MEM_AVAIL_GB} GB MemAvailable, can't reserve" \
+         "${HOST_HEADROOM_GB} GB headroom. Use --host-headroom-gb or" \
+         "--hicache-size N." >&2
+    exit 1
+  fi
+  PER_RANK=$(( USABLE_GB / TP_SIZE ))
+  PER_RANK=$(( PER_RANK / 32 * 32 ))   # 32 GB align for clean numbers
+  [ "$PER_RANK" -lt 32  ] && PER_RANK=32
+  [ "$PER_RANK" -gt 512 ] && PER_RANK=512   # diminishing returns past this
+  HICACHE_SIZE="$PER_RANK"
+  echo ">>> auto --hicache-size: ${HICACHE_SIZE} GB per rank" \
+       "(MemAvailable=${MEM_AVAIL_GB} GB, headroom=${HOST_HEADROOM_GB} GB," \
+       "TP=${TP_SIZE} ranks; total host pool = $(( HICACHE_SIZE * TP_SIZE )) GB)"
+else
+  echo ">>> manual --hicache-size: ${HICACHE_SIZE} GB per rank" \
+       "(total host pool = $(( HICACHE_SIZE * TP_SIZE )) GB)"
+fi
 
 # ============================== Output dir ==============================
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
