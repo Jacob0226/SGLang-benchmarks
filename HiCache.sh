@@ -311,14 +311,38 @@ snapshot_host_info() {
       printf "  node %s: DRAM=%s, CPUs=%s\n" "$nid" "$mem" "$cpus"
     done
     echo
-    echo "--- GPU → NUMA node ---"
-    for d in /sys/class/drm/card[0-9]*/device/numa_node; do
-      [ -f "$d" ] || continue
-      local card n
-      card=$(echo "$d" | sed 's|/device/numa_node||;s|.*/||')
-      n=$(cat "$d")
-      printf "  %-8s NUMA %s\n" "$card" "$n"
-    done | sort -u
+    echo "--- GPU → NUMA node (via PCIe sysfs, vendor-agnostic) ---"
+    # Match (vendor, class) pairs for real compute GPUs only — avoids
+    # picking up the ASPEED BMC graphics chip (also class 0x030000) on
+    # server boards.
+    #   NVIDIA datacenter (B200, H100, A100, …) → vendor 0x10de, class 0x030200
+    #   NVIDIA consumer (RTX, …)                → vendor 0x10de, class 0x030000
+    #   AMD MI100 / MI200 / MI300 / MI355       → vendor 0x1002, class 0x120000
+    #   AMD consumer (Radeon)                   → vendor 0x1002, class 0x030000
+    for d in /sys/bus/pci/devices/*; do
+      local v c n bdf vendor_name
+      v=$(cat "$d/vendor" 2>/dev/null) || continue
+      c=$(cat "$d/class"  2>/dev/null) || continue
+      case "$v:$c" in
+        0x10de:0x030000|0x10de:0x030200) vendor_name="NVIDIA" ;;
+        0x1002:0x030000|0x1002:0x030200) vendor_name="AMD"    ;;
+        0x1002:0x120000)                 vendor_name="AMD-CDNA" ;;
+        *) continue ;;
+      esac
+      bdf=$(basename "$d")
+      n=$(cat "$d/numa_node" 2>/dev/null)
+      printf "  %s  %-9s  NUMA %s\n" "$bdf" "$vendor_name" "$n"
+    done
+    echo
+    echo "--- vendor-specific topology ---"
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      echo "  [nvidia-smi topo -m]"
+      nvidia-smi topo -m 2>&1 | sed 's/^/    /' | head -20
+    fi
+    if command -v rocm-smi >/dev/null 2>&1; then
+      echo "  [rocm-smi --showtopo --showtoponuma]"
+      rocm-smi --showtopo --showtoponuma 2>&1 | sed 's/^/    /' | head -30
+    fi
     echo
     echo "--- numactl ---"
     if command -v numactl >/dev/null 2>&1; then
