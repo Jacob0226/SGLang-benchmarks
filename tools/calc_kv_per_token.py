@@ -125,6 +125,51 @@ def detect_attention_type(cfg: dict) -> str:
     return "gqa"
 
 
+# ============================== Library API ==============================
+# These are the only functions external scripts (HiCache.sh wrappers,
+# parse_hicache_multiturn.py, …) should call. Keep the return shape stable.
+
+def kv_per_token(model_path: str | Path, tp: int = 8,
+                 kv_dtype: str = "fp8_e4m3") -> dict:
+    """Compute per-token KV cache cost for a model checkpoint.
+
+    Returns a dict with at least:
+      attn_type:                "MLA (DeepSeek)" | "GQA" | "MHA"
+      bytes_per_token_full:     full-model bytes/token (sum over layers)
+      bytes_per_token_per_rank: per-rank bytes/token (after TP sharding)
+      shard_factor:             how many ranks the KV is split across
+      fixed_bytes_per_seq:      sliding-window layer fixed cost (0 if none)
+      num_layers_full / sliding
+    """
+    cfg = load_config(Path(model_path).expanduser().resolve())
+    attn = detect_attention_type(cfg)
+    info = compute_mla(cfg, tp) if attn == "mla" else compute_gqa(cfg, tp)
+    dtype_b = DTYPE_BYTES[kv_dtype]
+    bpt_full = info["elements_per_token_full"] * dtype_b
+    return {
+        "attn_type": info["attn_type"],
+        "shard_factor": info["shard_factor"],
+        "shard_note": info["shard_note"],
+        "num_layers_full": info["num_layers_full"],
+        "num_layers_sliding": info["num_layers_sliding"],
+        "elements_per_token_full": info["elements_per_token_full"],
+        "bytes_per_token_full": bpt_full,
+        "bytes_per_token_per_rank": bpt_full / info["shard_factor"],
+        "fixed_bytes_per_seq": info.get("fixed_elements_per_seq", 0) * dtype_b,
+        "kv_dtype": kv_dtype,
+    }
+
+
+def tokens_for_l1(device_pool_bytes: int, bytes_per_token_per_rank: float) -> int:
+    """How many tokens fit in a GPU KV pool of `device_pool_bytes`."""
+    if bytes_per_token_per_rank <= 0:
+        return 0
+    return int(device_pool_bytes / bytes_per_token_per_rank)
+
+
+# ==========================================================================
+
+
 def fmt_bytes(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if abs(n) < 1024:

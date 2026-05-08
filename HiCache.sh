@@ -743,6 +743,43 @@ bench_random_long() {
   done
 }
 
+# ============================== Bench metadata ==============================
+# Write a small JSON describing the workload and platform context so the
+# CSV parser can compute working_set / L1% without re-deriving the math.
+write_bench_meta() {
+  local cache_mode=$1
+  local size_arg="${HICACHE_SIZE:-}"
+  [[ "$cache_mode" != hicache* ]] && size_arg=""
+  local meta="${LOG_DIR}/bench_meta.json"
+  python3 - "$meta" <<PY
+import json, sys, os
+path = sys.argv[1]
+data = {
+    "cache_mode":          "$cache_mode",
+    "model_path":          "$MODEL_PATH",
+    "model_family":        "$MODEL_FAMILY",
+    "tp_size":             $TP_SIZE,
+    "kv_cache_dtype":      "fp8_e4m3",
+    "mem_fraction_static": 0.85,
+    "host_headroom_gb":    $HOST_HEADROOM_GB,
+    "hbm_gb":              $HBM_GB,
+    "device_pool_gb":      $DEVICE_POOL_GB,
+    "hicache_size_gb":     "${size_arg}" or None,
+    "bench_mode":          "$BENCH_MODE",
+    "num_clients":         $NUM_CLIENTS,
+    "num_rounds":          $NUM_ROUNDS,
+    "request_length":      $REQUEST_LENGTH,
+    "output_length":       $OUTPUT_LENGTH,
+    "max_parallel":        $MAX_PARALLEL,
+    "request_rate":        $REQUEST_RATE,
+    "enable_round_barrier": "$ENABLE_ROUND_BARRIER" == "true",
+    "disable_random_sample": "$DISABLE_AUTO_RUN" == "true",
+}
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+}
+
 # ============================== Run-one ==============================
 run_one() {
   # Caller is expected to have set LOG_DIR and (for hicache_* modes)
@@ -754,6 +791,7 @@ run_one() {
   fi
 
   snapshot_host_info "${LOG_DIR}/host_info.log"
+  write_bench_meta "$cache_mode"
 
   local server_log="${LOG_DIR}/server.log"
   if ! build_server_cmd "$cache_mode" "$server_log"; then

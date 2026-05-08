@@ -27,8 +27,18 @@ import csv
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Iterable
+
+# Make `tools/calc_kv_per_token.py` importable so we can compute
+# bytes/token/rank from the model's config.json on the fly.
+_THIS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_THIS_DIR / "tools"))
+try:
+    import calc_kv_per_token as _kvc
+except ImportError:
+    _kvc = None
 
 PATH_RE = re.compile(
     r"results/(?P<docker>[^/]+)/"
@@ -65,6 +75,15 @@ LONG_COLS = [
     "tag",
     "cache_mode",
     "hicache_size_gb",
+    # Workload sizing (read from bench_meta.json + computed via calc_kv_per_token)
+    "num_clients",
+    "num_rounds",
+    "request_length",
+    "kv_kb_per_token_per_rank",
+    "device_pool_gb",
+    "working_set_tokens",
+    "working_set_pct_l1",          # <— what % of GPU L1 the workload covers
+    # Bench result summary
     "total_requests",
     "request_rate",
     "avg_prompt_len",
@@ -133,10 +152,80 @@ def s_to_ms(v):
         return v
 
 
+def derive_workload_meta(jsonl_path: Path, record: dict) -> dict:
+    """Read bench_meta.json next to bench_multiturn.jsonl and compute working
+    set + % of L1. Falls back to round-dict-based estimation if no meta file
+    is present (older runs)."""
+    out = {
+        "num_clients": "",
+        "num_rounds": "",
+        "request_length": "",
+        "kv_kb_per_token_per_rank": "",
+        "device_pool_gb": "",
+        "working_set_tokens": "",
+        "working_set_pct_l1": "",
+    }
+    meta_path = jsonl_path.parent / "bench_meta.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+        except Exception:
+            meta = {}
+        out["num_clients"]    = meta.get("num_clients", "")
+        out["num_rounds"]     = meta.get("num_rounds", "")
+        out["request_length"] = meta.get("request_length", "")
+        out["device_pool_gb"] = meta.get("device_pool_gb", "")
+
+        if _kvc and meta.get("model_path"):
+            try:
+                r = _kvc.kv_per_token(
+                    meta["model_path"],
+                    tp=meta.get("tp_size", 8),
+                    kv_dtype=meta.get("kv_cache_dtype", "fp8_e4m3"),
+                )
+                bpt = r["bytes_per_token_per_rank"]
+                out["kv_kb_per_token_per_rank"] = round(bpt / 1024, 3)
+                if meta.get("num_clients") and meta.get("num_rounds") and meta.get("request_length"):
+                    ws_tokens = (meta["num_clients"]
+                                 * meta["num_rounds"]
+                                 * meta["request_length"])
+                    out["working_set_tokens"] = ws_tokens
+                    if meta.get("device_pool_gb", 0):
+                        l1_tokens = meta["device_pool_gb"] * (1024 ** 3) / bpt
+                        if l1_tokens > 0:
+                            out["working_set_pct_l1"] = round(
+                                100 * ws_tokens / l1_tokens, 1)
+            except Exception as e:
+                print(f"[warn] {jsonl_path.parent.name}: kv calc failed: {e}")
+    else:
+        # Older runs without bench_meta.json: count rounds from JSONL,
+        # back out request_length from average_prompt_len, num_clients
+        # from total_requests / num_rounds.
+        s = record.get("summary", {})
+        r = record.get("round") or {}
+        round_keys = [k for k in r if k.startswith("round_")]
+        if round_keys and s.get("total_requests"):
+            num_rounds = max(int(k.split("_")[1]) for k in round_keys) + 1
+            num_clients = int(s["total_requests"] / num_rounds)
+            avg_prompt_len = s.get("average_prompt_len") or 0
+            if num_rounds > 0 and avg_prompt_len > 0:
+                request_length = round(avg_prompt_len * 2 / (num_rounds + 1))
+            else:
+                request_length = 0
+            out["num_clients"]    = num_clients
+            out["num_rounds"]     = num_rounds
+            out["request_length"] = request_length
+            if request_length:
+                out["working_set_tokens"] = num_clients * num_rounds * request_length
+    return out
+
+
 def flatten_summary(record: dict, meta: dict, jsonl_path: Path) -> dict:
     s = record.get("summary", {})
+    workload = derive_workload_meta(jsonl_path, record)
     row = {
         **meta,
+        **workload,
         "total_requests": s.get("total_requests"),
         "request_rate": s.get("request_rate"),
         "avg_prompt_len": s.get("average_prompt_len"),
