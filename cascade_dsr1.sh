@@ -62,6 +62,17 @@ REQUEST_LENGTH=4096
 OUTPUT_LENGTH=1
 MAX_PARALLEL=8
 REQUEST_RATE=32
+# CUDA graph capture range: SGLang pre-captures graphs for batch sizes
+# 1..N, each costing GPU memory. Default 512 wastes memory because
+# round-barrier + max-parallel caps actual batch at <=MAX_PARALLEL.
+# When unset (0), we couple to MAX_PARALLEL so capture matches reality.
+CUDA_GRAPH_MAX_BS=0
+# Prefill chunking. Default in SGLang is 8K. Setting these to the
+# context-length (65536) means a single 60K-token prompt prefills in
+# one chunk instead of 2, saving the chunk-switch overhead at
+# round 11+ where prompts exceed 32K.
+CHUNKED_PREFILL_SIZE=65536
+MAX_PREFILL_TOKENS=65536
 WAIT_FOR_SERVER_SEC=900     # 15 min cap; bail out if SGLang doesn't /health
 
 while [[ $# -gt 0 ]]; do
@@ -78,6 +89,9 @@ while [[ $# -gt 0 ]]; do
     --request-length) REQUEST_LENGTH="$2"; shift 2;;
     --max-parallel)   MAX_PARALLEL="$2"; shift 2;;
     --request-rate)   REQUEST_RATE="$2"; shift 2;;
+    --cuda-graph-max-bs)   CUDA_GRAPH_MAX_BS="$2"; shift 2;;
+    --chunked-prefill-size) CHUNKED_PREFILL_SIZE="$2"; shift 2;;
+    --max-prefill-tokens)   MAX_PREFILL_TOKENS="$2"; shift 2;;
     -h|--help) sed -n '1,/^set -euo pipefail/p' "$0" | sed 's/^# \?//' | head -n -1; exit 0;;
     *) echo "Unknown option: $1" >&2; exit 1;;
   esac
@@ -218,6 +232,15 @@ trap 'rm -rf "$HICACHE_FILE_STORE_DIR" 2>/dev/null; pkill -9 -f sglang.launch_se
 
 # ============================== Server launch ==============================
 SERVER_LOG="$LOG_DIR/server.log"
+# Default cuda-graph-max-bs to MAX_PARALLEL when user didn't override.
+# That keeps captured graphs to the actual concurrent batch sizes the
+# bench will produce (under round-barrier + max-parallel client cap).
+if [ "$CUDA_GRAPH_MAX_BS" -le 0 ]; then
+  CUDA_GRAPH_MAX_BS="$MAX_PARALLEL"
+fi
+echo ">>> cuda-graph-max-bs=${CUDA_GRAPH_MAX_BS} (coupled to max-parallel)"
+echo ">>> chunked-prefill-size=${CHUNKED_PREFILL_SIZE}, max-prefill-tokens=${MAX_PREFILL_TOKENS}"
+
 SERVER_CMD=(
   "${NUMACTL_PREFIX[@]}"
   python3 -m sglang.launch_server
@@ -233,8 +256,9 @@ SERVER_CMD=(
     --kv-cache-dtype fp8_e4m3
     --page-size 64
     --context-length 65536
-    --chunked-prefill-size 32768
-    --max-prefill-tokens 32768
+    --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
+    --max-prefill-tokens "$MAX_PREFILL_TOKENS"
+    --cuda-graph-max-bs "$CUDA_GRAPH_MAX_BS"
     --enable-hierarchical-cache
     --hicache-size "$HICACHE_SIZE"
     --hicache-mem-layout page_first_direct
