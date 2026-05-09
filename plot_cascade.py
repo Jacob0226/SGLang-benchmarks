@@ -153,6 +153,70 @@ def load_round_data(jsonl_path: Path) -> tuple[list[float], list[float]]:
     return [], []
 
 
+# Per-token KV cost (bytes per rank) for known model families. MLA is
+# replicated across TP, GQA is sharded — see tools/calc_kv_per_token.py.
+KV_BYTES_PER_TOKEN_PER_RANK = {
+    "deepseek": 35136,   # MLA: (kv_lora 512 + qk_rope 64) × 61 layers × 1 byte FP8
+    "gpt-oss":  2304,    # GQA TP-sharded: 8 KV heads × 64 head_dim × 2 (K+V) × 18 full layers / 8 TP × 1 byte
+}
+
+
+def load_fill_thresholds(jsonl_path: Path) -> dict | None:
+    """Read sibling bench_meta.json + server.log to compute when L1 / L1+L2
+    fill across rounds. Returns None when the metadata is incomplete (e.g.
+    older runs without bench_meta.json). When server.log has the real
+    "KV Cache is allocated. ... KV size: X GB" line we use that as L1
+    instead of bench_meta's estimate, since SGLang's hicache+aiter combo
+    auto-reduces mem_fraction below the user-specified value."""
+    bench_dir = jsonl_path.parent
+    meta_path = bench_dir / "bench_meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text())
+    except Exception:
+        return None
+
+    # Per-rank GiB added per round = clients × req_len × kv_bytes / 2^30
+    family = meta.get("model_family", "deepseek")
+    kv_bytes = KV_BYTES_PER_TOKEN_PER_RANK.get(family, 35136)
+    nc = meta.get("num_clients", 0)
+    rl = meta.get("request_length", 0)
+    if nc <= 0 or rl <= 0:
+        return None
+    round_inc_gib = nc * rl * kv_bytes / (1024 ** 3)
+
+    # L1: prefer the actual "KV size" from server.log if present.
+    l1_gib = None
+    server_log = bench_dir / "server.log"
+    if server_log.exists():
+        try:
+            with open(server_log, "r", errors="ignore") as f:
+                for ln in f:
+                    if "KV Cache is allocated" in ln and "KV size:" in ln:
+                        # "[TPx] KV Cache is allocated. #tokens: N, KV size: X GB"
+                        try:
+                            l1_gib = float(ln.split("KV size:")[1].split("GB")[0].strip())
+                            break
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    if l1_gib is None:
+        # Fall back to bench_meta's pre-launch estimate (often optimistic).
+        l1_gib = float(meta.get("device_pool_gb") or 0)
+
+    l2_gib = float(meta.get("hicache_size_gb") or 0)
+
+    return {
+        "round_inc_gib": round_inc_gib,
+        "l1_gib": l1_gib,
+        "l2_gib": l2_gib,
+        "l1_fill_round":      l1_gib / round_inc_gib if round_inc_gib else None,
+        "l1_l2_fill_round":  (l1_gib + l2_gib) / round_inc_gib if round_inc_gib else None,
+    }
+
+
 def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
     if not runs:
         raise SystemExit("No runs found matching filters")
@@ -212,6 +276,32 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
             linestyle, marker = TAG_LINESTYLE.get(tag_idx, ("solid", "o"))
         else:
             linestyle, marker = "solid", ("o", "s", "^", "D")[tag_idx % 4]
+
+        # Vertical lines marking when L1 and L1+L2 are predicted to fill,
+        # so the reader can verify TTFT spikes line up with cache-tier
+        # boundary crossings instead of guessing. Labels are staggered
+        # per tag to avoid overlapping when two platforms fill at nearby
+        # rounds (typical for MI355X-vs-B200 L1 events).
+        thr = r.get("fill_thresholds")
+        if thr:
+            l1_r = thr.get("l1_fill_round")
+            ll_r = thr.get("l1_l2_fill_round")
+            tag_label = r["tag"]
+            # tag_idx 0 → labels at top (0.92 / 0.84); tag_idx 1+ → bottom (0.04 / 0.12).
+            top_y = 0.92 - 0.08 * (tag_idx % 2)
+            bot_y = 0.04 + 0.08 * (tag_idx % 2)
+            if l1_r and 1 <= l1_r <= max_rounds:
+                ax_ttft.axvline(l1_r, color=color, linestyle=":", alpha=0.55, linewidth=1.2)
+                ax_ttft.text(l1_r, bot_y,
+                             f" {tag_label} L1 fill (r={l1_r:.1f})",
+                             transform=ax_ttft.get_xaxis_transform(),
+                             color=color, fontsize=8, va="bottom", ha="left", alpha=0.95)
+            if ll_r and 1 <= ll_r <= max_rounds:
+                ax_ttft.axvline(ll_r, color=color, linestyle="--", alpha=0.55, linewidth=1.2)
+                ax_ttft.text(ll_r, top_y,
+                             f" {tag_label} L1+L2 fill (r={ll_r:.1f})",
+                             transform=ax_ttft.get_xaxis_transform(),
+                             color=color, fontsize=8, va="top", ha="left", alpha=0.95)
 
         mode_label = CACHE_MODE_LABEL.get(r["cache_mode"], r["cache_mode"])
         size_suffix = f" ({r['size']} GB)" if r["size"] is not None else ""
@@ -275,6 +365,7 @@ def main():
             sys.exit(f"ERROR: no per-round data in {jsonl_path}")
         meta["ttft"] = ttft
         meta["hit"] = hit
+        meta["fill_thresholds"] = load_fill_thresholds(p_jsonl)
         runs.append(meta)
 
     if not runs:
