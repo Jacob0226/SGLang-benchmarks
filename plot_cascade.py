@@ -180,6 +180,14 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
     ax_hit.set_ylim(-2, 102)
     ax_hit.grid(True, alpha=0.3)
 
+    # Show every round on the x-axis (no stride). Use the longest run's
+    # round count so single-platform and cross-platform plots both label
+    # rounds 1..N individually rather than matplotlib's default 2/4/6/...
+    max_rounds = max(len(r["ttft"]) for r in runs)
+    xticks = list(range(1, max_rounds + 1))
+    ax_ttft.set_xticks(xticks)
+    ax_hit.set_xticks(xticks)
+
     # Color rule: tag wins. AMD → orange, NVIDIA → green, regardless of how
     # many cache_modes are in the plot. Falls back to cache_mode color only
     # when the tag doesn't look like any known platform.
