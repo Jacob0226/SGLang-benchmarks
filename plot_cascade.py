@@ -180,15 +180,12 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
     ax_hit.set_ylim(-2, 102)
     ax_hit.grid(True, alpha=0.3)
 
-    # Distinct color per tag when only one cache_mode is plotted (cross-platform
-    # comparison); otherwise color encodes cache_mode and linestyle encodes tag.
-    distinct_modes = sorted({r["cache_mode"] for r in runs})
-    color_by_tag = len(distinct_modes) == 1 and len(tag_list) > 1
+    # Color rule: tag wins. AMD → orange, NVIDIA → green, regardless of how
+    # many cache_modes are in the plot. Falls back to cache_mode color only
+    # when the tag doesn't look like any known platform.
     tag_palette = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b"]
 
     def color_for_tag(tag: str) -> str | None:
-        """Tag-name-aware color so the assignment is stable across runs.
-        AMD platforms get warm colors (orange / red), NVIDIA cool (green / blue)."""
         t = tag.lower()
         if any(p in t for p in ("b200", "h200", "h800", "h100", "a100", "nvidia")):
             return "#2ca02c"  # green for NVIDIA
@@ -199,12 +196,14 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
     for r in runs:
         rounds = list(range(1, len(r["ttft"]) + 1))
         tag_idx = tag_list.index(r["tag"])
-        if color_by_tag:
-            color = color_for_tag(r["tag"]) or tag_palette[tag_idx % len(tag_palette)]
-            linestyle, marker = "solid", ("o", "s", "^", "D")[tag_idx % 4]
-        else:
-            color = CACHE_MODE_COLOR.get(r["cache_mode"], "black")
+        color = (color_for_tag(r["tag"])
+                 or CACHE_MODE_COLOR.get(r["cache_mode"])
+                 or tag_palette[tag_idx % len(tag_palette)])
+        # If multiple cache_modes per tag, use linestyle to distinguish modes.
+        if len(tag_list) > 1 and len({rr["cache_mode"] for rr in runs if rr["tag"] == r["tag"]}) > 1:
             linestyle, marker = TAG_LINESTYLE.get(tag_idx, ("solid", "o"))
+        else:
+            linestyle, marker = "solid", ("o", "s", "^", "D")[tag_idx % 4]
 
         mode_label = CACHE_MODE_LABEL.get(r["cache_mode"], r["cache_mode"])
         size_suffix = f" ({r['size']} GB)" if r["size"] is not None else ""
