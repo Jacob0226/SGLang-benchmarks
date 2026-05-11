@@ -550,6 +550,7 @@ for PROF_MODE in "${PROF_SERVER_MODES[@]}"; do
     run_benchmarks
 
     pkill -9 python || true
+    pkill -f sglang || true
     sleep 10
 done
 
