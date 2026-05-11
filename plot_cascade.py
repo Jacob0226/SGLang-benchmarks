@@ -232,9 +232,18 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
         r["size"] or 0,
     ))
 
-    fig, (ax_ttft, ax_hit) = plt.subplots(1, 2, figsize=(13, 4.5))
+    # Two panels stacked vertically (TTFT on top, Cache Hit Rate below) so
+    # both share the same X-axis width and any vertical fill-threshold lines
+    # in the top panel align visually with the corresponding round in the
+    # bottom panel. sharex=True hides the redundant top-panel x-tick labels.
+    # constrained_layout handles the legend / suptitle spacing automatically
+    # and is sharex/gridspec-friendly (unlike tight_layout, which warns).
+    fig, (ax_ttft, ax_hit) = plt.subplots(
+        2, 1, figsize=(11, 8.5), sharex=True,
+        gridspec_kw={"hspace": 0.18},
+        constrained_layout=True,
+    )
     ax_ttft.set_title("Prefill Performance (per round)")
-    ax_ttft.set_xlabel("# Round")
     ax_ttft.set_ylabel("Avg TTFT (sec)")
     ax_ttft.grid(True, alpha=0.3)
 
@@ -312,14 +321,15 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
         ax_hit.plot(rounds, [h * 100 for h in r["hit"]], label=label,
                     color=color, linestyle=linestyle, marker=marker, markersize=6)
 
-    # One shared legend below the plots.
+    # One shared legend below the plots. With constrained_layout the figure
+    # automatically reserves space for the legend, so a positive y offset
+    # keeps it inside the saved canvas instead of relying on bbox_inches.
     handles, labels = ax_ttft.get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, -0.05),
+    fig.legend(handles, labels, loc="outside lower center",
                ncol=min(3, len(runs)), fontsize=9)
 
     if title:
         fig.suptitle(title, fontsize=12)
-    plt.tight_layout(rect=[0, 0.05, 1, 0.96 if title else 1])
     plt.savefig(out_path, dpi=120, bbox_inches="tight")
     print(f"Wrote {out_path} ({len(runs)} curves)")
 
