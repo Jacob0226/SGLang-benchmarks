@@ -19,17 +19,16 @@
 # plot) into one bench folder so a copy of that folder is reproducible.
 #
 # Workload (hard-coded to land cache-fill events in observable rounds):
-#   N=300 clients × R=4096 tokens/req × num_rounds (default 15)
+#   N=300 clients × R=4096 tokens/req × num_rounds (default 10)
 #   per-rank cache occupancy ≈ 41 GB × round  (DSR1 MLA replicated, FP8 KV)
 #   write_through to all tiers; L3 store goes under /tmp (auto-cleaned)
 #
-# Why default num_rounds=15 (not 10):
-#   - per-rank cache occupancy hits L1+L2 ceiling around:
-#       B200   (L1≈79 GB,  L2=192 GB → 271 GB/rank): round ~7
-#       MI355X (L1≈160 GB, L2=320 GB → 480 GB/rank): round ~12
-#   - rounds 12-15 are where MI355X's L3 NVMe spike appears in TTFT,
-#     so 10 rounds is enough for B200 but cuts the MI355X cascade short.
-#   - 15 rounds gives both platforms 3+ rounds past their L2 ceiling.
+# All workload defaults below match the original a0367ca cascade_dsr1.sh
+# config (the one that produced the 2026-05-08 reference jsonl). Pass
+# --num-rounds 15 / --hicache-size N / --chunked-prefill-size N etc. on
+# the CLI to override for ablation runs (e.g. extending the cascade past
+# the L2 ceiling, sweeping host-pool size, or stress-testing the AMD
+# scheduler with longer chunked-prefills).
 #
 # Override common knobs via flags below. Anything else: edit the
 # constants in this file.
@@ -86,32 +85,38 @@ PORT="30000"
 #   L2       + host DRAM pool      (no external storage)
 #   L3_file  + local file backend  (full cascade; the default)
 CACHE_MODE="L3_file"
-# --hicache-size:
+# --hicache-size: per-rank host KV pool in GB. Default 192 matches the
+# original a0367ca config. Pass "auto" or --hicache-size N to override:
 #   "auto"   = pick the largest value that fits in this box's MemAvailable
-#              minus 200 GB host headroom, divided across TP ranks. Lets
-#              MI355X (3 TB DRAM) max out to ~320 GB/rank while B200 with
-#              2 TB DRAM lands around ~192 GB/rank automatically — same
-#              command line on both, each platform shows its real ceiling.
-#   <number> = explicit per-rank GB (override auto)
-HICACHE_SIZE="auto"
+#              minus host headroom, divided across TP ranks. Lets MI355X
+#              (3 TB DRAM) max out to ~320 GB/rank while B200 (2 TB DRAM)
+#              lands around ~192 GB/rank automatically — same command
+#              line on both, each platform shows its real ceiling. Use
+#              this for "let each platform win on its own DRAM" runs.
+#   <number> = explicit per-rank GB (cross-platform fairness — same host
+#              pool size on both MI355X and B200).
+HICACHE_SIZE=192
 HOST_HEADROOM_GB=200
 NUM_CLIENTS=300
-NUM_ROUNDS=15           # see header: 15 walks both L1+L2 ceilings into L3
+NUM_ROUNDS=10
 REQUEST_LENGTH=4096
 OUTPUT_LENGTH=1
 MAX_PARALLEL=8
 REQUEST_RATE=32
 # CUDA graph capture range: SGLang pre-captures graphs for batch sizes
-# 1..N, each costing GPU memory. Default 512 wastes memory because
-# round-barrier + max-parallel caps actual batch at <=MAX_PARALLEL.
-# When unset (0), we couple to MAX_PARALLEL so capture matches reality.
+# 1..N, each costing GPU memory. SGLang's own default (~512) wastes
+# memory because round-barrier + max-parallel caps actual batch at
+# <=MAX_PARALLEL. When unset (0), we couple to MAX_PARALLEL so capture
+# matches reality.
 CUDA_GRAPH_MAX_BS=0
-# Prefill chunking. Default in SGLang is 8K. Setting these to the
-# context-length (65536) means a single 60K-token prompt prefills in
-# one chunk instead of 2, saving the chunk-switch overhead at
-# round 11+ where prompts exceed 32K.
-CHUNKED_PREFILL_SIZE=65536
-MAX_PREFILL_TOKENS=65536
+# Prefill chunking. Default 32768 matches the original a0367ca config
+# (SGLang's own default is 8192). a0c0522 bumped this to 65536 to save
+# chunk-switch overhead on the round-11+ 60K-token prompts, but that
+# change has been linked to AMD scheduler instability under high
+# concurrency — keep at 32768 by default and pass --chunked-prefill-size
+# 65536 explicitly for ablation runs.
+CHUNKED_PREFILL_SIZE=32768
+MAX_PREFILL_TOKENS=32768
 WAIT_FOR_SERVER_SEC=900     # 15 min cap; bail out if SGLang doesn't /health
 # Optional GSM8K precheck: adds ~70-90 sec per cascade run; results land
 # in $LOG_DIR/Accuracy_GSM8K.log + bench_meta.json["gsm8k_precheck_*"].
