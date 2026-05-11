@@ -8,6 +8,12 @@
 # ./GLM.sh --prof --dual-stream-rocm --tag DualStream
 # ./GLM.sh --tp 4 --tag 0507_TP4    # tensor parallel size (default 8)
 # ./GLM.sh --docker rocm/sgl-dev:v0.5.10rc0-rocm720-mi35x-20260412   # tag results dir with docker image
+#
+# GLM-5 / GLM-5.1 FP4 examples (auto-detects quant scheme from model name;
+# mirrors InferenceX recipes — see SemiAnalysisAI/InferenceX benchmarks/
+# single_node/glm5.1_fp4_mi355x.sh and glm5_fp4_b200.sh):
+# ./GLM.sh --model amd/GLM-5.1-MXFP4               # MI355X (MXFP4 self-declares)
+# ./GLM.sh --model nvidia/GLM-5-NVFP4              # B200   (NV official ModelOpt quant)
 set -euo pipefail
 set -x
 ulimit -n 65535
@@ -70,6 +76,42 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 MODEL_NAME=$(basename "${MODEL_PATH%/}")
+
+# ===================== Quantization auto-detection (matches InferenceX) =====================
+# Pick --quantization and --mem-fraction-static based on the model name.
+# Mirrors SemiAnalysisAI/InferenceX recipes in benchmarks/single_node/
+# {glm5.1_fp4_mi355x.sh, glm5_fp4_b200.sh, glm5_fp8_b200.sh}.
+#
+#   *MXFP4*  -> AMD MXFP4 (e.g. amd/GLM-5.1-MXFP4): model files self-declare
+#               quant, so no --quantization flag is passed. AMD's Quark recipe
+#               quantizes the shared experts to MXFP4 too (model card:
+#               "MOE-only (shared experts quantized), OCP MXFP4"), so fusion
+#               works (no --disable-shared-experts-fusion needed). Matches
+#               InferenceX glm5.1_fp4_mi355x.sh.
+#   *NVFP4*  -> NVIDIA NVFP4 (e.g. nvidia/GLM-5-NVFP4): needs
+#               --quantization modelopt_fp4 and --mem-fraction-static 0.9
+#               (matches InferenceX glm5_fp4_b200.sh's KV-pool budget; NV's
+#               HF card uses 0.80). No --disable-shared-experts-fusion (NV's
+#               HF launch command and InferenceX glm5_fp4_b200.sh both omit
+#               it — sglang's modelopt_fp4 path handles it correctly).
+#   *FP8*    -> default GLM-5-FP8: --quantization fp8 on B200, none on ROCm.
+QUANT_ARGS=()
+MEM_FRACTION_STATIC="0.85"
+# Set to "true" by --dual-stream-rocm (see start_server()) — needed so MoE.forward
+# takes forward_normal_dual_stream instead of the fused shared-expert path.
+NEED_DISABLE_SHARED_FUSION="false"
+case "${MODEL_NAME}" in
+    *NVFP4*)
+        QUANT_ARGS=(--quantization modelopt_fp4)
+        MEM_FRACTION_STATIC="0.9"
+        ;;
+    *MXFP4*)
+        # MXFP4 self-declares; shared experts are also MXFP4 -> fusion OK.
+        ;;
+    *FP8*)
+        QUANT_ARGS=(--quantization fp8)
+        ;;
+esac
 
 # ===================== Server and Benchmark Setting =====================
 # InferenceMax tuning (from InferenceX/glm5_fp8_mi355x.sh)
@@ -240,20 +282,26 @@ start_server() {
             --tp $TP_SIZE
             --host $HOST
             --port $PORT
+            --trust-remote-code
             --tool-call-parser glm47
             --reasoning-parser glm45
             --watchdog-timeout 1200
-            --mem-fraction-static 0.85
+            --mem-fraction-static "$MEM_FRACTION_STATIC"
             --kv-cache-dtype fp8_e4m3
             --disable-radix-cache
             --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}'
-            --watchdog-timeout 1200
     )
+    if [ ${#QUANT_ARGS[@]} -gt 0 ]; then
+        cmd+=("${QUANT_ARGS[@]}")
+    fi
 
     if is_rocm_gpu_env; then
+        # Match InferenceX glm5.1_fp4_mi355x.sh: tilelang NSA backends,
+        # tokenizer-worker-num scales with TP.
         cmd+=(
             --nsa-prefill-backend tilelang
             --nsa-decode-backend tilelang
+            --tokenizer-worker-num $((TP_SIZE * 2))
         )
         if [ "$DUAL_STREAM_ROCM" == "true" ]; then
             # Two independent toggles must both be set for full ROCm dual-stream:
@@ -268,13 +316,14 @@ start_server() {
             #         layout and the MoE forward_normal_dual_stream are skipped.
             #         (Default OFF because the layout regresses on MI355X — see
             #         tools/dual_stream_regression_analysis.md for full analysis.)
-            cmd+=(--disable-shared-experts-fusion)
+            NEED_DISABLE_SHARED_FUSION="true"
             export SGLANG_ENABLE_HIP_DUAL_STREAM=1
         fi
     else
-        # NVIDIA (B200) specific optimizations
+        # NVIDIA (B200) specific optimizations. Matches InferenceX
+        # glm5_fp4_b200.sh / glm5_fp8_b200.sh: trtllm NSA, flashinfer MoE,
+        # 32K prefill chunking, allreduce fusion, fixed stream-interval.
         cmd+=(
-            --quantization fp8
             --attention-backend nsa
             --nsa-prefill-backend trtllm
             --nsa-decode-backend trtllm
@@ -283,7 +332,29 @@ start_server() {
             --max-prefill-tokens 32768
             --enable-flashinfer-allreduce-fusion
             --stream-interval 30
+            --tokenizer-worker-num 6
         )
+        # NVFP4-specific: cap CUDA-graph BS and lower scheduler poll
+        # interval to match InferenceX's glm5_fp4_b200.sh exactly.
+        case "${MODEL_NAME}" in
+            *NVFP4*)
+                cmd+=(
+                    --cuda-graph-max-bs 256
+                    --scheduler-recv-interval 10
+                )
+                ;;
+        esac
+    fi
+
+    # Auto-add --disable-shared-experts-fusion only when ROCm dual-stream is
+    # enabled (forces num_fused_shared_experts=0 so MoE.forward takes
+    # forward_normal_dual_stream instead of the fused path).
+    # NOT added for nvidia/GLM-5-NVFP4 or amd/GLM-5.1-MXFP4: NV's official
+    # sglang command, InferenceX glm5_fp4_b200.sh, and glm5.1_fp4_mi355x.sh
+    # all omit it (sglang's modelopt_fp4 path handles NVFP4's mixed-precision
+    # shared expert correctly; AMD's MXFP4 quantizes shared experts too).
+    if [ "$NEED_DISABLE_SHARED_FUSION" = "true" ]; then
+        cmd+=(--disable-shared-experts-fusion)
     fi
 
     if [ "$MTP_ENABLED" == "true" ]; then
