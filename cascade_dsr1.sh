@@ -34,13 +34,16 @@
 # Override common knobs via flags below. Anything else: edit the
 # constants in this file.
 #
-# Optional: --gsm8k-precheck adds a 200-question GSM8K accuracy run
-# AFTER warmup and BEFORE the cascade bench. Logs land in
-# $LOG_DIR/gsm8k_precheck.log and the parsed accuracy is recorded in
-# bench_meta.json so each cascade run carries a model-correctness
-# signature. After the GSM8K phase, /flush_cache + drop_caches
-# (best-effort) clean SGLang radix tree + OS page cache so the
-# cascade bench still starts cold. Adds ~3-5 min per run.
+# Optional: --gsm8k-precheck adds a 1200-question GSM8K accuracy run
+# AFTER warmup and BEFORE the cascade bench. Log file name + workload
+# match GLM.sh's accuracy_test() (--num-questions 1200 --parallel 1200,
+# log -> $LOG_DIR/Accuracy_GSM8K.log) so the cascade and GLM benchmark
+# trees produce comparable accuracy artifacts. The parsed accuracy is
+# also recorded in bench_meta.json so each cascade run carries a
+# model-correctness signature. After the GSM8K phase, /flush_cache +
+# drop_caches (best-effort) clean SGLang radix tree + OS page cache so
+# the cascade bench still starts cold. Adds ~70-90 sec per run on
+# MI355X (parallel=1200 finishes the 1200 questions in ~70 s wall).
 #
 # Usage on MI355X (run all three modes for a complete cascade picture):
 #   ./cascade_dsr1.sh --tag MI355X_cascade --cache-mode L1 \
@@ -110,11 +113,15 @@ CUDA_GRAPH_MAX_BS=0
 CHUNKED_PREFILL_SIZE=65536
 MAX_PREFILL_TOKENS=65536
 WAIT_FOR_SERVER_SEC=900     # 15 min cap; bail out if SGLang doesn't /health
-# Optional GSM8K precheck: adds ~3-5 min per cascade run; results land
-# in $LOG_DIR/gsm8k_precheck.log + bench_meta.json["gsm8k_precheck_*"].
+# Optional GSM8K precheck: adds ~70-90 sec per cascade run; results land
+# in $LOG_DIR/Accuracy_GSM8K.log + bench_meta.json["gsm8k_precheck_*"].
+# Defaults match GLM.sh's accuracy_test() (1200 / 1200) for cross-bench
+# parity. Higher parallel for cascade-style 4096-token prompts can crash
+# the AMD scheduler, but GSM8K prompts are short (~600 tokens) so
+# parallel=1200 is safe and matches what we already use in GLM benchmarks.
 GSM8K_PRECHECK="false"
-GSM8K_NUM_QUESTIONS=200
-GSM8K_PARALLEL=8            # match cascade --max-parallel; higher can crash scheduler
+GSM8K_NUM_QUESTIONS=1200
+GSM8K_PARALLEL=1200
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -448,8 +455,10 @@ if [ "$GSM8K_PRECHECK" = "true" ]; then
   if [ -z "$GSM8K_SCRIPT" ]; then
     echo ">>> WARNING: --gsm8k-precheck requested but bench_sglang.py not found; skipping" >&2
   else
-    GSM8K_LOG="$LOG_DIR/gsm8k_precheck.log"
-    GSM8K_RESULT_JSONL="$LOG_DIR/gsm8k_precheck_result.jsonl"
+    # File names match GLM.sh's accuracy_test() so the cascade tree and
+    # the GLM benchmark tree produce comparable accuracy artifacts.
+    GSM8K_LOG="$LOG_DIR/Accuracy_GSM8K.log"
+    GSM8K_RESULT_JSONL="$LOG_DIR/Accuracy_GSM8K.jsonl"
     echo ">>> GSM8K precheck: ${GSM8K_NUM_QUESTIONS} questions, parallel=${GSM8K_PARALLEL}"
     # cd into LOG_DIR so the bench script's tmp_output_*.txt and any other
     # cwd-relative outputs land beside the rest of this run's artifacts.
