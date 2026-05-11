@@ -6,7 +6,7 @@
 # ./GLM.sh --dual-stream-rocm        # disable shared-experts-fusion for dual stream on ROCm
 # ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-5-FP8
 # ./GLM.sh --prof --dual-stream-rocm --tag DualStream
-# ./GLM.sh --tp 4 --tag 0507_TP4    # tensor parallel size (default 8)
+# ./GLM.sh --tp 4 --tag 0507_TP4    # tensor parallel size (auto: TP=4 for FP4 models, TP=8 for FP8)
 # ./GLM.sh --docker rocm/sgl-dev:v0.5.10rc0-rocm720-mi35x-20260412   # tag results dir with docker image
 #
 # GLM-5 / GLM-5.1 FP4 examples (auto-detects quant scheme from model name;
@@ -25,7 +25,11 @@ PROF_COMBINED="false"   # if true: single combined trace (no --profile-by-stage)
 DUAL_STREAM_ROCM="false"
 MTP_TAG=""
 USER_TAG=""
-TP_SIZE=8
+# TP_SIZE="auto" means: pick from MODEL_NAME after --model is parsed.
+# FP4 models (MXFP4 / NVFP4) default to TP=4 so MI355X and B200 profiles
+# are directly comparable at the same TP. FP8 / unrecognized fall back
+# to TP=8. Override anytime with --tp.
+TP_SIZE="auto"
 MODEL_PATH="/data/huggingface/hub/zai-org/GLM-5-FP8"
 # DOCKER labels the results directory so different docker images don't clobber
 # each other. Override with --docker <image>. Known-good images:
@@ -104,14 +108,25 @@ case "${MODEL_NAME}" in
     *NVFP4*)
         QUANT_ARGS=(--quantization modelopt_fp4)
         MEM_FRACTION_STATIC="0.9"
+        # FP4 default TP=4 — InferenceX runs both TP=4 and TP=8 for B200
+        # NVFP4 (yaml: { tp: 4, conc 4–256 } is the main sweep); we pick
+        # TP=4 so it cross-compares cleanly with MI355X MXFP4 also at TP=4.
+        [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
         ;;
     *MXFP4*)
         # MXFP4 self-declares; shared experts are also MXFP4 -> fusion OK.
+        # InferenceX MI355X main sweep is TP=2 but its TP=4 entry is the
+        # one that lines up with B200's TP=4 NVFP4 sweep, so default to 4
+        # here for direct MI355X-vs-B200 comparison. Override with --tp 2
+        # to match InferenceX's MXFP4 main sweep.
+        [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
         ;;
     *FP8*)
         QUANT_ARGS=(--quantization fp8)
         ;;
 esac
+# Fallback for FP8 / unrecognized models: keep the historical TP=8 default.
+[ "$TP_SIZE" = "auto" ] && TP_SIZE=8
 
 # ===================== Server and Benchmark Setting =====================
 # InferenceMax tuning (from InferenceX/glm5_fp8_mi355x.sh)
