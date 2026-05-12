@@ -85,17 +85,18 @@ PORT="30000"
 #   L2       + host DRAM pool      (no external storage)
 #   L3_file  + local file backend  (full cascade; the default)
 CACHE_MODE="L3_file"
-# --hicache-size: per-rank host KV pool in GB. Default 192 matches the
-# original a0367ca config. Pass "auto" or --hicache-size N to override:
+# --hicache-size: per-rank host KV pool in GB. Default "auto" lets each
+# platform max out its own DRAM (MI355X ~320 GB/rank on a 3 TB box,
+# B200 ~192 GB/rank on a 2 TB box) — same command line on both. Pass an
+# explicit number for cross-platform fairness (same host pool size on
+# both MI355X and B200), e.g. --hicache-size 192 to reproduce the
+# original a0367ca config.
 #   "auto"   = pick the largest value that fits in this box's MemAvailable
-#              minus host headroom, divided across TP ranks. Lets MI355X
-#              (3 TB DRAM) max out to ~320 GB/rank while B200 (2 TB DRAM)
-#              lands around ~192 GB/rank automatically — same command
-#              line on both, each platform shows its real ceiling. Use
-#              this for "let each platform win on its own DRAM" runs.
+#              minus host headroom, divided across TP ranks. Use this for
+#              "let each platform win on its own DRAM" runs.
 #   <number> = explicit per-rank GB (cross-platform fairness — same host
 #              pool size on both MI355X and B200).
-HICACHE_SIZE=192
+HICACHE_SIZE=auto
 HOST_HEADROOM_GB=200
 NUM_CLIENTS=300
 NUM_ROUNDS=15
