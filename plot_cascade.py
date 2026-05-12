@@ -1,41 +1,50 @@
 #!/usr/bin/env python3
-"""Plot per-round TTFT / cache-hit-rate from HiCache.sh multiturn runs.
+"""Plot per-round TTFT / cache-hit-rate from HiCache.sh / cascade_dsr1.sh
+multiturn runs.
 
 Reproduces the "Per-turn Performance" figure style of the Mooncake
 HiCache benchmark page (https://kvcache-ai.github.io/Mooncake/
-performance/sglang-hicache-benchmark-results-v1.html), with explicit
-MI355X vs B200 jsonl files passed in for a 1-vs-1 cross-platform
-comparison.
+performance/sglang-hicache-benchmark-results-v1.html). Supports two
+plotting layouts in one script:
+
+  (A) Cross-platform compare: --MI355X X.jsonl --B200 Y.jsonl
+      One curve per platform tag (typically same cache_mode).
+
+  (B) Same-platform cascade compare: --B200 L1.jsonl L2.jsonl L3.jsonl
+      One curve per cache_mode under a single platform tag. Curves are
+      colored by cache_mode (L1 blue / L2 orange / L3_file green / ...)
+      with distinct markers so the legend stays readable.
 
 Inputs:
-  Each --MI355X / --B200 flag points at a single bench_multiturn.jsonl
-  produced by HiCache.sh. The first JSON line's "round" dict provides
-  per-round average_ttft and cache_hit_rate that get plotted as one
-  curve. Cache mode and hicache size are auto-extracted from the file
-  path if it follows HiCache.sh's
-    results/<docker>/<MODEL>-HiCache[-<tag>]/<cache_mode>/[size_N]/
-  layout; otherwise just the platform tag is shown in the legend.
+  --MI355X / --B200 each accept ONE OR MORE bench_multiturn.jsonl
+  paths. The first JSON line's "round" dict provides per-round
+  average_ttft and cache_hit_rate that get plotted as one curve per
+  file. Cache mode + hicache size are auto-extracted from the path if
+  it follows the conventional layout
+    results/<docker>/<MODEL>-(HiCache|cascade)[-<tag>]/<cache_mode>/[size_N]/
+  otherwise the parser falls back to scanning path segments for any
+  known cache_mode token (L1 / L2 / L3_file / ...).
 
 Paths:
   All paths (--MI355X / --B200 / --out) are resolved to absolute at
   parse time, so relative inputs still work but the rendered PNG always
-  lands in a predictable spot regardless of cwd. The success message
-  prints the resolved absolute path. Examples use $HOME-prefixed paths
-  for clarity.
+  lands in a predictable spot regardless of cwd.
 
 Usage:
-  # MI355X vs B200, same cache mode (auto-detected from path):
+  # Same platform, L1 vs L1+L2 vs L1+L2+L3 cascade (this user's typical case):
+  python3 plot_cascade.py \
+      --Title "DSR1-0528 B200 cascade" \
+      --B200 $HOME/SGLang-benchmarks/results/.../L1/bench_multiturn.jsonl \
+             $HOME/SGLang-benchmarks/results/.../L2/size_192/bench_multiturn.jsonl \
+             $HOME/SGLang-benchmarks/results/.../L3_file/size_192/bench_multiturn.jsonl \
+      --out  $HOME/SGLang-benchmarks/results/cascade_b200_3modes.png
+
+  # Cross-platform compare (same cache_mode):
   python3 plot_cascade.py \
       --Title "DSR1-0528 HiCache L3_file (192 GB)" \
-      --MI355X $HOME/SGLang-benchmarks/results/<rocm-docker>/DeepSeek-R1-0528-cascade-MI355X_cascade/L3_file/size_192/bench_multiturn.jsonl \
-      --B200   $HOME/SGLang-benchmarks/results/<cuda-docker>/DeepSeek-R1-0528-cascade-B200_cascade/L3_file/size_192/bench_multiturn.jsonl \
+      --MI355X $HOME/SGLang-benchmarks/results/.../L3_file/size_192/bench_multiturn.jsonl \
+      --B200   $HOME/SGLang-benchmarks/results/.../L3_file/size_192/bench_multiturn.jsonl \
       --out    $HOME/SGLang-benchmarks/results/cascade_L3_file_192.png
-
-  # Single platform also works (just drop the other flag):
-  python3 plot_cascade.py \
-      --Title "MI355X HiCache L2" \
-      --MI355X $HOME/SGLang-benchmarks/results/<rocm-docker>/DeepSeek-R1-0528-cascade-MI355X_cascade/L2/size_192/bench_multiturn.jsonl \
-      --out    $HOME/SGLang-benchmarks/results/mi355x_L2.png
 """
 
 from __future__ import annotations
@@ -57,7 +66,7 @@ except ImportError:
 
 PATH_RE = re.compile(
     r"results/(?P<docker>[^/]+)/"
-    r"(?P<model_tag>[^/]+)-HiCache(?:-(?P<tag>[^/]+))?/"
+    r"(?P<model_tag>[^/]+?)-(?:HiCache|cascade)(?:-(?P<tag>[^/]+))?/"
     r"(?P<cache_mode>[^/]+)"
     r"(?:/size_(?P<size>\d+))?/bench_multiturn\.jsonl$"
 )
@@ -107,11 +116,12 @@ TAG_LINESTYLE = {
 
 
 def parse_path(path: Path) -> dict | None:
-    """Extract (tag, cache_mode, size) from a HiCache.sh-style results path.
+    """Extract (tag, cache_mode, size) from a HiCache.sh / cascade_dsr1.sh
+    results path. Tries the strict layout first, then falls back to scanning
+    segments for any known cache_mode token so non-standard parents (e.g.
+    custom result dirs) still light up cache_mode in the legend.
 
-    Returns None when the path is anywhere outside results/ or doesn't
-    match the expected layout — caller is expected to fall back to a
-    minimal stub dict in that case.
+    Returns None only when the path is anywhere outside /results/.
     """
     abs_str = str(path.resolve())
     idx = abs_str.find("/results/")
@@ -119,14 +129,38 @@ def parse_path(path: Path) -> dict | None:
         return None
     sub = abs_str[idx + 1:]
     m = PATH_RE.search(sub)
-    if not m:
+    if m:
+        return {
+            "docker":     m.group("docker"),
+            "model":      m.group("model_tag"),
+            "tag":        m.group("tag") or "",
+            "cache_mode": m.group("cache_mode"),
+            "size":       int(m.group("size")) if m.group("size") else None,
+            "path":       path,
+        }
+    # Fallback: walk segments looking for a recognized cache_mode and an
+    # optional size_N sibling. Keeps the legend informative even when the
+    # parent dir doesn't follow the -HiCache / -cascade naming.
+    parts = sub.split("/")
+    cache_mode = ""
+    size = None
+    for i, seg in enumerate(parts):
+        if seg in CACHE_MODE_ORDER:
+            cache_mode = seg
+            if i + 1 < len(parts) and parts[i + 1].startswith("size_"):
+                try:
+                    size = int(parts[i + 1].split("_", 1)[1])
+                except (ValueError, IndexError):
+                    pass
+            break
+    if not cache_mode:
         return None
     return {
-        "docker":     m.group("docker"),
-        "model":      m.group("model_tag"),
-        "tag":        m.group("tag") or "",
-        "cache_mode": m.group("cache_mode"),
-        "size":       int(m.group("size")) if m.group("size") else None,
+        "docker":     parts[1] if len(parts) > 1 else "",
+        "model":      parts[2] if len(parts) > 2 else "",
+        "tag":        "",
+        "cache_mode": cache_mode,
+        "size":       size,
         "path":       path,
     }
 
@@ -261,9 +295,13 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
     ax_ttft.set_xticks(xticks)
     ax_hit.set_xticks(xticks)
 
-    # Color rule: tag wins. AMD → orange, NVIDIA → green, regardless of how
-    # many cache_modes are in the plot. Falls back to cache_mode color only
-    # when the tag doesn't look like any known platform.
+    # Style strategy depends on how many tags vs cache_modes are present:
+    #   - single tag + multi mode  → color by cache_mode (typical L1/L2/L3
+    #                                  cascade on one platform)
+    #   - multi tag + single mode  → color by platform (NVIDIA green vs AMD
+    #                                  orange cross-platform compare)
+    #   - multi tag + multi mode   → color by platform, linestyle by mode
+    #                                  index within that platform
     tag_palette = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b"]
 
     def color_for_tag(tag: str) -> str | None:
@@ -274,43 +312,79 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
             return "#ff7f0e"  # orange for AMD
         return None
 
+    modes_per_tag: dict[str, list[str]] = {}
+    for r in runs:
+        modes_per_tag.setdefault(r["tag"], [])
+        if r["cache_mode"] not in modes_per_tag[r["tag"]]:
+            modes_per_tag[r["tag"]].append(r["cache_mode"])
+    multi_tag = len(tag_list) > 1
+    multi_mode_some_tag = any(len(v) > 1 for v in modes_per_tag.values())
+    markers = ("o", "s", "^", "D", "v", "P")
+
+    # Same-platform multi-mode runs share the same model/clients/req_len, so
+    # their L1 / L1+L2 fill rounds collapse onto a single x-position per
+    # threshold. Track which rounded rounds we've already drawn so labels
+    # don't stack on top of each other. Cross-platform runs naturally won't
+    # collide here (different GPUs → different l1_gib → different rounds).
+    seen_l1_fill_rounds: set[float] = set()
+    seen_l1l2_fill_rounds: set[float] = set()
+
     for r in runs:
         rounds = list(range(1, len(r["ttft"]) + 1))
         tag_idx = tag_list.index(r["tag"])
-        color = (color_for_tag(r["tag"])
-                 or CACHE_MODE_COLOR.get(r["cache_mode"])
-                 or tag_palette[tag_idx % len(tag_palette)])
-        # If multiple cache_modes per tag, use linestyle to distinguish modes.
-        if len(tag_list) > 1 and len({rr["cache_mode"] for rr in runs if rr["tag"] == r["tag"]}) > 1:
-            linestyle, marker = TAG_LINESTYLE.get(tag_idx, ("solid", "o"))
+        mode_idx_in_tag = modes_per_tag[r["tag"]].index(r["cache_mode"])
+
+        if not multi_tag and multi_mode_some_tag:
+            color = (CACHE_MODE_COLOR.get(r["cache_mode"])
+                     or tag_palette[mode_idx_in_tag % len(tag_palette)])
+            linestyle = "solid"
+            marker = markers[mode_idx_in_tag % len(markers)]
+        elif multi_tag and multi_mode_some_tag:
+            color = (color_for_tag(r["tag"])
+                     or tag_palette[tag_idx % len(tag_palette)])
+            linestyle, marker = TAG_LINESTYLE.get(mode_idx_in_tag, ("solid", "o"))
         else:
-            linestyle, marker = "solid", ("o", "s", "^", "D")[tag_idx % 4]
+            color = (color_for_tag(r["tag"])
+                     or CACHE_MODE_COLOR.get(r["cache_mode"])
+                     or tag_palette[tag_idx % len(tag_palette)])
+            linestyle, marker = "solid", markers[tag_idx % len(markers)]
 
         # Vertical lines marking when L1 and L1+L2 are predicted to fill,
         # so the reader can verify TTFT spikes line up with cache-tier
         # boundary crossings instead of guessing. Labels are staggered
         # per tag to avoid overlapping when two platforms fill at nearby
-        # rounds (typical for MI355X-vs-B200 L1 events).
+        # rounds (typical for MI355X-vs-B200 L1 events). Dedup on rounded
+        # round so the SAME threshold (collapsed L1 fill across L1/L2/L3
+        # cascade modes on one platform) isn't redrawn 3 times.
         thr = r.get("fill_thresholds")
         if thr:
             l1_r = thr.get("l1_fill_round")
             ll_r = thr.get("l1_l2_fill_round")
             tag_label = r["tag"]
-            # tag_idx 0 → labels at top (0.92 / 0.84); tag_idx 1+ → bottom (0.04 / 0.12).
             top_y = 0.92 - 0.08 * (tag_idx % 2)
             bot_y = 0.04 + 0.08 * (tag_idx % 2)
             if l1_r and 1 <= l1_r <= max_rounds:
-                ax_ttft.axvline(l1_r, color=color, linestyle=":", alpha=0.55, linewidth=1.2)
-                ax_ttft.text(l1_r, bot_y,
-                             f" {tag_label} L1 fill (r={l1_r:.1f})",
-                             transform=ax_ttft.get_xaxis_transform(),
-                             color=color, fontsize=8, va="bottom", ha="left", alpha=0.95)
+                key = round(l1_r, 1)
+                if key not in seen_l1_fill_rounds:
+                    seen_l1_fill_rounds.add(key)
+                    line_color = color if multi_tag else "#555555"
+                    label_pre = f" {tag_label} " if multi_tag else " "
+                    ax_ttft.axvline(l1_r, color=line_color, linestyle=":", alpha=0.55, linewidth=1.2)
+                    ax_ttft.text(l1_r, bot_y,
+                                 f"{label_pre}L1 fill (r={l1_r:.1f})",
+                                 transform=ax_ttft.get_xaxis_transform(),
+                                 color=line_color, fontsize=8, va="bottom", ha="left", alpha=0.95)
             if ll_r and 1 <= ll_r <= max_rounds:
-                ax_ttft.axvline(ll_r, color=color, linestyle="--", alpha=0.55, linewidth=1.2)
-                ax_ttft.text(ll_r, top_y,
-                             f" {tag_label} L1+L2 fill (r={ll_r:.1f})",
-                             transform=ax_ttft.get_xaxis_transform(),
-                             color=color, fontsize=8, va="top", ha="left", alpha=0.95)
+                key = round(ll_r, 1)
+                if key not in seen_l1l2_fill_rounds:
+                    seen_l1l2_fill_rounds.add(key)
+                    line_color = color if multi_tag else "#555555"
+                    label_pre = f" {tag_label} " if multi_tag else " "
+                    ax_ttft.axvline(ll_r, color=line_color, linestyle="--", alpha=0.55, linewidth=1.2)
+                    ax_ttft.text(ll_r, top_y,
+                                 f"{label_pre}L1+L2 fill (r={ll_r:.1f})",
+                                 transform=ax_ttft.get_xaxis_transform(),
+                                 color=line_color, fontsize=8, va="top", ha="left", alpha=0.95)
 
         mode_label = CACHE_MODE_LABEL.get(r["cache_mode"], r["cache_mode"])
         size_suffix = f" ({r['size']} GB)" if r["size"] is not None else ""
@@ -340,43 +414,42 @@ def main():
                     "bench_multiturn.jsonl files (HiCache.sh output).",
     )
     p.add_argument("--Title", default=None, help="Plot title")
-    p.add_argument("--MI355X", default=None,
-                   help="Path to MI355X bench_multiturn.jsonl")
-    p.add_argument("--B200", default=None,
-                   help="Path to B200 bench_multiturn.jsonl")
+    p.add_argument("--MI355X", nargs="+", default=None,
+                   help="One or more MI355X bench_multiturn.jsonl paths")
+    p.add_argument("--B200", nargs="+", default=None,
+                   help="One or more B200 bench_multiturn.jsonl paths")
     p.add_argument("--out", required=True, help="Output PNG path")
     args = p.parse_args()
 
     sources = [
-        ("MI355X", args.MI355X),
-        ("B200",   args.B200),
+        ("MI355X", args.MI355X or []),
+        ("B200",   args.B200   or []),
     ]
     runs: list[dict] = []
-    for tag, jsonl_path in sources:
-        if jsonl_path is None:
-            continue
-        p_jsonl = Path(jsonl_path).expanduser()
-        if not p_jsonl.is_file():
-            sys.exit(f"ERROR: file not found: {jsonl_path}")
-        if p_jsonl.stat().st_size == 0:
-            sys.exit(f"ERROR: empty file: {jsonl_path}")
+    for tag, jsonl_paths in sources:
+        for jsonl_path in jsonl_paths:
+            p_jsonl = Path(jsonl_path).expanduser()
+            if not p_jsonl.is_file():
+                sys.exit(f"ERROR: file not found: {jsonl_path}")
+            if p_jsonl.stat().st_size == 0:
+                sys.exit(f"ERROR: empty file: {jsonl_path}")
 
-        # Recover cache_mode / size from the path when it follows HiCache.sh's
-        # results/<docker>/<MODEL>-HiCache[-<tag>]/<cache_mode>/[size_N]/
-        # layout. Falls back to a stub when the path lives elsewhere — the
-        # legend then shows just the platform tag without mode/size details.
-        meta = parse_path(p_jsonl) or {
-            "tag": "", "cache_mode": "", "size": None, "path": p_jsonl,
-        }
-        meta["tag"] = tag  # user-specified --MI355X / --B200 always wins
+            # Recover cache_mode / size from the path. parse_path() handles
+            # both the strict <MODEL>-(HiCache|cascade)/<mode>[/size_N]
+            # layout and a permissive fallback that just scans segments for
+            # a known cache_mode token.
+            meta = parse_path(p_jsonl) or {
+                "tag": "", "cache_mode": "", "size": None, "path": p_jsonl,
+            }
+            meta["tag"] = tag  # user-specified --MI355X / --B200 always wins
 
-        ttft, hit = load_round_data(p_jsonl)
-        if not ttft:
-            sys.exit(f"ERROR: no per-round data in {jsonl_path}")
-        meta["ttft"] = ttft
-        meta["hit"] = hit
-        meta["fill_thresholds"] = load_fill_thresholds(p_jsonl)
-        runs.append(meta)
+            ttft, hit = load_round_data(p_jsonl)
+            if not ttft:
+                sys.exit(f"ERROR: no per-round data in {jsonl_path}")
+            meta["ttft"] = ttft
+            meta["hit"] = hit
+            meta["fill_thresholds"] = load_fill_thresholds(p_jsonl)
+            runs.append(meta)
 
     if not runs:
         sys.exit("ERROR: pass at least one of --MI355X / --B200")
