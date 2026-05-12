@@ -395,6 +395,63 @@ collect_host_info() {
   elif command -v nvidia-smi >/dev/null 2>&1; then
     nvidia-smi --query-gpu=name --format=csv,noheader | head -1
   fi
+
+  # Per-GPU PCIe link spec — the HiCache L2 / L3 -> GPU upload ceiling.
+  # Each rank pulls its KV-cache shard via its own PCIe link, so aggregate
+  # upload BW is sum(per-link cur BW) across all 3D controllers. We walk
+  # /sys/bus/pci by class 0x030200 (3D controller) which catches both
+  # NVIDIA and AMD compute GPUs and skips the management VGA at 0x030000.
+  # GPU friendly name is best-effort: nvidia-smi first, fall back to a
+  # short lspci description, else vendor:device IDs.
+  echo "--- GPU PCIe links (/sys/bus/pci, class 0x030200) ---"
+  printf "  %-13s %-15s %-30s %s\n" "bus_id" "name" "PCIe cur / max" "~GB/s cur/max"
+  local gpu_name_map
+  gpu_name_map=$(mktemp 2>/dev/null || echo "/tmp/gpu_name_map.$$")
+  : > "$gpu_name_map"
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    # nvidia-smi BDF is "00000000:1B:00.0"; normalize to sysfs format
+    # "0000:1b:00.0" (lowercase, 4-char domain).
+    nvidia-smi --query-gpu=pci.bus_id,name --format=csv,noheader 2>/dev/null \
+      | awk -F, '{
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+          bdf = tolower($1); sub(/^[0-9a-f]{4}/, "", bdf)
+          printf "%s\t%s\n", bdf, $2
+        }' > "$gpu_name_map"
+  fi
+  local n_gpu=0 total_bw_cur=0 total_bw_max=0
+  local dev bdf name cls_str cw mls_str mw cur_lane max_lane bw_cur bw_max
+  for dev in /sys/bus/pci/devices/*; do
+    [ -d "$dev" ] || continue
+    [ "$(cat "$dev/class" 2>/dev/null)" = "0x030200" ] || continue
+    bdf=$(basename "$dev")
+    name=$(awk -F'\t' -v b="$bdf" '$1 == b {print $2; exit}' "$gpu_name_map")
+    if [ -z "$name" ] && command -v lspci >/dev/null 2>&1; then
+      name=$(lspci -s "$bdf" 2>/dev/null | sed 's/.*: //; s/ (rev.*//' | head -c 30)
+    fi
+    [ -z "$name" ] && name="(unknown)"
+    cls_str=$(cat "$dev/current_link_speed" 2>/dev/null)
+    cw=$(cat "$dev/current_link_width"      2>/dev/null)
+    mls_str=$(cat "$dev/max_link_speed"     2>/dev/null)
+    mw=$(cat "$dev/max_link_width"          2>/dev/null)
+    cur_lane=$(pcie_lane_gbps "$cls_str")
+    max_lane=$(pcie_lane_gbps "$mls_str")
+    bw_cur=$(awk -v l="$cur_lane" -v w="${cw:-0}" 'BEGIN{printf "%.1f", l*w}')
+    bw_max=$(awk -v l="$max_lane" -v w="${mw:-0}" 'BEGIN{printf "%.1f", l*w}')
+    printf "  %-13s %-15s %-30s %s / %s\n" \
+           "$bdf" "$name" \
+           "${cls_str:-?} x${cw:-?} / ${mls_str:-?} x${mw:-?}" \
+           "$bw_cur" "$bw_max"
+    total_bw_cur=$(awk -v t="$total_bw_cur" -v b="$bw_cur" 'BEGIN{printf "%.1f", t+b}')
+    total_bw_max=$(awk -v t="$total_bw_max" -v b="$bw_max" 'BEGIN{printf "%.1f", t+b}')
+    n_gpu=$((n_gpu+1))
+  done
+  rm -f "$gpu_name_map"
+  if [ "$n_gpu" -gt 0 ]; then
+    printf "  -> aggregate GPU PCIe upload BW: %.0f GB/s cur / %.0f GB/s max across %d GPUs\n" \
+           "$total_bw_cur" "$total_bw_max" "$n_gpu"
+    echo "     (HiCache L2 / L3 -> GPU upload ceiling; one PCIe link per TP rank)"
+  fi
 }
 
 # --host-info-only: print the snapshot and exit BEFORE any validation,
