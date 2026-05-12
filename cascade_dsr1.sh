@@ -241,6 +241,22 @@ collect_host_info() {
   fi
   if command -v dmidecode >/dev/null 2>&1 && [ -r /sys/firmware/dmi/tables/DMI ]; then
     dmidecode -t memory 2>/dev/null | awk '
+      # channel_of strips the trailing slot index from a Locator string so
+      # DIMMs sharing one memory channel collapse to one key. Intel labels
+      # follow "CPU0_DIMM_A0" / "CPU0_DIMM_A1" (same channel A); AMD/HPE
+      # variants like "P1-DIMMA1" or "DIMM 0" follow the same trailing-
+      # digit convention. Strip everything from the last digit to end of
+      # string.
+      function channel_of(s,   c) { c = s; sub(/[0-9]+$/, "", c); return c }
+      # parse_mts pulls the numeric MT/s value out of "5600 MT/s" /
+      # "4400 MT/s" strings; returns 0 for "Unknown" / empty.
+      function parse_mts(s,   v) {
+        v = s
+        if (v !~ /MT\/s/) return 0
+        sub(/[[:space:]]*MT\/s.*/, "", v)
+        gsub(/[^0-9.]/, "", v)
+        return v + 0
+      }
       BEGIN { populated=0; total_gb=0 }
       /^Physical Memory Array$/ { in_arr=1; max_cap=""; num_dev=""; next }
       in_arr && /^[[:space:]]*Maximum Capacity:/   { sub(/^[[:space:]]*Maximum Capacity: /,""); max_cap=$0 }
@@ -266,12 +282,44 @@ collect_host_info() {
           populated += 1
           if (size ~ /GB$/)      { gb=size; sub(/[[:space:]]*GB.*/,"",gb); total_gb += gb + 0 }
           else if (size ~ /MB$/) { mb=size; sub(/[[:space:]]*MB.*/,"",mb); total_gb += (mb+0)/1024 }
+          # Track distinct channels + the configured/rated speed so END can
+          # report aggregate DRAM bandwidth for THIS node (not the DIMM
+          # spec sheet) — the L2 (host pool) read-side roofline.
+          ch_id = channel_of(loc)
+          if (ch_id != "") channels[ch_id] = 1
+          cmts = parse_mts(cfg);   if (cmts > 0) last_cmts = cmts
+          rmts = parse_mts(speed); if (rmts > 0) last_rmts = rmts
         }
         in_md=0
       }
-      END { if (populated) printf "  populated DIMMs: %d, total %d GB\n", populated, total_gb }'
+      END {
+        if (!populated) exit
+        printf "  populated DIMMs: %d, total %d GB\n", populated, total_gb
+        # DRAM peak BW = MT/s × 8 bytes/transfer × num_channels.
+        # MT/s is megatransfers/sec (DDR transfers twice per clock, so e.g.
+        # 4400 MT/s ≈ 2200 MHz). DDR5 channel width is 64-bit = 8 bytes,
+        # giving 35.2 GB/s/ch at 4400 MT/s or 44.8 GB/s/ch at 5600 MT/s.
+        # We prefer "Configured Memory Speed" (the actual running speed
+        # set by BIOS; gets downclocked in 2DPC populations) and fall back
+        # to "Speed" (the DIMM SPD-rated max) only when cfg is Unknown.
+        n_ch = 0; for (k in channels) n_ch++
+        use_mts = (last_cmts > 0 ? last_cmts : last_rmts)
+        src     = (last_cmts > 0 ? "configured" : "rated (cfg unavailable)")
+        if (n_ch == 0 || use_mts == 0) exit
+        per_ch_gbs = use_mts * 8 / 1000
+        agg_gbs    = per_ch_gbs * n_ch
+        printf "  channels populated: %d @ %s %d MT/s\n", n_ch, src, use_mts
+        printf "  -> DRAM peak BW: %.1f GB/s/ch x %d ch = %.0f GB/s aggregate (this node)\n",
+               per_ch_gbs, n_ch, agg_gbs
+        if (last_cmts > 0 && last_rmts > 0 && last_cmts < last_rmts) {
+          rated_per_ch = last_rmts * 8 / 1000
+          rated_agg    = rated_per_ch * n_ch
+          printf "    (rated %d MT/s would be %.0f GB/s; cfg downclocked %.0f%% -- typical for 2DPC)\n",
+                 last_rmts, rated_agg, 100*(last_rmts-last_cmts)/last_rmts
+        }
+      }'
   else
-    echo "  (dmidecode unavailable — install with: apt-get update && apt-get install -y dmidecode)"
+    echo "  (dmidecode unavailable -- install with: apt-get update && apt-get install -y dmidecode)"
   fi
 
   # NVMe drives via sysfs (works without the `nvme` userspace tool). We list
