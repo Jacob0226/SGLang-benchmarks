@@ -97,7 +97,24 @@ CACHE_MODE="L3_file"
 #   <number> = explicit per-rank GB (cross-platform fairness — same host
 #              pool size on both MI355X and B200).
 HICACHE_SIZE=auto
-HOST_HEADROOM_GB=200
+# HOST_HEADROOM_GB: how much DRAM to reserve OUTSIDE the HiCache host pool.
+# On a 3 TB MI355X box with TP=8, the auto sizer does:
+#     PER_RANK = (MemAvail - HOST_HEADROOM) / 8, aligned down to 32 GB
+# i.e. raising headroom by 256 GB drops PER_RANK by 32 GB.
+#
+# Headroom must absorb (write_through hot path, MI355X DSR1-FP8):
+#   ~671 GB DSR1-FP8 weights briefly held in host RAM during model load
+#   ~ 80 GB HiCache pinned-memory staging buffers (TP=8, page_first_direct)
+#   ~ 50 GB OS page cache for /data/huggingface/...
+#   ~ 30 GB SGLang process group anonymous memory (per-rank workers)
+#   + safety margin for write_through bursts that briefly double-allocate.
+#
+# Default 400 GB was chosen after the 200 GB run on jacchang_HiCache pinned
+# 2560/3024 GB and slowed L2 prefill 10-200x (cascade_dsr1.sh L2 v3 run,
+# 2026-05-12). On a 3 TB box this still gives PER_RANK=320 GB / total 2560
+# GB pool, because raising headroom 200->400 only shaved 25 GB/rank pre-
+# alignment. Bump higher (e.g. 900) if write_through is starving the host.
+HOST_HEADROOM_GB=400
 NUM_CLIENTS=300
 NUM_ROUNDS=15
 REQUEST_LENGTH=4096
@@ -183,9 +200,10 @@ MODEL_NAME=$(basename "${MODEL_PATH%/}")
 # This is the whole point of the cross-platform comparison: MI355X
 # (3 TB DRAM) and B200 (~2 TB DRAM) each get to use their own DRAM
 # ceiling, so the cascade reflects true platform capacity. Headroom
-# (default 200 GB) covers OS page cache during model load, HiCache
-# pinned-memory staging buffers, NUMA fragmentation slack, and the
-# SGLang process group's anonymous memory.
+# (default 400 GB; see HOST_HEADROOM_GB block above for breakdown)
+# covers DSR1-FP8 weights held briefly in host DRAM during model load,
+# OS page cache, HiCache pinned-memory staging buffers, NUMA frag slack,
+# and the SGLang process group's anonymous memory.
 if [ "$CACHE_MODE" = "L1" ]; then
   HICACHE_SIZE=0
   echo ">>> CACHE_MODE=L1: skipping host pool sizing (GPU radix cache only)"
