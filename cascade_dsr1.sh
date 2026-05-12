@@ -241,13 +241,14 @@ collect_host_info() {
   fi
   if command -v dmidecode >/dev/null 2>&1 && [ -r /sys/firmware/dmi/tables/DMI ]; then
     dmidecode -t memory 2>/dev/null | awk '
-      # channel_of strips the trailing slot index from a Locator string so
-      # DIMMs sharing one memory channel collapse to one key. Intel labels
-      # follow "CPU0_DIMM_A0" / "CPU0_DIMM_A1" (same channel A); AMD/HPE
-      # variants like "P1-DIMMA1" or "DIMM 0" follow the same trailing-
-      # digit convention. Strip everything from the last digit to end of
-      # string.
-      function channel_of(s,   c) { c = s; sub(/[0-9]+$/, "", c); return c }
+      # stem_of strips the trailing-digit suffix from a Locator string.
+      # Useful for Intel-style "CPU0_DIMM_A0" / "CPU0_DIMM_A1" where the
+      # trailing digit is the slot index WITHIN a channel — stripping
+      # collapses 2DPC slot pairs back to the channel. AMD-style "A1",
+      # "A2", ..., "A12" packs the channel ID into that trailing digit
+      # instead, so this same stripping over-collapses; we disambiguate
+      # in END by checking the populated/stem ratio.
+      function stem_of(s,   c) { c = s; sub(/[0-9]+$/, "", c); return c }
       # parse_mts pulls the numeric MT/s value out of "5600 MT/s" /
       # "4400 MT/s" strings; returns 0 for "Unknown" / empty.
       function parse_mts(s,   v) {
@@ -282,11 +283,13 @@ collect_host_info() {
           populated += 1
           if (size ~ /GB$/)      { gb=size; sub(/[[:space:]]*GB.*/,"",gb); total_gb += gb + 0 }
           else if (size ~ /MB$/) { mb=size; sub(/[[:space:]]*MB.*/,"",mb); total_gb += (mb+0)/1024 }
-          # Track distinct channels + the configured/rated speed so END can
-          # report aggregate DRAM bandwidth for THIS node (not the DIMM
-          # spec sheet) — the L2 (host pool) read-side roofline.
-          ch_id = channel_of(loc)
-          if (ch_id != "") channels[ch_id] = 1
+          # Record BOTH the full locator and the trailing-digit-stripped
+          # stem; END uses populated/n_stem ratio to pick between Intel
+          # 2DPC (stem count = channels) and AMD 1DPC (full count =
+          # channels). Also stash the most recent configured / rated
+          # MT/s values for the bandwidth calc.
+          full_locs[loc] = 1
+          stem_locs[stem_of(loc)] = 1
           cmts = parse_mts(cfg);   if (cmts > 0) last_cmts = cmts
           rmts = parse_mts(speed); if (rmts > 0) last_rmts = rmts
         }
@@ -295,27 +298,47 @@ collect_host_info() {
       END {
         if (!populated) exit
         printf "  populated DIMMs: %d, total %d GB\n", populated, total_gb
-        # DRAM peak BW = MT/s × 8 bytes/transfer × num_channels.
+        # DRAM peak BW = MT/s x 8 bytes/transfer x num_channels.
         # MT/s is megatransfers/sec (DDR transfers twice per clock, so e.g.
-        # 4400 MT/s ≈ 2200 MHz). DDR5 channel width is 64-bit = 8 bytes,
-        # giving 35.2 GB/s/ch at 4400 MT/s or 44.8 GB/s/ch at 5600 MT/s.
+        # 4400 MT/s -> 2200 MHz). DDR5 channel width is 64-bit = 8 bytes,
+        # giving 35.2 GB/s/ch at 4400 MT/s or 48.0 GB/s/ch at 6000 MT/s.
         # We prefer "Configured Memory Speed" (the actual running speed
-        # set by BIOS; gets downclocked in 2DPC populations) and fall back
-        # to "Speed" (the DIMM SPD-rated max) only when cfg is Unknown.
-        n_ch = 0; for (k in channels) n_ch++
+        # set by BIOS; can be downclocked vs the DIMM SPD) and fall back
+        # to "Speed" (the rated max) only when cfg is Unknown.
+        n_full = 0; for (k in full_locs) n_full++
+        n_stem = 0; for (k in stem_locs) n_stem++
+        # Pick channel count based on locator format. Intel boards label
+        # slots "CPU0_DIMM_A0" / "CPU0_DIMM_A1" — trailing digit is the
+        # SLOT index, so stripping it collapses 2DPC pairs to one channel
+        # per stem (n_ch = n_stem). AMD EPYC boards label slots "A1",
+        # "A2", ..., "A12", "B1", ..., "B12" — trailing digit is the
+        # CHANNEL ID, so each populated locator is already one channel
+        # (n_ch = n_full). Disambiguate by populated/n_stem ratio: 1 or
+        # 2 = plausible Intel 1DPC/2DPC; anything larger means stem
+        # stripping over-collapsed (e.g. AMD A1..A12 -> stem "A") and we
+        # use the full count instead.
+        ratio = (n_stem > 0 ? int((populated / n_stem) + 0.5) : 0)
+        if (ratio == 1 || ratio == 2) {
+          n_ch = n_stem
+        } else {
+          n_ch = n_full
+        }
+        dpc = (n_ch > 0 ? int((populated / n_ch) + 0.5) : 1)
         use_mts = (last_cmts > 0 ? last_cmts : last_rmts)
         src     = (last_cmts > 0 ? "configured" : "rated (cfg unavailable)")
         if (n_ch == 0 || use_mts == 0) exit
         per_ch_gbs = use_mts * 8 / 1000
         agg_gbs    = per_ch_gbs * n_ch
-        printf "  channels populated: %d @ %s %d MT/s\n", n_ch, src, use_mts
+        printf "  channels populated: %d (DPC=%d) @ %s %d MT/s\n",
+               n_ch, dpc, src, use_mts
         printf "  -> DRAM peak BW: %.1f GB/s/ch x %d ch = %.0f GB/s aggregate (this node)\n",
                per_ch_gbs, n_ch, agg_gbs
         if (last_cmts > 0 && last_rmts > 0 && last_cmts < last_rmts) {
           rated_per_ch = last_rmts * 8 / 1000
           rated_agg    = rated_per_ch * n_ch
-          printf "    (rated %d MT/s would be %.0f GB/s; cfg downclocked %.0f%% -- typical for 2DPC)\n",
-                 last_rmts, rated_agg, 100*(last_rmts-last_cmts)/last_rmts
+          dpc_note = (dpc == 2 ? " -- typical for 2DPC" : "")
+          printf "    (rated %d MT/s would be %.0f GB/s; cfg downclocked %.0f%%%s)\n",
+                 last_rmts, rated_agg, 100*(last_rmts-last_cmts)/last_rmts, dpc_note
         }
       }'
   else
