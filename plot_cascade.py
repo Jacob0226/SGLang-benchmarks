@@ -242,12 +242,20 @@ def load_fill_thresholds(jsonl_path: Path) -> dict | None:
 
     l2_gib = float(meta.get("hicache_size_gb") or 0)
 
+    # When there's no L2 pool (L1-only run, hicache_size_gb is null), the
+    # "L1+L2 fill" round collapses onto "L1 fill" and adds no information —
+    # suppress it so the plot doesn't draw two overlapping labels at the
+    # same x-position with one of them ("L1+L2 fill") flat-out wrong.
+    l1_l2_fill = None
+    if round_inc_gib and l2_gib > 0:
+        l1_l2_fill = (l1_gib + l2_gib) / round_inc_gib
+
     return {
         "round_inc_gib": round_inc_gib,
         "l1_gib": l1_gib,
         "l2_gib": l2_gib,
-        "l1_fill_round":      l1_gib / round_inc_gib if round_inc_gib else None,
-        "l1_l2_fill_round":  (l1_gib + l2_gib) / round_inc_gib if round_inc_gib else None,
+        "l1_fill_round":     l1_gib / round_inc_gib if round_inc_gib else None,
+        "l1_l2_fill_round":  l1_l2_fill,
     }
 
 
@@ -290,10 +298,15 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
     # Show every round on the x-axis (no stride). Use the longest run's
     # round count so single-platform and cross-platform plots both label
     # rounds 1..N individually rather than matplotlib's default 2/4/6/...
+    # Force tick labels visible on the TOP panel too (sharex=True hides
+    # them by default) so the reader can read round numbers next to TTFT
+    # spikes without sliding their eye down to the hit-rate panel.
     max_rounds = max(len(r["ttft"]) for r in runs)
     xticks = list(range(1, max_rounds + 1))
     ax_ttft.set_xticks(xticks)
     ax_hit.set_xticks(xticks)
+    ax_ttft.tick_params(labelbottom=True)
+    ax_ttft.set_xlabel("# Round")
 
     # Style strategy depends on how many tags vs cache_modes are present:
     #   - single tag + multi mode  → color by cache_mode (typical L1/L2/L3
@@ -369,9 +382,13 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
                     seen_l1_fill_rounds.add(key)
                     line_color = color if multi_tag else "#555555"
                     label_pre = f" {tag_label} " if multi_tag else " "
-                    ax_ttft.axvline(l1_r, color=line_color, linestyle=":", alpha=0.55, linewidth=1.2)
+                    # Mirror the fill marker onto BOTH panels so the cause
+                    # (cache tier saturates) lines up visually with the
+                    # effect (hit-rate plateaus / TTFT spikes).
+                    for ax in (ax_ttft, ax_hit):
+                        ax.axvline(l1_r, color=line_color, linestyle=":", alpha=0.55, linewidth=1.2)
                     ax_ttft.text(l1_r, bot_y,
-                                 f"{label_pre}L1 fill (r={l1_r:.1f})",
+                                 f"{label_pre}L1 hard cap (r={l1_r:.1f})",
                                  transform=ax_ttft.get_xaxis_transform(),
                                  color=line_color, fontsize=8, va="bottom", ha="left", alpha=0.95)
             if ll_r and 1 <= ll_r <= max_rounds:
@@ -380,9 +397,10 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
                     seen_l1l2_fill_rounds.add(key)
                     line_color = color if multi_tag else "#555555"
                     label_pre = f" {tag_label} " if multi_tag else " "
-                    ax_ttft.axvline(ll_r, color=line_color, linestyle="--", alpha=0.55, linewidth=1.2)
+                    for ax in (ax_ttft, ax_hit):
+                        ax.axvline(ll_r, color=line_color, linestyle="--", alpha=0.55, linewidth=1.2)
                     ax_ttft.text(ll_r, top_y,
-                                 f"{label_pre}L1+L2 fill (r={ll_r:.1f})",
+                                 f"{label_pre}L1+L2 hard cap (r={ll_r:.1f})",
                                  transform=ax_ttft.get_xaxis_transform(),
                                  color=line_color, fontsize=8, va="top", ha="left", alpha=0.95)
 
