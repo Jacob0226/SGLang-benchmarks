@@ -347,7 +347,8 @@ if [[ "$CACHE_MODE" == L3_* ]]; then
   export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$HICACHE_FILE_STORE_DIR"
 fi
 # Trap uses :- so L1/L2 (HICACHE_FILE_STORE_DIR="") doesn't trip set -u.
-trap 'rm -rf "${HICACHE_FILE_STORE_DIR:-}" 2>/dev/null; pkill -9 -f sglang.launch_server 2>/dev/null || true' EXIT
+# Also kill the cache_monitor sidecar if it's still alive on exit.
+trap 'rm -rf "${HICACHE_FILE_STORE_DIR:-}" 2>/dev/null; [ -n "${CACHE_MONITOR_PID:-}" ] && kill "${CACHE_MONITOR_PID}" 2>/dev/null; pkill -9 -f sglang.launch_server 2>/dev/null || true' EXIT
 
 # ============================== Server launch ==============================
 SERVER_LOG="$LOG_DIR/server.log"
@@ -528,6 +529,30 @@ else
 fi
 sleep 2
 
+# Start the per-tier cache hit-rate monitor as a sidecar. It detects
+# bench_multiturn.py's round-barrier crossings via sglang:num_requests_total
+# and emits one line + one CSV row per finished round, with L1 / L2 / L3
+# token-hit rates attributable to THAT round only (delta vs the previous
+# round's snapshot — first round's delta uses the baseline captured at
+# monitor start, so warmup / GSM8K precheck hits never pollute the cascade
+# rates). No waiting for bench_multiturn.jsonl at the very end.
+CACHE_MONITOR_SCRIPT="$(dirname "$(readlink -f "$0")")/cache_monitor.py"
+if [ -f "$CACHE_MONITOR_SCRIPT" ]; then
+  echo ">>> starting cache_monitor sidecar (per-round; interval=1s)"
+  python3 "$CACHE_MONITOR_SCRIPT" \
+      --url "http://${HOST}:${PORT}/metrics" \
+      --interval 1 \
+      --num-clients "$NUM_CLIENTS" \
+      --num-rounds "$NUM_ROUNDS" \
+      --csv "$LOG_DIR/cache_tiers.csv" \
+      > "$LOG_DIR/cache_monitor.log" 2>&1 &
+  CACHE_MONITOR_PID=$!
+  echo ">>> cache_monitor pid=${CACHE_MONITOR_PID}; tail -f ${LOG_DIR}/cache_monitor.log"
+else
+  echo ">>> WARNING: ${CACHE_MONITOR_SCRIPT} not found; skipping per-tier cache monitor" >&2
+  CACHE_MONITOR_PID=""
+fi
+
 echo ">>> running cascade multiturn (N=${NUM_CLIENTS} × R=${REQUEST_LENGTH} × ${NUM_ROUNDS} rounds)"
 python3 "$BENCH_SCRIPT" \
   --host "$HOST" --port "$PORT" \
@@ -545,6 +570,12 @@ python3 "$BENCH_SCRIPT" \
   --disable-auto-run \
   --enable-round-barrier \
   2>&1 | tee "$LOG_DIR/bench_multiturn.log"
+
+if [ -n "${CACHE_MONITOR_PID:-}" ] && kill -0 "$CACHE_MONITOR_PID" 2>/dev/null; then
+  echo ">>> stopping cache_monitor (pid=${CACHE_MONITOR_PID})"
+  kill "$CACHE_MONITOR_PID" 2>/dev/null || true
+  wait "$CACHE_MONITOR_PID" 2>/dev/null || true
+fi
 
 # ============================== Cleanup ==============================
 echo ">>> stopping server"
