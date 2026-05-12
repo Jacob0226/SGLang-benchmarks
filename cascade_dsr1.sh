@@ -378,9 +378,7 @@ SERVER_CMD=(
     --enable-metrics
     --enable-cache-report
     --trust-remote-code
-    --reasoning-parser deepseek-r1
     --kv-cache-dtype fp8_e4m3
-    --page-size 64
     --context-length 65536
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
     --max-prefill-tokens "$MAX_PREFILL_TOKENS"
@@ -415,7 +413,32 @@ case "$CACHE_MODE" in
 esac
 
 if is_rocm; then
-  export ROCM_QUICK_REDUCE_QUANTIZATION=INT4 SAFETENSORS_FAST_GPU=1
+  # MI355X DSR1-FP8 server config — aligned with InferenceX
+  # benchmarks/single_node/dsr1_fp8_mi355x.sh + AMD ROCm 7.0 official doc
+  # (https://rocm.docs.amd.com/en/docs-7.0-docker/benchmark-docker/inference-sglang-deepseek-r1-fp8.html).
+  #
+  # SGLANG_USE_AITER=1                       enable aiter kernels (docker
+  #                                          default already sets this; pinned
+  #                                          here so behavior is explicit).
+  # ROCM_QUICK_REDUCE_QUANTIZATION=NONE      do NOT quantize AllReduce. INT4
+  #                                          (the value the SKILL.md notes for
+  #                                          GLM-5) is too lossy for DSR1 and
+  #                                          tanks GSM8K accuracy from 0.93+
+  #                                          to ~0.01 (verified 2026-05-12 in
+  #                                          tools/gsm8k_dsr1_minfix_test.sh).
+  # Also dropped from SERVER_CMD common args:
+  #   --page-size 64           non-standard for FP8 KV + aiter MLA;
+  #                            no public reference uses page_size>1 (AMD doc,
+  #                            InferenceX, Clint Greene's MXFP4 cmd all use
+  #                            default page_size=1). page_size=64 corrupts KV
+  #                            indexing → garbage outputs + occasional HSA fault.
+  #   --reasoning-parser deepseek-r1   strips <think>...</think> server-side;
+  #                            for cascade workload (output_length=1) and
+  #                            GSM8K precheck the parser can eat the actual
+  #                            answer text. Not needed for these benches.
+  export SAFETENSORS_FAST_GPU=1
+  export SGLANG_USE_AITER=1
+  export ROCM_QUICK_REDUCE_QUANTIZATION=NONE
   SERVER_CMD+=(--attention-backend aiter)
 else
   export SGL_ENABLE_JIT_DEEPGEMM=1
