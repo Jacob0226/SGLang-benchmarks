@@ -271,10 +271,27 @@ if command -v numactl >/dev/null 2>&1 && [[ "$NUMA_NODES" == *,* ]]; then
 fi
 
 # ============================== Host snapshot ==============================
+# PCIe link speed string → GB/s per lane (single direction, post-encoding):
+# Gen1 0.25, Gen2 0.5, Gen3 0.985, Gen4 1.969, Gen5 3.938, Gen6 7.877.
+# Used to derive each NVMe drive's theoretical max bandwidth ceiling so the
+# host_info log makes the SSD speed envelope explicit instead of leaving the
+# reader to look up "what is PCIe Gen5 x4". Returns 0 for unknown speeds.
+pcie_lane_gbps() {
+  case "$1" in
+    "2.5 GT/s PCIe"|"2.5 GT/s")   echo "0.250" ;;
+    "5.0 GT/s PCIe"|"5.0 GT/s")   echo "0.500" ;;
+    "8.0 GT/s PCIe"|"8.0 GT/s")   echo "0.985" ;;
+    "16.0 GT/s PCIe"|"16.0 GT/s") echo "1.969" ;;
+    "32.0 GT/s PCIe"|"32.0 GT/s") echo "3.938" ;;
+    "64.0 GT/s PCIe"|"64.0 GT/s") echo "7.877" ;;
+    *)                            echo "0"     ;;
+  esac
+}
+
 {
   echo "=== cascade_dsr1.sh host snapshot @ $(date '+%F %T %Z') ==="
   echo "--- lscpu ---"
-  lscpu | grep -E "Architecture|Vendor|Model name|CPU\(s\)|Socket|Core|Thread|NUMA"
+  lscpu | grep -E "Architecture|Vendor|Model name|CPU\(s\)|Socket|Core|Thread|NUMA|^CPU max MHz|^CPU min MHz"
   echo "--- /proc/meminfo ---"
   grep -E "^MemTotal:|^MemAvailable:|^MemFree:|^Cached:" /proc/meminfo
   echo "--- NUMA per-node DRAM ---"
@@ -285,6 +302,96 @@ fi
     cpus=$(cat "$n/cpulist" 2>/dev/null)
     printf "  node %s: DRAM=%s, CPUs=%s\n" "$nid" "$mem" "$cpus"
   done
+
+  # DIMM-level detail (model, rated + configured speed, manufacturer). Needs
+  # dmidecode + /sys/firmware/dmi/tables (root in container is typical).
+  # Auto-install dmidecode on debian/ubuntu bases since the binary is tiny
+  # and the bench image rarely ships with it; silently no-op if apt fails.
+  echo "--- DRAM DIMMs (dmidecode -t memory) ---"
+  if ! command -v dmidecode >/dev/null 2>&1 \
+       && command -v apt-get >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+    echo "  (auto-installing dmidecode...)"
+    apt-get -qq update >/dev/null 2>&1 || true
+    apt-get -qq install -y dmidecode >/dev/null 2>&1 || true
+  fi
+  if command -v dmidecode >/dev/null 2>&1 && [ -r /sys/firmware/dmi/tables/DMI ]; then
+    dmidecode -t memory 2>/dev/null | awk '
+      BEGIN { populated=0; total_gb=0 }
+      /^Physical Memory Array$/ { in_arr=1; max_cap=""; num_dev=""; next }
+      in_arr && /^[[:space:]]*Maximum Capacity:/   { sub(/^[[:space:]]*Maximum Capacity: /,""); max_cap=$0 }
+      in_arr && /^[[:space:]]*Number Of Devices:/  { sub(/^[[:space:]]*Number Of Devices: /,""); num_dev=$0 }
+      in_arr && /^$/ {
+        if (max_cap!="") printf "  array max=%s, slots=%s\n", max_cap, num_dev
+        in_arr=0
+      }
+      /^Memory Device$/ {
+        in_md=1; size=""; type=""; speed=""; cfg=""; mfr=""; part=""; loc=""; next
+      }
+      in_md && /^[[:space:]]*Size:/                       { sub(/^[[:space:]]*Size: /,""); size=$0 }
+      in_md && /^[[:space:]]*Type: /                      { sub(/^[[:space:]]*Type: /,""); type=$0 }
+      in_md && /^[[:space:]]*Speed:/ && !/Configured/      { sub(/^[[:space:]]*Speed: /,""); speed=$0 }
+      in_md && /^[[:space:]]*Configured Memory Speed:/     { sub(/^[[:space:]]*Configured Memory Speed: /,""); cfg=$0 }
+      in_md && /^[[:space:]]*Manufacturer:/                { sub(/^[[:space:]]*Manufacturer: /,""); mfr=$0 }
+      in_md && /^[[:space:]]*Part Number:/                 { sub(/^[[:space:]]*Part Number: /,""); gsub(/[[:space:]]+$/,"",$0); part=$0 }
+      in_md && /^[[:space:]]*Locator:/ && !/Bank Locator/  { sub(/^[[:space:]]*Locator: /,""); loc=$0 }
+      in_md && /^$/ {
+        if (size != "" && size !~ /No Module/) {
+          printf "  %-14s %-9s %-5s rated=%-10s cfg=%-10s %s %s\n",
+                 loc, size, type, speed, cfg, mfr, part
+          populated += 1
+          if (size ~ /GB$/)      { gb=size; sub(/[[:space:]]*GB.*/,"",gb); total_gb += gb + 0 }
+          else if (size ~ /MB$/) { mb=size; sub(/[[:space:]]*MB.*/,"",mb); total_gb += (mb+0)/1024 }
+        }
+        in_md=0
+      }
+      END { if (populated) printf "  populated DIMMs: %d, total %d GB\n", populated, total_gb }'
+  else
+    echo "  (dmidecode unavailable — install with: apt-get update && apt-get install -y dmidecode)"
+  fi
+
+  # NVMe drives via sysfs (works without the `nvme` userspace tool). We list
+  # every controller, its model, firmware, total size, current PCIe link
+  # speed × width, and the resulting theoretical max bandwidth. The host
+  # may have multiple drives on different PCIe generations (e.g. Samsung
+  # negotiated at Gen3 next to KIOXIA at Gen5 in this lab), and the L3 file
+  # backend's actual disk throughput is capped by whichever drive backs the
+  # docker overlay / mount it lands on — see the L3-path section below.
+  echo "--- NVMe drives (/sys/class/nvme) ---"
+  printf "  %-7s %-34s %-10s %-7s %-28s %s\n" "name" "model" "firmware" "size" "PCIe cur / max" "~GB/s cur/max"
+  for c in /sys/class/nvme/nvme*; do
+    [ -d "$c" ] || continue
+    name=$(basename "$c")
+    model=$(cat "$c/model" 2>/dev/null | xargs)
+    fw=$(cat "$c/firmware_rev" 2>/dev/null | xargs)
+    size=$(lsblk -dn -o SIZE "/dev/${name}n1" 2>/dev/null | head -1 | xargs)
+    cls=$(cat "$c/device/current_link_speed" 2>/dev/null)
+    clw=$(cat "$c/device/current_link_width" 2>/dev/null)
+    mls=$(cat "$c/device/max_link_speed"     2>/dev/null)
+    mlw=$(cat "$c/device/max_link_width"     2>/dev/null)
+    cur_lane=$(pcie_lane_gbps "$cls")
+    max_lane=$(pcie_lane_gbps "$mls")
+    bw_cur=$(awk -v l="$cur_lane" -v w="${clw:-0}" 'BEGIN{printf "%.1f", l*w}')
+    bw_max=$(awk -v l="$max_lane" -v w="${mlw:-0}" 'BEGIN{printf "%.1f", l*w}')
+    printf "  %-7s %-34s %-10s %-7s %-28s %s / %s\n" \
+           "$name" "$model" "$fw" "$size" "${cls:-?} x${clw:-?} / ${mls:-?} x${mlw:-?}" \
+           "$bw_cur" "$bw_max"
+  done
+
+  # L3 file backend lands at /tmp inside the container per line ~367
+  # (HICACHE_FILE_STORE_DIR=/tmp/cascade_dsr1_l3_<TAG>_<SIZE>). Inside docker
+  # /tmp is on the overlay, so df shows "overlay" rather than the underlying
+  # NVMe — readers should cross-reference the drives listed above to figure
+  # out which physical disk the host's /var/lib/docker actually sits on.
+  echo "--- L3 file backend path & backing fs ---"
+  L3_STORE_DIR_PRED="/tmp/cascade_dsr1_l3_${TAG}_${HICACHE_SIZE}"
+  DETECT_DIR="$L3_STORE_DIR_PRED"
+  [ ! -e "$DETECT_DIR" ] && DETECT_DIR="/tmp"
+  echo "  expected L3 dir: $L3_STORE_DIR_PRED"
+  df -h "$DETECT_DIR" 2>/dev/null | tail -1 \
+    | awk '{printf "  mount=%-12s fs=%-10s size=%s used=%s avail=%s\n", $6, $1, $2, $3, $4}'
+  echo "  note: container /tmp is on the docker overlay; the backing NVMe is whichever"
+  echo "        drive holds /var/lib/docker on the host (correlate with the NVMe list)."
+
   echo "--- GPU info ---"
   if command -v rocm-smi >/dev/null 2>&1; then
     rocm-smi --showid 2>&1 | grep "Device Name" | head -1
