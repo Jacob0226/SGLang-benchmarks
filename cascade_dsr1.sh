@@ -589,10 +589,12 @@ sleep 2
 # rates). No waiting for bench_multiturn.jsonl at the very end.
 CACHE_MONITOR_SCRIPT="$(dirname "$(readlink -f "$0")")/cache_monitor.py"
 if [ -f "$CACHE_MONITOR_SCRIPT" ]; then
-  echo ">>> starting cache_monitor sidecar (per-round; interval=1s)"
+  echo ">>> starting cache_monitor sidecar (time-driven 10s sample;"
+  echo "    one CSV row per sample fuses /metrics cache hits + /proc/meminfo"
+  echo "    host RAM, with round_index column to group rows by round)"
   python3 "$CACHE_MONITOR_SCRIPT" \
       --url "http://${HOST}:${PORT}/metrics" \
-      --interval 1 \
+      --interval 10 \
       --num-clients "$NUM_CLIENTS" \
       --num-rounds "$NUM_ROUNDS" \
       --csv "$LOG_DIR/cache_tiers.csv" \
@@ -600,7 +602,7 @@ if [ -f "$CACHE_MONITOR_SCRIPT" ]; then
   CACHE_MONITOR_PID=$!
   echo ">>> cache_monitor pid=${CACHE_MONITOR_PID}; tail -f ${LOG_DIR}/cache_monitor.log"
 else
-  echo ">>> WARNING: ${CACHE_MONITOR_SCRIPT} not found; skipping per-tier cache monitor" >&2
+  echo ">>> WARNING: ${CACHE_MONITOR_SCRIPT} not found; skipping cache+host monitor" >&2
   CACHE_MONITOR_PID=""
 fi
 
