@@ -475,8 +475,13 @@ if [ "$GSM8K_PRECHECK" = "true" ]; then
     # cwd-relative outputs land beside the rest of this run's artifacts.
     if (
         cd "$LOG_DIR"
+        # NOTE: bench_sglang.py's --backend is a *frontend* selector
+        # (srt / srt-no-parallel / srt-raw / gpt-*) defined in
+        # python/sglang/test/test_utils.py:select_sglang_backend(). It is NOT
+        # the server-side --backend used by bench_serving.py (sglang/vllm/tgi).
+        # Don't pass --backend here — the default "srt" is what we want and
+        # what GLM.sh's accuracy_test() uses.
         python3 "$GSM8K_SCRIPT" \
-          --backend sglang \
           --host "$HOST" --port "$PORT" \
           --num-questions "$GSM8K_NUM_QUESTIONS" \
           --parallel "$GSM8K_PARALLEL" \
