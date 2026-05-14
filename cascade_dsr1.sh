@@ -174,6 +174,39 @@ PAGE_SIZE_OVERRIDE=""
 # cache and HiCache (--disable-radix-cache + no --enable-hierarchical-cache).
 NO_CACHE="false"
 
+# --hicache-write-policy: write_through (default) or write_back. Hubert's
+# PR #16531 for DSR1-MXFP4 + page_size=64 + HiCache used write_through;
+# write_back may be faster for cascade workloads where eviction is rare.
+HICACHE_WRITE_POLICY="write_through"
+
+# --hicache-ratio: host pool / device pool ratio (when not using
+# explicit --hicache-size). Empty = SGLang default (2). Hubert used 1.
+HICACHE_RATIO=""
+
+# --max-running-requests: cap on concurrent requests in scheduler.
+# Empty = SGLang default. Hubert used 128 for DSR1-MXFP4 + EAGLE.
+MAX_RUNNING_REQUESTS=""
+
+# --enable-eagle + companions: turn on EAGLE speculative decoding.
+# Hubert tested DSR1-MXFP4 with steps=3, topk=1, draft_tokens=4 +
+# lmsys/DeepSeek-R1-NextN draft model. SGLANG_ENABLE_SPEC_V2=1 is
+# auto-set in the ROCm block when --enable-eagle is on.
+ENABLE_EAGLE="false"
+SPECULATIVE_DRAFT_MODEL=""
+SPECULATIVE_NUM_STEPS=3
+SPECULATIVE_EAGLE_TOPK=1
+SPECULATIVE_NUM_DRAFT_TOKENS=4
+
+# --hubert-preset: apply env vars + flag combinations from Hubert's
+# PR #16531 ("[AMD] Fix aiter page-size handling, DeepSeek MLA tuple
+# inputs, and HiCache/FA3 decode-backend override"). Verified config
+# for DSR1-MXFP4 + aiter + HiCache + page_size=64 → GSM8K 0.942.
+# Sets SGLANG_AITER_MLA_PERSIST=1, SGLANG_ROCM_FUSED_DECODE_MLA=1,
+# SGLANG_USE_AITER_AR=0, SGLANG_INT4_WEIGHT=0, SGLANG_MOE_PADDING=1,
+# SGLANG_SET_CPU_AFFINITY=1, RCCL_MSCCL_ENABLE=0; AITER_MXFP4_MOE_SF=1
+# only when model is MXFP4.
+HUBERT_PRESET="false"
+
 while [[ $# -gt 0 ]]; do
   case $1 in
     --model)          MODEL_PATH="$2"; shift 2;;
@@ -201,6 +234,15 @@ while [[ $# -gt 0 ]]; do
     --mem-fraction-static) MEM_FRACTION_STATIC="$2"; shift 2;;
     --page-size) PAGE_SIZE_OVERRIDE="$2"; shift 2;;
     --no-cache) NO_CACHE="true"; shift 1;;
+    --hicache-write-policy) HICACHE_WRITE_POLICY="$2"; shift 2;;
+    --hicache-ratio) HICACHE_RATIO="$2"; shift 2;;
+    --max-running-requests) MAX_RUNNING_REQUESTS="$2"; shift 2;;
+    --enable-eagle) ENABLE_EAGLE="true"; shift 1;;
+    --speculative-draft-model-path) SPECULATIVE_DRAFT_MODEL="$2"; shift 2;;
+    --speculative-num-steps) SPECULATIVE_NUM_STEPS="$2"; shift 2;;
+    --speculative-eagle-topk) SPECULATIVE_EAGLE_TOPK="$2"; shift 2;;
+    --speculative-num-draft-tokens) SPECULATIVE_NUM_DRAFT_TOKENS="$2"; shift 2;;
+    --hubert-preset) HUBERT_PRESET="true"; shift 1;;
     -h|--help) sed -n '1,/^set -euo pipefail/p' "$0" | sed 's/^# \?//' | head -n -1; exit 0;;
     *) echo "Unknown option: $1" >&2; exit 1;;
   esac
@@ -578,6 +620,13 @@ if [ -n "$PAGE_SIZE_OVERRIDE" ]; then
   PAGE_SIZE="$PAGE_SIZE_OVERRIDE"
 fi
 
+# Detect MXFP4 weight format from model name. AITER_MXFP4_MOE_SF=1 must be
+# set on ROCm + MXFP4 to enable the scale-factor MoE kernel path.
+IS_MXFP4="false"
+case "$MODEL_NAME" in
+  *MXFP4*|*mxfp4*) IS_MXFP4="true" ;;
+esac
+
 # NSA on ROCm + radix cache: tilelang lacks the page_table_1_flattened
 # fixup that flashmla_sparse has on CUDA. With radix cache on, prefix-
 # shared KV reads come from wrong physical slots → GSM8K 0.94 → ~0.82.
@@ -720,6 +769,12 @@ data = {
     "model_path": "$MODEL_PATH",
     "model_name": "$MODEL_NAME",
     "model_family": "$MODEL_FAMILY",
+    "is_mxfp4": $([ "$IS_MXFP4" = "true" ] && echo "True" || echo "False"),
+    "hubert_preset": $([ "$HUBERT_PRESET" = "true" ] && echo "True" || echo "False"),
+    "hicache_write_policy": "$HICACHE_WRITE_POLICY",
+    "hicache_ratio": $([ -n "$HICACHE_RATIO" ] && echo "\"$HICACHE_RATIO\"" || echo "None"),
+    "max_running_requests": $([ -n "$MAX_RUNNING_REQUESTS" ] && echo "$MAX_RUNNING_REQUESTS" || echo "None"),
+    "enable_eagle": $([ "$ENABLE_EAGLE" = "true" ] && echo "True" || echo "False"),
     "page_size": $PAGE_SIZE,
     "context_length": $CONTEXT_LENGTH,
     "tp_size": $TP_SIZE,
@@ -842,7 +897,7 @@ case "$CACHE_MODE" in
       --hicache-size "$HICACHE_SIZE"
       --hicache-mem-layout page_first_direct
       --hicache-io-backend kernel
-      --hicache-write-policy write_through
+      --hicache-write-policy "$HICACHE_WRITE_POLICY"
     )
     ;;
   L3_file)
@@ -851,12 +906,35 @@ case "$CACHE_MODE" in
       --hicache-size "$HICACHE_SIZE"
       --hicache-mem-layout page_first_direct
       --hicache-io-backend kernel
-      --hicache-write-policy write_through
+      --hicache-write-policy "$HICACHE_WRITE_POLICY"
       --hicache-storage-backend file
       --hicache-storage-prefetch-policy best_effort
     )
     ;;
 esac
+
+# Optional CLI overrides (Hubert PR #16531 style knobs).
+if [ -n "$HICACHE_RATIO" ]; then
+  SERVER_CMD+=(--hicache-ratio "$HICACHE_RATIO")
+fi
+if [ -n "$MAX_RUNNING_REQUESTS" ]; then
+  SERVER_CMD+=(--max-running-requests "$MAX_RUNNING_REQUESTS")
+fi
+if [ "$ENABLE_EAGLE" = "true" ]; then
+  if [ -z "$SPECULATIVE_DRAFT_MODEL" ]; then
+    echo "ERROR: --enable-eagle requires --speculative-draft-model-path" >&2
+    exit 1
+  fi
+  SERVER_CMD+=(
+    --speculative-algorithm EAGLE
+    --speculative-draft-model-path "$SPECULATIVE_DRAFT_MODEL"
+    --speculative-num-steps "$SPECULATIVE_NUM_STEPS"
+    --speculative-eagle-topk "$SPECULATIVE_EAGLE_TOPK"
+    --speculative-num-draft-tokens "$SPECULATIVE_NUM_DRAFT_TOKENS"
+  )
+  # SGLang spec scheduler v2 (used by Hubert's PR + GLM.sh MTP path).
+  export SGLANG_ENABLE_SPEC_V2=1
+fi
 
 if is_rocm; then
   # MI355X DSR1-FP8 server config — aligned with InferenceX
@@ -885,6 +963,30 @@ if is_rocm; then
   export SAFETENSORS_FAST_GPU=1
   export SGLANG_USE_AITER=1
   export ROCM_QUICK_REDUCE_QUANTIZATION=NONE
+
+  # --hubert-preset: Hubert PR #16531 ("Fix aiter page-size handling,
+  # DeepSeek MLA tuple inputs, and HiCache/FA3 decode-backend override")
+  # tested DSR1-MXFP4 + aiter + HiCache + page_size=64 → GSM8K 0.942
+  # with the env vars below. Apply the same set so we can reproduce
+  # that result on FP8 / MXFP4 DSR1 variants.
+  if [ "$HUBERT_PRESET" = "true" ]; then
+    export SGLANG_AITER_MLA_PERSIST=1
+    export SGLANG_ROCM_FUSED_DECODE_MLA=1
+    export SGLANG_USE_AITER_AR=0
+    export SGLANG_INT4_WEIGHT=0
+    export SGLANG_MOE_PADDING=1
+    export SGLANG_SET_CPU_AFFINITY=1
+    export RCCL_MSCCL_ENABLE=0
+    if [ "$IS_MXFP4" = "true" ]; then
+      export AITER_MXFP4_MOE_SF=1
+    fi
+    echo ">>> --hubert-preset: applied Hubert PR #16531 env vars" >&2
+    echo "    SGLANG_AITER_MLA_PERSIST=1, SGLANG_ROCM_FUSED_DECODE_MLA=1," >&2
+    echo "    SGLANG_USE_AITER_AR=0, SGLANG_INT4_WEIGHT=0," >&2
+    echo "    SGLANG_MOE_PADDING=1, SGLANG_SET_CPU_AFFINITY=1," >&2
+    echo "    RCCL_MSCCL_ENABLE=0$([ "$IS_MXFP4" = "true" ] && echo ", AITER_MXFP4_MOE_SF=1")" >&2
+  fi
+
   # NSA family (GLM-5/5.1, DSV3.2): route attention through tilelang.
   # On ROCm, aiter's dense MHA fallback path inside _concat_and_cast_mha_k
   # trips a Triton `arange's range must be a power of 2` error when
