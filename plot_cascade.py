@@ -30,6 +30,28 @@ Paths:
   parse time, so relative inputs still work but the rendered PNG always
   lands in a predictable spot regardless of cwd.
 
+Style (fixed):
+  Color = platform family. B200 = green family, MI355X = orange family.
+  Lightness goes dark (L1) -> light (L3+) so the curve color encodes both
+  vendor and cache-tier depth at a glance:
+      B200:   L1 dark green   / L1+L2 green        / L1+L2+L3 light green
+      MI355X: L1 dark orange  / L1+L2 orange       / L1+L2+L3 light orange
+  Marker = cache_mode. L1 = circle, L2 = square, L3 = triangle (same marker
+  across both platforms so tier lines up visually even at low contrast).
+  Other tags (H200, MI325, ...) fall back to a generic palette.
+
+Outputs:
+  --out <name>.png provides only the BASENAME; each PNG is auto-placed
+  in the appropriate cascade root dir so each platform's results folder
+  stays self-contained:
+      <MI355X-root>/<name>.png         combined plot (up to 6 lines)
+      <B200-root>/<name>.B200.png      just the B200 curves
+      <MI355X-root>/<name>.MI355X.png  just the MI355X curves
+  Combined plot defaults to MI355X root (typical "I'm on the MI355X box"
+  workflow); falls back to B200 root if no MI355X data, then to --out's
+  parent for non-MI/B platforms. Per-platform plots are skipped if that
+  platform has no runs.
+
 Usage:
   # Same platform, L1 vs L1+L2 vs L1+L2+L3 cascade (this user's typical case):
   python3 plot_cascade.py \
@@ -39,12 +61,13 @@ Usage:
              $HOME/SGLang-benchmarks/results/.../L3_file/size_192/bench_multiturn.jsonl \
       --out  $HOME/SGLang-benchmarks/results/cascade_b200_3modes.png
 
-  # Cross-platform compare (same cache_mode):
+  # Cross-platform 3x3 cascade compare (produces 3 PNGs):
   python3 plot_cascade.py \
-      --Title "DSR1-0528 HiCache L3_file (192 GB)" \
-      --MI355X $HOME/SGLang-benchmarks/results/.../L3_file/size_192/bench_multiturn.jsonl \
-      --B200   $HOME/SGLang-benchmarks/results/.../L3_file/size_192/bench_multiturn.jsonl \
-      --out    $HOME/SGLang-benchmarks/results/cascade_L3_file_192.png
+      --Title "DSR1-0528 cascade" \
+      --B200 .../B200_cascade/{L1,L2/size_192,L3_file/size_192}/bench_multiturn.jsonl \
+      --MI355X .../MI355X_cascade/{L1,L2/size_192,L3_file/size_192}/bench_multiturn.jsonl \
+      --out $HOME/SGLang-benchmarks/results/cascade_compare.png
+  # → cascade_compare.png + cascade_compare.B200.png + cascade_compare.MI355X.png
 """
 
 from __future__ import annotations
@@ -92,27 +115,70 @@ CACHE_MODE_LABEL = {
     "hicache_hf3fs":    "L1+L2+L3 (hf3fs)",
     "hicache_mooncake": "L1+L2+L3 (Mooncake)",
 }
-# Distinct color per cache_mode; line style per platform tag.
-CACHE_MODE_COLOR = {
-    "no_cache":         "#888888",
-    "L1":               "#1f77b4",
-    "L2":               "#ff7f0e",
-    "L3_file":          "#2ca02c",
-    "L3_hf3fs":         "#d62728",
-    "L3_mooncake":      "#9467bd",
-    "no_radix":         "#888888",
-    "radix":            "#1f77b4",
-    "hicache":          "#ff7f0e",
-    "hicache_file":     "#2ca02c",
-    "hicache_hf3fs":    "#d62728",
-    "hicache_mooncake": "#9467bd",
+
+# Color = platform; lightness within a platform = cache tier depth.
+# B200 = green family, MI355X = orange family, both go dark (L1) -> light
+# (L3+) so a glance at the line color tells you both vendor and tier depth.
+# Same family per platform across all 3 tiers makes legend reading easy
+# even at thumbnail scale (e.g. on slides).
+PLATFORM_PALETTE = {
+    "B200": {
+        # Hue shift: dark green (L1) -> warm green (L2) -> lime (L3+) so the
+        # three tiers stay distinguishable on small thumbnails / projector.
+        "no_cache":         "#0d3311",  # very dark green (rare)
+        "L1":               "#1b5e20",  # dark green
+        "L2":               "#2e7d32",  # forest green (slightly darker than before)
+        "L3_file":          "#9ccc65",  # lime green (clear contrast vs L2)
+        "L3_hf3fs":         "#c5e1a5",
+        "L3_mooncake":      "#dcedc8",
+        # Legacy aliases:
+        "no_radix":         "#0d3311",
+        "radix":             "#1b5e20",
+        "hicache":           "#2e7d32",
+        "hicache_file":      "#9ccc65",
+        "hicache_hf3fs":     "#c5e1a5",
+        "hicache_mooncake":  "#dcedc8",
+    },
+    "MI355X": {
+        # Hue shift: dark red (L1) -> orange (L2) -> amber/yellow (L3+) so
+        # the lightest tier doesn't look like a faded version of L2.
+        "no_cache":         "#7f1d00",
+        "L1":               "#bf360c",  # dark orange / red-brown
+        "L2":               "#ef6c00",  # warm orange (deeper)
+        "L3_file":          "#ffd54f",  # amber (yellow-toned, clear gap from L2)
+        "L3_hf3fs":         "#ffe082",
+        "L3_mooncake":      "#fff59d",
+        "no_radix":         "#7f1d00",
+        "radix":             "#bf360c",
+        "hicache":           "#ef6c00",
+        "hicache_file":      "#ffd54f",
+        "hicache_hf3fs":     "#ffe082",
+        "hicache_mooncake":  "#fff59d",
+    },
 }
-TAG_LINESTYLE = {
-    0: ("solid",  "o"),  # first tag
-    1: ("dashed", "s"),  # second tag
-    2: ("dotted", "^"),
-    3: ("dashdot", "D"),
+
+# Marker = cache_mode (consistent across platforms so a reader can match
+# tier across the green and orange lines at a glance, instead of having
+# to read the legend every time).
+MODE_MARKER = {
+    "no_cache":         "x",
+    "L1":               "o",  # circle
+    "L2":               "s",  # square
+    "L3_file":          "^",  # triangle up
+    "L3_hf3fs":         "D",  # diamond
+    "L3_mooncake":      "P",  # plus
+    # Legacy aliases:
+    "no_radix":         "x",
+    "radix":             "o",
+    "hicache":           "s",
+    "hicache_file":      "^",
+    "hicache_hf3fs":     "D",
+    "hicache_mooncake":  "P",
 }
+
+# Fallback palette for non-B200 / non-MI355X tags (e.g. user adds a
+# third platform). Keeps the script generic.
+FALLBACK_PALETTE = ["#1f77b4", "#9467bd", "#17becf", "#bcbd22", "#8c564b"]
 
 
 def parse_path(path: Path) -> dict | None:
@@ -241,19 +307,36 @@ def load_fill_thresholds(jsonl_path: Path) -> dict | None:
         l1_gib = float(meta.get("device_pool_gb") or 0)
 
     l2_gib = float(meta.get("hicache_size_gb") or 0)
+    write_policy = meta.get("hicache_write_policy", "write_through")
 
     # When there's no L2 pool (L1-only run, hicache_size_gb is null), the
-    # "L1+L2 fill" round collapses onto "L1 fill" and adds no information —
-    # suppress it so the plot doesn't draw two overlapping labels at the
-    # same x-position with one of them ("L1+L2 fill") flat-out wrong.
+    # L2-side fill round collapses onto "L1 fill" and adds no information —
+    # suppress it so the plot doesn't draw two overlapping labels.
+    #
+    # HiCache write policy controls whether L1 and L2 hold the SAME blocks
+    # (write_through: L2 mirrors L1, every L1 write is replicated to L2 →
+    # effective cache cap = max(L1, L2) = L2 in well-sized setups) or
+    # DISJOINT blocks (write_back: L1 evicts to L2 lazily → effective cap =
+    # L1 + L2). cascade_dsr1.sh defaults to write_through and that's what
+    # both reference runs use, so the hit-rate cliffs in the empirical plot
+    # line up with the L2 boundary, not the L1+L2 sum.
     l1_l2_fill = None
+    l1_l2_cap_label = "L1+L2 cap"
     if round_inc_gib and l2_gib > 0:
-        l1_l2_fill = (l1_gib + l2_gib) / round_inc_gib
+        if write_policy == "write_through":
+            cap_gib = max(l1_gib, l2_gib)
+            l1_l2_cap_label = "L2 cap"   # write_through: L2 alone is the cap
+        else:
+            cap_gib = l1_gib + l2_gib
+            l1_l2_cap_label = "L1+L2 cap"  # write_back: tiers are disjoint
+        l1_l2_fill = cap_gib / round_inc_gib
 
     return {
         "round_inc_gib": round_inc_gib,
         "l1_gib": l1_gib,
         "l2_gib": l2_gib,
+        "write_policy": write_policy,
+        "l1_l2_cap_label": l1_l2_cap_label,
         "l1_fill_round":     l1_gib / round_inc_gib if round_inc_gib else None,
         "l1_l2_fill_round":  l1_l2_fill,
     }
@@ -308,22 +391,30 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
     ax_ttft.tick_params(labelbottom=True)
     ax_ttft.set_xlabel("# Round")
 
-    # Style strategy depends on how many tags vs cache_modes are present:
-    #   - single tag + multi mode  → color by cache_mode (typical L1/L2/L3
-    #                                  cascade on one platform)
-    #   - multi tag + single mode  → color by platform (NVIDIA green vs AMD
-    #                                  orange cross-platform compare)
-    #   - multi tag + multi mode   → color by platform, linestyle by mode
-    #                                  index within that platform
-    tag_palette = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b"]
+    # Fixed style scheme:
+    #   color  = platform family (B200 green / MI355X orange), darker for
+    #            shallower cache tier so L1 stands out vs L3+ at a glance.
+    #   marker = cache_mode (consistent across platforms so the reader can
+    #            line up tiers between green and orange curves).
+    # Tags outside B200 / MI355X fall back to a generic palette so an
+    # H200 / MI325 user can still get distinct colors.
+    fallback_idx = 0
+    fallback_for_tag: dict[str, str] = {}
 
-    def color_for_tag(tag: str) -> str | None:
-        t = tag.lower()
-        if any(p in t for p in ("b200", "h200", "h800", "h100", "a100", "nvidia")):
-            return "#2ca02c"  # green for NVIDIA
-        if any(p in t for p in ("mi355", "mi325", "mi300", "mi250", "mi210", "amd", "rocm")):
-            return "#ff7f0e"  # orange for AMD
-        return None
+    def style_for(tag: str, mode: str) -> tuple[str, str]:
+        nonlocal fallback_idx
+        pal = PLATFORM_PALETTE.get(tag)
+        if pal and mode in pal:
+            color = pal[mode]
+        elif pal:
+            color = next(iter(pal.values()))  # any from the platform palette
+        else:
+            if tag not in fallback_for_tag:
+                fallback_for_tag[tag] = FALLBACK_PALETTE[fallback_idx % len(FALLBACK_PALETTE)]
+                fallback_idx += 1
+            color = fallback_for_tag[tag]
+        marker = MODE_MARKER.get(mode, "o")
+        return color, marker
 
     modes_per_tag: dict[str, list[str]] = {}
     for r in runs:
@@ -331,8 +422,6 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
         if r["cache_mode"] not in modes_per_tag[r["tag"]]:
             modes_per_tag[r["tag"]].append(r["cache_mode"])
     multi_tag = len(tag_list) > 1
-    multi_mode_some_tag = any(len(v) > 1 for v in modes_per_tag.values())
-    markers = ("o", "s", "^", "D", "v", "P")
 
     # Same-platform multi-mode runs share the same model/clients/req_len, so
     # their L1 / L1+L2 fill rounds collapse onto a single x-position per
@@ -345,22 +434,9 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
     for r in runs:
         rounds = list(range(1, len(r["ttft"]) + 1))
         tag_idx = tag_list.index(r["tag"])
-        mode_idx_in_tag = modes_per_tag[r["tag"]].index(r["cache_mode"])
 
-        if not multi_tag and multi_mode_some_tag:
-            color = (CACHE_MODE_COLOR.get(r["cache_mode"])
-                     or tag_palette[mode_idx_in_tag % len(tag_palette)])
-            linestyle = "solid"
-            marker = markers[mode_idx_in_tag % len(markers)]
-        elif multi_tag and multi_mode_some_tag:
-            color = (color_for_tag(r["tag"])
-                     or tag_palette[tag_idx % len(tag_palette)])
-            linestyle, marker = TAG_LINESTYLE.get(mode_idx_in_tag, ("solid", "o"))
-        else:
-            color = (color_for_tag(r["tag"])
-                     or CACHE_MODE_COLOR.get(r["cache_mode"])
-                     or tag_palette[tag_idx % len(tag_palette)])
-            linestyle, marker = "solid", markers[tag_idx % len(markers)]
+        color, marker = style_for(r["tag"], r["cache_mode"])
+        linestyle = "solid"
 
         # Vertical lines marking when L1 and L1+L2 are predicted to fill,
         # so the reader can verify TTFT spikes line up with cache-tier
@@ -397,10 +473,11 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
                     seen_l1l2_fill_rounds.add(key)
                     line_color = color if multi_tag else "#555555"
                     label_pre = f" {tag_label} " if multi_tag else " "
+                    cap_lbl = thr.get("l1_l2_cap_label", "L1+L2 cap")
                     for ax in (ax_ttft, ax_hit):
                         ax.axvline(ll_r, color=line_color, linestyle="--", alpha=0.55, linewidth=1.2)
                     ax_ttft.text(ll_r, top_y,
-                                 f"{label_pre}L1+L2 hard cap (r={ll_r:.1f})",
+                                 f"{label_pre}{cap_lbl} (r={ll_r:.1f})",
                                  transform=ax_ttft.get_xaxis_transform(),
                                  color=line_color, fontsize=8, va="top", ha="left", alpha=0.95)
 
@@ -413,12 +490,20 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
         ax_hit.plot(rounds, [h * 100 for h in r["hit"]], label=label,
                     color=color, linestyle=linestyle, marker=marker, markersize=6)
 
-    # One shared legend below the plots. With constrained_layout the figure
-    # automatically reserves space for the legend, so a positive y offset
-    # keeps it inside the saved canvas instead of relying on bbox_inches.
+    # One shared legend below the plots. matplotlib fills columns top-to-bottom
+    # (column-major), so legend layout depends on ncol vs item count:
+    #   - multi-platform: one column per tag → each column reads top-down as
+    #     L1 / L1+L2 / L1+L2+L3 for that platform; columns left→right by tag
+    #     order (MI355X first, then B200, since main() loads MI355X first).
+    #   - single-platform: one row, all modes left-to-right.
     handles, labels = ax_ttft.get_legend_handles_labels()
+    n_tags = len(tag_list)
+    if n_tags >= 2:
+        legend_ncol = n_tags
+    else:
+        legend_ncol = min(len(runs), 6)
     fig.legend(handles, labels, loc="outside lower center",
-               ncol=min(3, len(runs)), fontsize=9)
+               ncol=legend_ncol, fontsize=9)
 
     if title:
         fig.suptitle(title, fontsize=12)
@@ -472,12 +557,68 @@ def main():
     if not runs:
         sys.exit("ERROR: pass at least one of --MI355X / --B200")
 
-    # Always resolve --out to an absolute path so the PNG lands in a
-    # predictable spot regardless of cwd. Relative inputs still work,
-    # they just get attached to the cwd at parse time.
+    # Per-platform plots land in that platform's cascade root dir (the
+    # parent of the L1/L2/L3_file subdirs), so each platform's results
+    # folder is self-contained. The combined plot defaults to the MI355X
+    # platform root since that's typically the box the user is working
+    # on; falls back to B200's root if no MI355X data; final fallback is
+    # the --out's parent so absolute paths still work for non-MI/B tags.
+    def cascade_root_for(jsonl_path: Path) -> Path:
+        """Walk up from a bench_multiturn.jsonl to the <MODEL>-cascade-<tag>/
+        directory that holds the cache_mode subdirs."""
+        cache_mode_tokens = set(CACHE_MODE_ORDER)
+        for parent in jsonl_path.parents:
+            if "-cascade-" in parent.name or parent.name.endswith("-cascade"):
+                return parent
+            if "-HiCache-" in parent.name or parent.name.endswith("-HiCache"):
+                return parent
+        # Heuristic fallback: find the dir whose immediate child is a known
+        # cache_mode token. Works for non-conventional parent names.
+        cur = jsonl_path.parent
+        while cur != cur.parent:
+            if cur.name in cache_mode_tokens:
+                return cur.parent
+            if cur.name.startswith("size_"):
+                cur = cur.parent
+                continue
+            cur = cur.parent
+        return jsonl_path.parent.parent
+
+    platform_root: dict[str, Path] = {}
+    for r in runs:
+        if r["tag"] in platform_root:
+            continue
+        platform_root[r["tag"]] = cascade_root_for(Path(r["path"]))
+
     out_path = Path(args.out).expanduser().resolve()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plot_cascade(runs, out_path, title=args.Title)
+    out_name = out_path.name  # e.g., cascade_compare.png
+
+    # Combined: pick MI355X first, then B200, then user-supplied dir.
+    combined_root = (
+        platform_root.get("MI355X")
+        or platform_root.get("B200")
+        or out_path.parent
+    )
+    combined_root.mkdir(parents=True, exist_ok=True)
+    combined_out = combined_root / out_name
+    plot_cascade(runs, combined_out, title=args.Title)
+
+    # Per-platform plots: filename gets `.<platform>` inserted before the
+    # suffix, output goes into that platform's root.
+    #   cascade_compare.png -> cascade_compare.B200.png  in B200 root
+    #                       -> cascade_compare.MI355X.png in MI355X root
+    base_title = args.Title or ""
+    stem = out_path.stem
+    suffix = out_path.suffix
+    for platform in ("B200", "MI355X"):
+        sub = [r for r in runs if r["tag"] == platform]
+        if not sub:
+            continue
+        root = platform_root[platform]
+        root.mkdir(parents=True, exist_ok=True)
+        sub_out = root / f"{stem}.{platform}{suffix}"
+        sub_title = f"{base_title} ({platform})" if base_title else platform
+        plot_cascade(sub, sub_out, title=sub_title)
 
 
 if __name__ == "__main__":
