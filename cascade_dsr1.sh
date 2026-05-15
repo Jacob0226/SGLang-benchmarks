@@ -116,7 +116,7 @@ HICACHE_SIZE=auto
 # alignment. Bump higher (e.g. 900) if write_through is starving the host.
 HOST_HEADROOM_GB=400
 NUM_CLIENTS=300
-NUM_ROUNDS=15
+NUM_ROUNDS=10
 REQUEST_LENGTH=4096
 OUTPUT_LENGTH=1
 MAX_PARALLEL=8
@@ -870,7 +870,7 @@ SERVER_CMD=(
     --tp "$TP_SIZE"
     --host "$HOST" --port "$PORT"
     --mem-fraction-static "$MEM_FRACTION_STATIC"
-    --watchdog-timeout 1200
+    --watchdog-timeout 2400
     --enable-metrics
     --enable-cache-report
     --trust-remote-code
@@ -880,7 +880,6 @@ SERVER_CMD=(
     --context-length "$CONTEXT_LENGTH"
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
     --max-prefill-tokens "$MAX_PREFILL_TOKENS"
-    --cuda-graph-max-bs "$CUDA_GRAPH_MAX_BS"
 )
 # Cache-mode-specific flags. none = --disable-radix-cache (no radix, no
 # HiCache); L1 = GPU-only radix; L2 = + host DRAM pool; L3_file = + file.
@@ -895,7 +894,7 @@ case "$CACHE_MODE" in
     SERVER_CMD+=(
       --enable-hierarchical-cache
       --hicache-size "$HICACHE_SIZE"
-      --hicache-mem-layout page_first_direct
+      # --hicache-mem-layout page_first_direct # Docker Jan-10 haven't supported
       --hicache-io-backend kernel
       --hicache-write-policy "$HICACHE_WRITE_POLICY"
     )
@@ -904,7 +903,7 @@ case "$CACHE_MODE" in
     SERVER_CMD+=(
       --enable-hierarchical-cache
       --hicache-size "$HICACHE_SIZE"
-      --hicache-mem-layout page_first_direct
+      # --hicache-mem-layout page_first_direct # Docker Jan-10 haven't supported
       --hicache-io-backend kernel
       --hicache-write-policy "$HICACHE_WRITE_POLICY"
       --hicache-storage-backend file
@@ -963,6 +962,17 @@ if is_rocm; then
   export SAFETENSORS_FAST_GPU=1
   export SGLANG_USE_AITER=1
   export ROCM_QUICK_REDUCE_QUANTIZATION=NONE
+  # Disable PR #18528 (Fp8 prefill attn kernel integration, merged 2026-02-11)
+  # on MI355X. The new mla_prefill_ps_asm_fwd kernel default-enabled by
+  # is_gfx95_supported() collapses GSM8K accuracy from 0.94 → 0.02 when
+  # --page-size > 1 with radix cache (or HiCache, which forces radix on).
+  # Bisect window: sglang d0d387dea (good 0.949) → dcc63dc54 (bad 0.750)
+  # = 19 commits, only PR #18528 touched aiter_backend.py. Verified
+  # workaround: setting this env var to 0 restores acc to 0.954 on the
+  # latest May 13 docker. Track upstream fix; until then keep this off
+  # for any DSR1 + page>1 workload.
+  # See results/_bisect/ for full per-docker accuracy table.
+  export SGLANG_AITER_FP8_PREFILL_ATTN=0
 
   # --hubert-preset: Hubert PR #16531 ("Fix aiter page-size handling,
   # DeepSeek MLA tuple inputs, and HiCache/FA3 decode-backend override")
