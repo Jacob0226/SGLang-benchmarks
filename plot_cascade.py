@@ -342,7 +342,13 @@ def load_fill_thresholds(jsonl_path: Path) -> dict | None:
     }
 
 
-def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
+def plot_cascade(runs: list[dict], out_path: Path,
+                 title: str | None = None,
+                 ymax_ttft: float | None = None):
+    """Render one TTFT + cache-hit-rate figure. ymax_ttft, when given,
+    forces the TTFT panel's upper Y limit so multiple figures sharing
+    the same workload land on the same scale (handy for side-by-side
+    comparison of MI355X.png, B200.png, MI355X_VS_B200.png)."""
     if not runs:
         raise SystemExit("No runs found matching filters")
 
@@ -371,6 +377,8 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
     ax_ttft.set_title("Prefill Performance (per round)")
     ax_ttft.set_ylabel("Avg TTFT (sec)")
     ax_ttft.grid(True, alpha=0.3)
+    if ymax_ttft is not None:
+        ax_ttft.set_ylim(0, ymax_ttft)
 
     ax_hit.set_title("Cache Hit Rate (per round)")
     ax_hit.set_xlabel("# Round")
@@ -482,7 +490,15 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
                                  color=line_color, fontsize=8, va="top", ha="left", alpha=0.95)
 
         mode_label = CACHE_MODE_LABEL.get(r["cache_mode"], r["cache_mode"])
-        size_suffix = f" ({r['size']} GB)" if r["size"] is not None else ""
+        # Size suffix only on L2: that's the GB number that actually describes
+        # the *L2 host pool*. For L3_file the same number is still the L2
+        # host pool (the path is .../L3_file/size_<HICACHE_SIZE>/), but
+        # writing "L1+L2+L3 (file) (320 GB)" misleadingly reads as "L3 has
+        # 320 GB capacity" so we drop it for L3.
+        if r["cache_mode"] == "L2" and r["size"] is not None:
+            size_suffix = f" ({r['size']} GB)"
+        else:
+            size_suffix = ""
         label = f"[{r['tag']}] {mode_label}{size_suffix}".strip()
 
         ax_ttft.plot(rounds, r["ttft"], label=label,
@@ -511,122 +527,178 @@ def plot_cascade(runs: list[dict], out_path: Path, title: str | None = None):
     print(f"Wrote {out_path} ({len(runs)} curves)")
 
 
+MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun",
+               "Jul","Aug","Sep","Oct","Nov","Dec"]
+
+# Display-name shortenings for common model dirs. Add more as needed.
+MODEL_DISPLAY_NAME = {
+    "DeepSeek-R1-0528":         "DSR1-0528",
+    "DeepSeek-R1":              "DSR1",
+    "DeepSeek-V3":              "DSV3",
+    "DeepSeek-V3.2-Exp":        "DSV3.2",
+    "DeepSeek-R1-0528-MXFP4":   "DSR1-0528-MXFP4",
+}
+
+
+def discover_jsonls(cascade_dir: Path) -> list[Path]:
+    """Walk a cascade root dir looking for bench_multiturn.jsonl under
+    L1/, L2/size_*, L3_file/size_*, none/. Returns one jsonl per mode in
+    CACHE_MODE_ORDER. When multiple size_* dirs exist under L2 or L3,
+    picks the largest size."""
+    found: list[tuple[str, int, Path]] = []
+    for mode in CACHE_MODE_ORDER:
+        mode_dir = cascade_dir / mode
+        if not mode_dir.is_dir():
+            continue
+        # L1 / no_cache: no size subdir.
+        direct = mode_dir / "bench_multiturn.jsonl"
+        if direct.is_file() and direct.stat().st_size > 0:
+            found.append((mode, 0, direct))
+            continue
+        # L2 / L3_file: pick the size_<N>/ with the largest N.
+        size_dirs = sorted(
+            (d for d in mode_dir.iterdir() if d.is_dir() and d.name.startswith("size_")),
+            key=lambda d: int(d.name.split("_", 1)[1]) if d.name.split("_", 1)[1].isdigit() else 0,
+            reverse=True,
+        )
+        for sd in size_dirs:
+            j = sd / "bench_multiturn.jsonl"
+            if j.is_file() and j.stat().st_size > 0:
+                try:
+                    sz = int(sd.name.split("_", 1)[1])
+                except (ValueError, IndexError):
+                    sz = 0
+                found.append((mode, sz, j))
+                break
+    return [p for _, _, p in found]
+
+
+def extract_date(cascade_dir: Path) -> str:
+    """Return a short 'Mon DD' date for the cascade run. Tries (in order):
+        1) 8-digit YYYYMMDD in the parent docker dir name (build date).
+        2) 4-digit MMDD suffix in the tag (e.g. B200_15rounds_0512).
+        3) Newest bench_multiturn.jsonl mtime."""
+    docker_name = cascade_dir.parent.name if cascade_dir.parent else ""
+    m = re.search(r"(20\d{2})(\d{2})(\d{2})", docker_name)
+    if m:
+        y, mo, da = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= mo <= 12 and 1 <= da <= 31:
+            return f"{MONTH_NAMES[mo-1]} {da:d}"
+    m = re.search(r"_(\d{2})(\d{2})(?:_|$)", cascade_dir.name)
+    if m:
+        mo, da = int(m.group(1)), int(m.group(2))
+        if 1 <= mo <= 12 and 1 <= da <= 31:
+            return f"{MONTH_NAMES[mo-1]} {da:d}"
+    import datetime
+    newest = max(
+        (j.stat().st_mtime for j in cascade_dir.rglob("bench_multiturn.jsonl") if j.is_file()),
+        default=None,
+    )
+    if newest is not None:
+        d = datetime.datetime.fromtimestamp(newest)
+        return f"{MONTH_NAMES[d.month-1]} {d.day:d}"
+    return ""
+
+
+def extract_model_display(cascade_dir: Path, override: str | None = None) -> str:
+    """Extract display-friendly model name from '<model>-cascade-<tag>'
+    dir name. Honors --model-name override if given."""
+    if override:
+        return override
+    name = cascade_dir.name
+    raw = name.split("-cascade-", 1)[0] if "-cascade-" in name else name
+    return MODEL_DISPLAY_NAME.get(raw, raw)
+
+
+def load_runs(cascade_dir: Path, tag: str, max_rounds: int | None) -> list[dict]:
+    """Discover + load all bench_multiturn.jsonl files under a cascade root."""
+    jsonls = discover_jsonls(cascade_dir)
+    if not jsonls:
+        sys.exit(f"ERROR: no bench_multiturn.jsonl under {cascade_dir}")
+    runs: list[dict] = []
+    for p_jsonl in jsonls:
+        meta = parse_path(p_jsonl) or {
+            "tag": "", "cache_mode": "", "size": None, "path": p_jsonl,
+        }
+        meta["tag"] = tag
+        ttft, hit = load_round_data(p_jsonl)
+        if not ttft:
+            print(f"WARNING: no per-round data in {p_jsonl}, skipping", file=sys.stderr)
+            continue
+        if max_rounds is not None:
+            ttft = ttft[:max_rounds]
+            hit  = hit[:max_rounds]
+        meta["ttft"] = ttft
+        meta["hit"]  = hit
+        meta["fill_thresholds"] = load_fill_thresholds(p_jsonl)
+        runs.append(meta)
+    return runs
+
+
 def main():
     p = argparse.ArgumentParser(
-        description="Plot per-round TTFT / cache-hit-rate from MI355X vs B200 "
-                    "bench_multiturn.jsonl files (HiCache.sh output).",
+        description="Plot per-round TTFT / cache-hit-rate for MI355X and B200 "
+                    "cascade runs. Takes two cascade root dirs (one per "
+                    "platform), auto-discovers L1/L2/L3_file jsonls inside, "
+                    "and writes 3 PNGs: MI355X.png, B200.png, MI355X_VS_B200.png.",
     )
-    p.add_argument("--Title", default=None, help="Plot title")
-    p.add_argument("--MI355X", nargs="+", default=None,
-                   help="One or more MI355X bench_multiturn.jsonl paths")
-    p.add_argument("--B200", nargs="+", default=None,
-                   help="One or more B200 bench_multiturn.jsonl paths")
-    p.add_argument("--out", required=True, help="Output PNG path")
+    p.add_argument("--MI355X-dir", required=True,
+                   help="Path to MI355X cascade root, e.g. "
+                        "results/<docker>/<MODEL>-cascade-<tag>/")
+    p.add_argument("--B200-dir", required=True,
+                   help="Path to B200 cascade root, same layout.")
+    p.add_argument("--out-dir", default=None,
+                   help="Where to write the 3 PNGs. Default: MI355X-dir.")
+    p.add_argument("--model-name", default=None,
+                   help="Override the model display name (default: derive "
+                        "from cascade dir, e.g. DeepSeek-R1-0528 → DSR1-0528).")
     p.add_argument("--max-rounds", type=int, default=None,
-                   help="Truncate every curve to at most N rounds. Useful when "
-                        "cross-platform runs have different round counts and "
-                        "you want a fair-window comparison (e.g. MI355X 10 vs "
-                        "B200 15 → --max-rounds 10).")
+                   help="Truncate every curve to at most N rounds. Useful "
+                        "when MI355X (10 rounds) vs B200 (15 rounds) and you "
+                        "want a fair window (--max-rounds 10).")
     args = p.parse_args()
 
-    sources = [
-        ("MI355X", args.MI355X or []),
-        ("B200",   args.B200   or []),
-    ]
-    runs: list[dict] = []
-    for tag, jsonl_paths in sources:
-        for jsonl_path in jsonl_paths:
-            p_jsonl = Path(jsonl_path).expanduser()
-            if not p_jsonl.is_file():
-                sys.exit(f"ERROR: file not found: {jsonl_path}")
-            if p_jsonl.stat().st_size == 0:
-                sys.exit(f"ERROR: empty file: {jsonl_path}")
+    mi_dir   = Path(args.MI355X_dir).expanduser().resolve()
+    b2_dir   = Path(args.B200_dir).expanduser().resolve()
+    out_dir  = Path(args.out_dir).expanduser().resolve() if args.out_dir else mi_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-            # Recover cache_mode / size from the path. parse_path() handles
-            # both the strict <MODEL>-(HiCache|cascade)/<mode>[/size_N]
-            # layout and a permissive fallback that just scans segments for
-            # a known cache_mode token.
-            meta = parse_path(p_jsonl) or {
-                "tag": "", "cache_mode": "", "size": None, "path": p_jsonl,
-            }
-            meta["tag"] = tag  # user-specified --MI355X / --B200 always wins
+    for d in (mi_dir, b2_dir):
+        if not d.is_dir():
+            sys.exit(f"ERROR: not a directory: {d}")
 
-            ttft, hit = load_round_data(p_jsonl)
-            if not ttft:
-                sys.exit(f"ERROR: no per-round data in {jsonl_path}")
-            if args.max_rounds is not None:
-                ttft = ttft[: args.max_rounds]
-                hit  = hit[:  args.max_rounds]
-            meta["ttft"] = ttft
-            meta["hit"] = hit
-            meta["fill_thresholds"] = load_fill_thresholds(p_jsonl)
-            runs.append(meta)
+    runs_mi = load_runs(mi_dir, "MI355X", args.max_rounds)
+    runs_b2 = load_runs(b2_dir, "B200",   args.max_rounds)
+    all_runs = runs_mi + runs_b2
 
-    if not runs:
-        sys.exit("ERROR: pass at least one of --MI355X / --B200")
+    # Shared TTFT Y-axis: round(max + 0.5) + 1 → e.g. 12.6 → 14, 11.7 → 13.
+    # Same rule for all three PNGs so they're visually directly comparable.
+    max_ttft = max((max(r["ttft"]) for r in all_runs), default=1.0)
+    ymax_ttft = round(max_ttft + 0.5) + 1
 
-    # Per-platform plots land in that platform's cascade root dir (the
-    # parent of the L1/L2/L3_file subdirs), so each platform's results
-    # folder is self-contained. The combined plot defaults to the MI355X
-    # platform root since that's typically the box the user is working
-    # on; falls back to B200's root if no MI355X data; final fallback is
-    # the --out's parent so absolute paths still work for non-MI/B tags.
-    def cascade_root_for(jsonl_path: Path) -> Path:
-        """Walk up from a bench_multiturn.jsonl to the <MODEL>-cascade-<tag>/
-        directory that holds the cache_mode subdirs."""
-        cache_mode_tokens = set(CACHE_MODE_ORDER)
-        for parent in jsonl_path.parents:
-            if "-cascade-" in parent.name or parent.name.endswith("-cascade"):
-                return parent
-            if "-HiCache-" in parent.name or parent.name.endswith("-HiCache"):
-                return parent
-        # Heuristic fallback: find the dir whose immediate child is a known
-        # cache_mode token. Works for non-conventional parent names.
-        cur = jsonl_path.parent
-        while cur != cur.parent:
-            if cur.name in cache_mode_tokens:
-                return cur.parent
-            if cur.name.startswith("size_"):
-                cur = cur.parent
-                continue
-            cur = cur.parent
-        return jsonl_path.parent.parent
+    model = extract_model_display(mi_dir, args.model_name)
+    date_mi = extract_date(mi_dir)
+    date_b2 = extract_date(b2_dir)
 
-    platform_root: dict[str, Path] = {}
-    for r in runs:
-        if r["tag"] in platform_root:
-            continue
-        platform_root[r["tag"]] = cascade_root_for(Path(r["path"]))
-
-    out_path = Path(args.out).expanduser().resolve()
-    out_name = out_path.name  # e.g., cascade_compare.png
-
-    # Combined: pick MI355X first, then B200, then user-supplied dir.
-    combined_root = (
-        platform_root.get("MI355X")
-        or platform_root.get("B200")
-        or out_path.parent
+    # 3 outputs.
+    plot_cascade(
+        runs_mi,
+        out_dir / "MI355X.png",
+        title=f"{model} MI355X {date_mi}".strip(),
+        ymax_ttft=ymax_ttft,
     )
-    combined_root.mkdir(parents=True, exist_ok=True)
-    combined_out = combined_root / out_name
-    plot_cascade(runs, combined_out, title=args.Title)
-
-    # Per-platform plots: filename gets `.<platform>` inserted before the
-    # suffix, output goes into that platform's root.
-    #   cascade_compare.png -> cascade_compare.B200.png  in B200 root
-    #                       -> cascade_compare.MI355X.png in MI355X root
-    base_title = args.Title or ""
-    stem = out_path.stem
-    suffix = out_path.suffix
-    for platform in ("B200", "MI355X"):
-        sub = [r for r in runs if r["tag"] == platform]
-        if not sub:
-            continue
-        root = platform_root[platform]
-        root.mkdir(parents=True, exist_ok=True)
-        sub_out = root / f"{stem}.{platform}{suffix}"
-        sub_title = f"{base_title} ({platform})" if base_title else platform
-        plot_cascade(sub, sub_out, title=sub_title)
+    plot_cascade(
+        runs_b2,
+        out_dir / "B200.png",
+        title=f"{model} B200 {date_b2}".strip(),
+        ymax_ttft=ymax_ttft,
+    )
+    plot_cascade(
+        all_runs,
+        out_dir / "MI355X_VS_B200.png",
+        title=f"{model} MI355X {date_mi} vs B200 {date_b2}".strip(),
+        ymax_ttft=ymax_ttft,
+    )
 
 
 if __name__ == "__main__":
