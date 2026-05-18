@@ -573,6 +573,36 @@ def discover_jsonls(cascade_dir: Path) -> list[Path]:
     return [p for _, _, p in found]
 
 
+def unmangle_docker(name: str) -> str:
+    """Reverse GLM.sh's docker tag mangling so titles show the original
+    'docker pull'-able image name.
+
+    GLM.sh does (line ~162):
+        DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\\//_/g; s/:/-/g')
+    i.e. '/' -> '_' and ':' -> '-'. We invert by:
+      1) Replace '_' with '/' (docker org names don't legally contain
+         underscores, so this is safe).
+      2) Locate the ':' (which was turned into '-') by anchoring on the
+         version suffix — image tags conventionally start with 'v<digit>'
+         (e.g. v0.5.11) so the LAST '-vN' boundary marks where ':' was.
+
+    Examples:
+      rocm_sgl-dev-v0.5.11-rocm720-mi35x-20260514
+          -> rocm/sgl-dev:v0.5.11-rocm720-mi35x-20260514
+      lmsysorg_sglang-v0.5.11-cu130
+          -> lmsysorg/sglang:v0.5.11-cu130
+
+    Falls back to returning the name unchanged when no 'v<digit>' anchor
+    is found (e.g. non-conventional tags); the docker dir name itself is
+    still readable in that case.
+    """
+    s = name.replace("_", "/")
+    m = re.search(r"-(v\d)", s)
+    if m:
+        return s[: m.start()] + ":" + s[m.start() + 1 :]
+    return s
+
+
 def extract_date(cascade_dir: Path) -> str:
     """Return a short 'Mon DD' date for the cascade run. Tries (in order):
         1) 8-digit YYYYMMDD in the parent docker dir name (build date).
@@ -677,26 +707,31 @@ def main():
     ymax_ttft = round(max_ttft + 0.5) + 1
 
     model = extract_model_display(mi_dir, args.model_name)
-    date_mi = extract_date(mi_dir)
-    date_b2 = extract_date(b2_dir)
+    # Docker tag (parent dir of the cascade root) -> 'docker pull'-able
+    # image name. Each PNG's subtitle lists ONLY the docker(s) whose curves
+    # are actually drawn on that figure, so a standalone B200.png viewer
+    # doesn't see an MI355X docker tag that has nothing to do with the
+    # plot. The combined MI355X_VS_B200.png lists both, one per line.
+    docker_mi = unmangle_docker(mi_dir.parent.name) if mi_dir.parent else ""
+    docker_b2 = unmangle_docker(b2_dir.parent.name) if b2_dir.parent else ""
 
     # 3 outputs.
     plot_cascade(
         runs_mi,
         out_dir / "MI355X.png",
-        title=f"{model} MI355X {date_mi}".strip(),
+        title=f"{model}\nMI355X {docker_mi}".strip(),
         ymax_ttft=ymax_ttft,
     )
     plot_cascade(
         runs_b2,
         out_dir / "B200.png",
-        title=f"{model} B200 {date_b2}".strip(),
+        title=f"{model}\nB200 {docker_b2}".strip(),
         ymax_ttft=ymax_ttft,
     )
     plot_cascade(
         all_runs,
         out_dir / "MI355X_VS_B200.png",
-        title=f"{model} MI355X {date_mi} vs B200 {date_b2}".strip(),
+        title=f"{model}\nMI355X {docker_mi}\nB200 {docker_b2}".strip(),
         ymax_ttft=ymax_ttft,
     )
 
