@@ -212,6 +212,8 @@ case "$CACHE_MODE" in
   none) SERVER_CMD+=(--disable-radix-cache);;
   L1)   :;;
   L2)
+    # --hicache-mem-layout omitted: defaults to layer_first. On DSR1-0528
+    # cascade workload, page_first cost ~2.1% extra TTFT vs default.
     SERVER_CMD+=(
       --enable-hierarchical-cache
       --hicache-size "$HICACHE_SIZE"

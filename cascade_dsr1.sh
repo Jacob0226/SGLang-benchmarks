@@ -1003,7 +1003,12 @@ case "$CACHE_MODE" in
     SERVER_CMD+=(
       --enable-hierarchical-cache
       --hicache-size "$HICACHE_SIZE"
-      # --hicache-mem-layout page_first_direct # Docker Jan-10 haven't supported
+      # --hicache-mem-layout: leave unset (defaults to layer_first).
+      # docs recommend page_first w/ kernel backend, but on DSR1-0528 +
+      # cascade workload we measured +2.1% avg TTFT regression vs default
+      # (MAY17_PS64 vs MAY17_PFIRST on rocm720-mi35x-20260517). Cascade
+      # workload has very limited host pool I/O (only r4-r10 after L1
+      # eviction), so page_first's zero-copy advantage never amortizes.
       --hicache-io-backend kernel
       --hicache-write-policy "$HICACHE_WRITE_POLICY"
     )
@@ -1012,7 +1017,6 @@ case "$CACHE_MODE" in
     SERVER_CMD+=(
       --enable-hierarchical-cache
       --hicache-size "$HICACHE_SIZE"
-      # --hicache-mem-layout page_first_direct # Docker Jan-10 haven't supported
       --hicache-io-backend kernel
       --hicache-write-policy "$HICACHE_WRITE_POLICY"
       --hicache-storage-backend file
