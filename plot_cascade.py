@@ -522,6 +522,11 @@ def main():
     p.add_argument("--B200", nargs="+", default=None,
                    help="One or more B200 bench_multiturn.jsonl paths")
     p.add_argument("--out", required=True, help="Output PNG path")
+    p.add_argument("--max-rounds", type=int, default=None,
+                   help="Truncate every curve to at most N rounds. Useful when "
+                        "cross-platform runs have different round counts and "
+                        "you want a fair-window comparison (e.g. MI355X 10 vs "
+                        "B200 15 → --max-rounds 10).")
     args = p.parse_args()
 
     sources = [
@@ -549,6 +554,9 @@ def main():
             ttft, hit = load_round_data(p_jsonl)
             if not ttft:
                 sys.exit(f"ERROR: no per-round data in {jsonl_path}")
+            if args.max_rounds is not None:
+                ttft = ttft[: args.max_rounds]
+                hit  = hit[:  args.max_rounds]
             meta["ttft"] = ttft
             meta["hit"] = hit
             meta["fill_thresholds"] = load_fill_thresholds(p_jsonl)
