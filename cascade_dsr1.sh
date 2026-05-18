@@ -44,15 +44,19 @@
 # + OS page cache so the cascade bench still starts cold. Adds ~70-90 sec
 # per run on MI355X (parallel=1200 finishes the 1200 questions in ~70 s wall).
 #
-# Usage on MI355X (run all three modes for a complete cascade picture):
-#   ./cascade_dsr1.sh --tag MI355X_cascade --cache-mode L1 \
-#       --docker rocm/sgl-dev:v0.5.11-rocm720-mi35x-20260507
-#   ./cascade_dsr1.sh --tag MI355X_cascade --cache-mode L2 \
-#       --docker rocm/sgl-dev:v0.5.11-rocm720-mi35x-20260507
+# Usage on MI355X — preferred: one command via the chain dispatcher
+# (re-execs self per mode, with pkill -9 sglang + sleep 10 between
+# iterations, GLM.sh-style). Saves you from manually chaining 4 shells:
+#   ./cascade_dsr1.sh --tag MI355X_cascade \
+#       --cache-modes "none L1 L2 L3_file" \
+#       --docker rocm/sgl-dev:v0.5.11-rocm720-mi35x-20260514
+#
+# Or run a single mode for ad-hoc / re-run scenarios:
 #   ./cascade_dsr1.sh --tag MI355X_cascade --cache-mode L3_file \
-#       --docker rocm/sgl-dev:v0.5.11-rocm720-mi35x-20260507
-# Usage on B200 (mirror): same three commands with --tag B200_cascade
-#   and --docker lmsysorg/sglang:v0.5.9-cu130.
+#       --docker rocm/sgl-dev:v0.5.11-rocm720-mi35x-20260514
+#
+# Usage on B200 (mirror): same commands with --tag B200_cascade and
+#   --docker lmsysorg/sglang:v0.5.9-cu130.
 #
 # All three modes write under the same parent dir
 #   results/<docker>/<MODEL>-cascade-<TAG>/{L1,L2/size_<N>,L3_file/size_<N>}/
@@ -121,11 +125,13 @@ REQUEST_LENGTH=4096
 OUTPUT_LENGTH=1
 MAX_PARALLEL=8
 REQUEST_RATE=32
-# CUDA graph capture range: SGLang pre-captures graphs for batch sizes
-# 1..N, each costing GPU memory. SGLang's own default (~512) wastes
-# memory because round-barrier + max-parallel caps actual batch at
-# <=MAX_PARALLEL. When unset (0), we couple to MAX_PARALLEL so capture
-# matches reality.
+# --cuda-graph-max-bs: passthrough to SGLang's --cuda-graph-max-bs. 0
+# (default) means "don't pass it; let SGLang pick its own default
+# (~512)". Set explicitly only if you have a memory-constrained reason.
+# NOTE: bench_multiturn.py's --max-parallel is a client-side concurrency
+# limit, NOT a server-side cap — the server scheduler batches as many
+# requests as fit in max-running-requests + chunked-prefill-size, so in
+# practice #running-req climbs well above MAX_PARALLEL.
 CUDA_GRAPH_MAX_BS=0
 # Prefill chunking. Default 32768 matches the original a0367ca config
 # (SGLang's own default is 8192). a0c0522 bumped this to 65536 to save
@@ -135,7 +141,10 @@ CUDA_GRAPH_MAX_BS=0
 # 65536 explicitly for ablation runs.
 CHUNKED_PREFILL_SIZE=32768
 MAX_PREFILL_TOKENS=32768
-WAIT_FOR_SERVER_SEC=900     # 15 min cap; bail out if SGLang doesn't /health
+# 30 min cap; large host pools (e.g. 320 GB × 8 ranks = 2.56 TB pinned)
+# can take 12-15 min just to fault in + register with the GPU driver,
+# so 900s was too tight and caused L3_file timeouts on MI355X.
+WAIT_FOR_SERVER_SEC=1800
 # GSM8K precheck. ON by default so every cascade run carries a model-
 # correctness signature in bench_meta.json (paired with the per-run
 # Accuracy_GSM8K.log under $LOG_DIR). Adds ~70-90 sec per cascade run;
@@ -165,9 +174,10 @@ HOST_INFO_ONLY="false"
 # both device KV-pool size and the "host > device" HiCache assertion.
 MEM_FRACTION_STATIC=0.85
 
-# --page-size: overrides the model-family-detected PAGE_SIZE. Useful
-# for controlled DSR1 page_size=1-vs-64 experiments combined with
-# --cache-mode none. Leave empty to use family default.
+# --page-size: overrides the model-family-detected PAGE_SIZE. Family
+# defaults are page_size=64 across the board (MLA / NSA / GQA); pass
+# --page-size 1 here to A/B against the legacy contiguous-KV layout for
+# DSR1 / Llama / Qwen runs. Leave empty to use family default.
 PAGE_SIZE_OVERRIDE=""
 
 # --no-cache: legacy alias for --cache-mode none. Disables both radix
@@ -207,12 +217,28 @@ SPECULATIVE_NUM_DRAFT_TOKENS=4
 # only when model is MXFP4.
 HUBERT_PRESET="false"
 
+# --cache-modes (plural): space-separated list of modes to run as a GLM.sh-
+# style chain. With this set, the script re-execs itself once per mode
+# (each as a separate cascade_dsr1.sh process so all per-mode state is
+# fresh) with pkill -9 sglang + sleep 10 between iterations, then exits.
+# Without this flag, the script behaves as before (single mode via
+# --cache-mode). Example:
+#   ./cascade_dsr1.sh --tag PS64 --cache-modes "none L1 L2 L3_file" \
+#       --docker rocm/sgl-dev:v0.5.11-rocm720-mi35x-20260514
+CACHE_MODES=""
+
+# Save the original argv so the chain dispatcher can re-exec self with the
+# user's flags forwarded (minus --cache-modes itself, which would cause an
+# infinite recursion).
+ORIG_ARGS=("$@")
+
 while [[ $# -gt 0 ]]; do
   case $1 in
     --model)          MODEL_PATH="$2"; shift 2;;
     --tag)            TAG="$2"; shift 2;;
     --docker)         DOCKER="$2"; shift 2;;
     --cache-mode)     CACHE_MODE="$2"; shift 2;;
+    --cache-modes)    CACHE_MODES="$2"; shift 2;;
     --tp)             TP_SIZE="$2"; shift 2;;
     --port)           PORT="$2"; shift 2;;
     --hicache-size)   HICACHE_SIZE="$2"; shift 2;;
@@ -247,6 +273,40 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown option: $1" >&2; exit 1;;
   esac
 done
+
+# ============================== Chain dispatcher (GLM.sh-style) ==============================
+# If --cache-modes was passed (space-separated list), re-exec self once
+# per mode with pkill + sleep 10 between iterations. Same idea as the
+# `for PROF_MODE in ...; do ...; pkill -9 python; sleep 10; done` loop
+# in GLM.sh, except scoped to sglang processes only. This makes manually
+# chaining `./cascade_dsr1.sh --cache-mode L1; ./cascade_dsr1.sh ...`
+# unnecessary AND eliminates the race where the previous invocation's
+# server is still alive when the next one launches (root cause of the
+# 2026-05-16 "L3_file curve == L2 curve" bug).
+if [ -n "$CACHE_MODES" ]; then
+  # Strip --cache-modes and its value from the argv we forward — keeping
+  # it would cause infinite self-exec recursion.
+  FORWARD_ARGS=()
+  i=0
+  while [ "$i" -lt "${#ORIG_ARGS[@]}" ]; do
+    case "${ORIG_ARGS[$i]}" in
+      --cache-modes) i=$((i + 2)) ;;
+      *) FORWARD_ARGS+=("${ORIG_ARGS[$i]}"); i=$((i + 1)) ;;
+    esac
+  done
+  for MODE in $CACHE_MODES; do
+    echo ""
+    echo ">>> ============================================================"
+    echo ">>> cascade_dsr1.sh chain: starting cache_mode=${MODE}"
+    echo ">>> ============================================================"
+    "$0" --cache-mode "$MODE" "${FORWARD_ARGS[@]}"
+    echo ">>> chain: ${MODE} done; killing any leftover sglang + sleeping 10s"
+    pkill -9 sglang 2>/dev/null || true
+    sleep 10
+  done
+  echo ">>> chain: all modes complete (${CACHE_MODES})"
+  exit 0
+fi
 
 # ============================== Host snapshot helpers ==============================
 # Defined up-here (before validation) so --host-info-only can call them
@@ -584,31 +644,36 @@ case "$MODEL_NAME" in
     # Drop --reasoning-parser here on purpose: see ROCm-block comment in
     # SERVER_CMD section about parser eating cascade output text.
     REASONING_PARSER_FLAGS=()
-    PAGE_SIZE=1
+    # page_size=64 is now the script-wide default. For MLA on ROCm aiter
+    # this combo only works once the FP8-prefill kernel from PR #18528 is
+    # disabled (SGLANG_AITER_FP8_PREFILL_ATTN=0, exported below); otherwise
+    # GSM8K collapses to ~0.0 on MI355X. Pair with --page-size 1 override
+    # if you specifically need to A/B against the legacy contiguous layout.
+    PAGE_SIZE=64
     CONTEXT_LENGTH=65536
     ;;
   Qwen3-32B|Qwen3-*|Qwen2.5-*|Qwen2-*)
     MODEL_FAMILY="GQA"
     REASONING_PARSER_FLAGS=()
-    PAGE_SIZE=1
+    PAGE_SIZE=64
     CONTEXT_LENGTH=40960
     ;;
   Llama-3.*|Llama3-*|Meta-Llama-3*)
     MODEL_FAMILY="GQA"
     REASONING_PARSER_FLAGS=()
-    PAGE_SIZE=1
+    PAGE_SIZE=64
     CONTEXT_LENGTH=65536
     ;;
   Mixtral-*|Mistral-*|mistral-*)
     MODEL_FAMILY="GQA"
     REASONING_PARSER_FLAGS=()
-    PAGE_SIZE=1
+    PAGE_SIZE=64
     CONTEXT_LENGTH=32768
     ;;
   *)
     MODEL_FAMILY="GQA"
     REASONING_PARSER_FLAGS=()
-    PAGE_SIZE=1
+    PAGE_SIZE=64
     CONTEXT_LENGTH=32768
     echo ">>> NOTE: unrecognized model name '$MODEL_NAME', defaulting to GQA family" >&2
     ;;
@@ -675,6 +740,29 @@ if [ "$CACHE_MODE" = "none" ] || [ "$CACHE_MODE" = "L1" ]; then
   HICACHE_SIZE=0
   echo ">>> CACHE_MODE=$CACHE_MODE: skipping host pool sizing (no HiCache layer)"
 elif [ "$HICACHE_SIZE" = "auto" ]; then
+  # Wait for any prior run's pinned host pool to actually come back to
+  # MemAvailable. After SIGKILL on the previous sglang server the kernel
+  # async-releases the cudaMallocHost pages, so /proc/meminfo MemAvailable
+  # can lag by 10-30s. Without this wait, chained runs (e.g. L2 → L3 back
+  # to back) auto-size L3 against the still-pinned L2 pool and end up with
+  # ~32 GB/rank less host pool than L2 had, making cross-mode comparisons
+  # unfair. We sync + drop_caches once (clears OS page cache), then sample
+  # MemAvail every 5s and break as soon as two consecutive samples are
+  # within 5 GB (signal: kernel is done reclaiming for now). Cap at 60s.
+  sync
+  echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+  prev=0
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    cur=$(awk '/^MemAvailable:/ {print int($2/1024/1024)}' /proc/meminfo)
+    if [ "$prev" -gt 0 ] && [ $((cur - prev)) -le 5 ] && [ $((prev - cur)) -le 5 ]; then
+      echo ">>> MemAvailable settled at ${cur} GB after $((i*5)) s"
+      break
+    fi
+    echo ">>> waiting for MemAvailable to settle (sample $i: ${cur} GB; prev ${prev} GB)"
+    prev=$cur
+    sleep 5
+  done
+
   MEM_AVAIL_GB=$(awk '/^MemAvailable:/ {print int($2/1024/1024)}' /proc/meminfo)
   USABLE_GB=$(( MEM_AVAIL_GB - HOST_HEADROOM_GB ))
   if [ "$USABLE_GB" -le 0 ]; then
@@ -826,18 +914,36 @@ if [[ "$CACHE_MODE" == L3_* ]]; then
   rm -rf "$HICACHE_FILE_STORE_DIR" 2>/dev/null
   mkdir -p "$HICACHE_FILE_STORE_DIR"
   export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$HICACHE_FILE_STORE_DIR"
+
+  # Sanity check: L3 NVMe free space must be > total L2 host pool size
+  # (HICACHE_SIZE per rank × TP_SIZE ranks). If L3 can't even hold a
+  # single L2 worth of evictions, the L3_file run will collapse onto the
+  # L2 curve (no meaningful extra capacity to spill to) and the cascade
+  # plot becomes uninformative. df -BG prints free space in GB chunks
+  # rounded down, which is exactly the conservative comparison we want.
+  L2_TOTAL_GB=$(( HICACHE_SIZE * TP_SIZE ))
+  L3_FREE_GB=$(df -BG --output=avail "$HICACHE_FILE_STORE_DIR" | tail -1 | tr -dc '0-9')
+  echo ">>> L3 disk check: free=${L3_FREE_GB} GB at $(dirname "$HICACHE_FILE_STORE_DIR")," \
+       "L2 total host pool=${L2_TOTAL_GB} GB (=${HICACHE_SIZE} GB/rank × ${TP_SIZE} ranks)"
+  if [ "${L3_FREE_GB:-0}" -le "$L2_TOTAL_GB" ]; then
+    echo "ERROR: L3 NVMe free space (${L3_FREE_GB} GB) <= L2 host pool" >&2
+    echo "       total (${L2_TOTAL_GB} GB). L3 can't even hold one L2 worth of" >&2
+    echo "       evictions — the L3_file curve will look identical to L2 and" >&2
+    echo "       the cascade plot will be uninformative. Free up /tmp space" >&2
+    echo "       or shrink --hicache-size before re-running." >&2
+    exit 1
+  fi
 fi
-# Trap uses :- so none/L1/L2 (HICACHE_FILE_STORE_DIR="") doesn't trip
-# set -u. Also kill the cache_monitor sidecar if it's still alive.
-# Graceful: SIGTERM first so SGLang can flush stdout/stderr buffers
-# (final Prefill batch / Shutting down / per-rank stats) into server.log;
-# then SIGKILL anything still hanging.
+# GLM.sh-style cleanup: SIGKILL anything matching "sglang", sleep 10 so
+# the HIP/CUDA driver can reap VRAM before the next invocation. Same
+# pattern as GLM.sh line 466 (`pkill -9 python; sleep 10`), scoped to
+# sglang since this script runs inside a dedicated sglang container.
+# Uses :- so none/L1/L2 (HICACHE_FILE_STORE_DIR="") doesn't trip set -u.
 trap '
   rm -rf "${HICACHE_FILE_STORE_DIR:-}" 2>/dev/null
   [ -n "${CACHE_MONITOR_PID:-}" ] && kill "${CACHE_MONITOR_PID}" 2>/dev/null
-  pkill -TERM -f sglang.launch_server 2>/dev/null
-  sleep 3
-  pkill -9 -f sglang.launch_server 2>/dev/null
+  pkill -9 sglang 2>/dev/null || true
+  sleep 10
   true' EXIT
 
 # ============================== Server launch ==============================
@@ -848,13 +954,11 @@ SERVER_LOG="$LOG_DIR/server.log"
 # buffering loses up to ~8 KB of trailing logs when killed at end of
 # run and makes tail -f look frozen during the run.
 export PYTHONUNBUFFERED=1
-# Default cuda-graph-max-bs to MAX_PARALLEL when user didn't override.
-# That keeps captured graphs to the actual concurrent batch sizes the
-# bench will produce (under round-barrier + max-parallel client cap).
-if [ "$CUDA_GRAPH_MAX_BS" -le 0 ]; then
-  CUDA_GRAPH_MAX_BS="$MAX_PARALLEL"
+if [ "$CUDA_GRAPH_MAX_BS" -gt 0 ]; then
+  echo ">>> cuda-graph-max-bs=${CUDA_GRAPH_MAX_BS} (user override)"
+else
+  echo ">>> cuda-graph-max-bs: SGLang default (~512)"
 fi
-echo ">>> cuda-graph-max-bs=${CUDA_GRAPH_MAX_BS} (coupled to max-parallel)"
 echo ">>> chunked-prefill-size=${CHUNKED_PREFILL_SIZE}, max-prefill-tokens=${MAX_PREFILL_TOKENS}"
 
 # Common cmd (everything that doesn't depend on cache mode).
@@ -881,6 +985,11 @@ SERVER_CMD=(
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
     --max-prefill-tokens "$MAX_PREFILL_TOKENS"
 )
+# Only pass --cuda-graph-max-bs when user explicitly overrode it
+# (CUDA_GRAPH_MAX_BS > 0). Otherwise rely on SGLang's own default (~512).
+if [ "$CUDA_GRAPH_MAX_BS" -gt 0 ]; then
+  SERVER_CMD+=(--cuda-graph-max-bs "$CUDA_GRAPH_MAX_BS")
+fi
 # Cache-mode-specific flags. none = --disable-radix-cache (no radix, no
 # HiCache); L1 = GPU-only radix; L2 = + host DRAM pool; L3_file = + file.
 case "$CACHE_MODE" in
@@ -950,18 +1059,35 @@ if is_rocm; then
   #                                          to ~0.01 (verified 2026-05-12 in
   #                                          tools/gsm8k_dsr1_minfix_test.sh).
   # Also dropped from SERVER_CMD common args:
-  #   --page-size 64           non-standard for FP8 KV + aiter MLA;
-  #                            no public reference uses page_size>1 (AMD doc,
-  #                            InferenceX, Clint Greene's MXFP4 cmd all use
-  #                            default page_size=1). page_size=64 corrupts KV
-  #                            indexing → garbage outputs + occasional HSA fault.
   #   --reasoning-parser deepseek-r1   strips <think>...</think> server-side;
   #                            for cascade workload (output_length=1) and
   #                            GSM8K precheck the parser can eat the actual
   #                            answer text. Not needed for these benches.
+  #
+  # NOTE on --page-size 64: previously avoided because page>1 + aiter MLA
+  # produced garbled outputs / HSA faults. Root-cause was the new FP8
+  # prefill kernel from PR #18528 (KV layout assumption). With
+  # SGLANG_AITER_FP8_PREFILL_ATTN=0 exported below the kernel falls back
+  # to the contiguous path and page_size=64 is safe. Family default is
+  # now PAGE_SIZE=64; override with --page-size 1 for A/B sanity checks.
   export SAFETENSORS_FAST_GPU=1
   export SGLANG_USE_AITER=1
   export ROCM_QUICK_REDUCE_QUANTIZATION=NONE
+
+  # MXFP4 model: always export the env vars aiter needs to take the
+  # scale-factor MoE kernel path. Without AITER_MXFP4_MOE_SF=1 the model
+  # either crashes at MoE init or silently produces garbage outputs.
+  # SGLANG_DISABLE_FUSED_AR_MXFP4_QUANT=false enables the fused all-reduce
+  # path for MXFP4 quant; Hubert's PR #16531 verified config sets both.
+  # Independent of --hubert-preset because these are *required* for MXFP4
+  # to work at all (not optional perf tweaks like the rest of the preset).
+  if [ "$IS_MXFP4" = "true" ]; then
+    export AITER_MXFP4_MOE_SF=1
+    export SGLANG_DISABLE_FUSED_AR_MXFP4_QUANT=false
+    echo ">>> MXFP4 model detected: exported AITER_MXFP4_MOE_SF=1," \
+         "SGLANG_DISABLE_FUSED_AR_MXFP4_QUANT=false" >&2
+  fi
+
   # Disable PR #18528 (Fp8 prefill attn kernel integration, merged 2026-02-11)
   # on MI355X. The new mla_prefill_ps_asm_fwd kernel default-enabled by
   # is_gfx95_supported() collapses GSM8K accuracy from 0.94 → 0.02 when
@@ -987,14 +1113,14 @@ if is_rocm; then
     export SGLANG_MOE_PADDING=1
     export SGLANG_SET_CPU_AFFINITY=1
     export RCCL_MSCCL_ENABLE=0
-    if [ "$IS_MXFP4" = "true" ]; then
-      export AITER_MXFP4_MOE_SF=1
-    fi
     echo ">>> --hubert-preset: applied Hubert PR #16531 env vars" >&2
     echo "    SGLANG_AITER_MLA_PERSIST=1, SGLANG_ROCM_FUSED_DECODE_MLA=1," >&2
     echo "    SGLANG_USE_AITER_AR=0, SGLANG_INT4_WEIGHT=0," >&2
     echo "    SGLANG_MOE_PADDING=1, SGLANG_SET_CPU_AFFINITY=1," >&2
-    echo "    RCCL_MSCCL_ENABLE=0$([ "$IS_MXFP4" = "true" ] && echo ", AITER_MXFP4_MOE_SF=1")" >&2
+    echo "    RCCL_MSCCL_ENABLE=0" >&2
+    # AITER_MXFP4_MOE_SF=1 + SGLANG_DISABLE_FUSED_AR_MXFP4_QUANT=false are
+    # set unconditionally for MXFP4 models in the block above (required,
+    # not part of the optional hubert preset).
   fi
 
   # NSA family (GLM-5/5.1, DSV3.2): route attention through tilelang.
@@ -1023,19 +1149,59 @@ fi
 
 echo ">>> launching SGLang (cache_mode=${CACHE_MODE}, hicache-size=${HICACHE_SIZE} GB)"
 echo "${SERVER_CMD[*]}" | tee "$SERVER_LOG"
+
+# Pre-launch safety: refuse to start if any sglang process is alive in
+# this container, or if port 30000 is already serving /health. Without
+# these guards, a leftover server from the previous cascade_dsr1.sh
+# invocation (whose EXIT trap missed it for any reason) would (a) make
+# our new server OOM during weight load, then (b) /health below would
+# still return 200 from the *old* server and we'd silently run the
+# entire bench against the wrong cache_mode (root cause of the 2026-05-16
+# "L3_file curve == L2 curve" bug — see size_320.invalid_l2_rerun_*).
+# With the new --cache-modes chain dispatcher this race is largely gone,
+# but keep the check as a belt-and-suspenders safety net for manual
+# multi-shell invocations.
+if pgrep sglang >/dev/null 2>&1; then
+  echo "ERROR: another sglang process is already running in this container." >&2
+  echo "       Run 'pkill -9 sglang && sleep 10' first, or wait for the" >&2
+  echo "       previous cascade_dsr1.sh invocation to exit." >&2
+  pgrep -a sglang >&2
+  exit 1
+fi
+if curl -s -o /dev/null -w '%{http_code}' "http://${HOST}:${PORT}/health" 2>/dev/null | grep -q '^200$'; then
+  echo "ERROR: port ${PORT} already has something serving /health 200." >&2
+  echo "       Refusing to launch — would otherwise silently run bench" >&2
+  echo "       against the wrong server." >&2
+  exit 1
+fi
+
 "${SERVER_CMD[@]}" 2>&1 | tee -a "$SERVER_LOG" &
+SERVER_BG_PID=$!
 
 # ============================== Wait for /health ==============================
+# Wait for the *launched* server to come up. Cross-check that:
+#   1) SERVER_BG_PID is still alive (bg pipeline didn't crash), AND
+#   2) /health returns 200.
+# Without (1), an OOM at weight-load time would silently let us proceed
+# against whatever other server happened to answer on PORT — see the
+# 2026-05-16 L3_file post-mortem above.
 deadline=$(( $(date +%s) + WAIT_FOR_SERVER_SEC ))
 echo ">>> waiting up to ${WAIT_FOR_SERVER_SEC}s for /health 200..."
 while [ "$(curl -s -o /dev/null -w '%{http_code}' "http://${HOST}:${PORT}/health" 2>/dev/null)" != "200" ]; do
+  if ! kill -0 "$SERVER_BG_PID" 2>/dev/null; then
+    echo "ERROR: server background pipeline (pid=$SERVER_BG_PID) exited before" >&2
+    echo "       /health became ready. Inspect $SERVER_LOG (likely OOM, port" >&2
+    echo "       conflict, weight-load crash, or aiter kernel failure)." >&2
+    tail -n 80 "$SERVER_LOG" >&2 || true
+    exit 1
+  fi
   if [ "$(date +%s)" -ge "$deadline" ]; then
-    echo "ERROR: server didn't come up — see $SERVER_LOG" >&2
+    echo "ERROR: server didn't come up within ${WAIT_FOR_SERVER_SEC}s — see $SERVER_LOG" >&2
     exit 1
   fi
   sleep 5
 done
-echo ">>> server ready"
+echo ">>> server ready (bg pid=$SERVER_BG_PID)"
 
 # ============================== Warmup ==============================
 echo ">>> warmup (random 1024/128 × 8 prompts × 4 concurrency)"
@@ -1197,14 +1363,12 @@ if [ -n "${CACHE_MONITOR_PID:-}" ] && kill -0 "$CACHE_MONITOR_PID" 2>/dev/null; 
 fi
 
 # ============================== Cleanup ==============================
-# Graceful: SIGTERM first so SGLang flushes its trailing log lines
-# (Shutting down / per-rank stats) into server.log; SIGKILL anything
-# stuck after 5s.
-echo ">>> stopping server (graceful: SIGTERM then SIGKILL after 5s)"
-pkill -TERM -f sglang.launch_server 2>/dev/null || true
-sleep 5
-pkill -9 -f sglang.launch_server 2>/dev/null || true
-sleep 1
+# GLM.sh-style: pkill -9 sglang + sleep 10. Simple and reliable. The
+# EXIT trap also fires after this, so anything that survives gets a
+# second kill on the way out.
+echo ">>> stopping server (pkill -9 sglang)"
+pkill -9 sglang 2>/dev/null || true
+sleep 10
 
 if [ -n "$HICACHE_FILE_STORE_DIR" ] && [ -d "$HICACHE_FILE_STORE_DIR" ]; then
   sz=$(du -sh "$HICACHE_FILE_STORE_DIR" 2>/dev/null | cut -f1)
