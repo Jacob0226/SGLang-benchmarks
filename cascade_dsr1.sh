@@ -1376,31 +1376,19 @@ if [ -n "$HICACHE_FILE_STORE_DIR" ] && [ -d "$HICACHE_FILE_STORE_DIR" ]; then
   echo ">>> cleaned L3 file store (${sz:-?} reclaimed)"
 fi
 
-# Auto-suggest the right --MI355X / --B200 flag for plot_cascade.py
-# based on the user's --tag (so the printed command can be copy-pasted
-# straight into a shell). Falls back to --MI355X for unknown tags.
+# Auto-suggest the right --MI355X-dir / --B200-dir flag for plot_cascade.py
+# based on --tag. plot_cascade.py now takes cascade root dirs (one per
+# platform) and auto-discovers L1/L2/L3_file jsonls inside.
 case "$TAG" in
-  *MI355X*|*MI300*|*MI325*|*MI250*|*MI210*|*ROCm*|*rocm*|*amd*) PLOT_FLAG="--MI355X" ;;
-  *B200*|*H200*|*H100*|*A100*|*L40*|*nvidia*|*NVIDIA*)          PLOT_FLAG="--B200"  ;;
-  *)                                                            PLOT_FLAG="--MI355X" ;;  # generic fallback
+  *MI355X*|*MI300*|*MI325*|*MI250*|*MI210*|*ROCm*|*rocm*|*amd*) PLATFORM_FLAG="--MI355X-dir" ;;
+  *B200*|*H200*|*H100*|*A100*|*L40*|*nvidia*|*NVIDIA*)          PLATFORM_FLAG="--B200-dir"  ;;
+  *)                                                            PLATFORM_FLAG="--MI355X-dir" ;;
 esac
 
-# Title text for the suggested plot — L1 has no hicache size, L2/L3 do.
-if [ "$CACHE_MODE" = "L1" ]; then
-  PLOT_TITLE_SUFFIX=""
-else
-  PLOT_TITLE_SUFFIX=" (hicache=${HICACHE_SIZE} GB)"
-fi
-
 echo ">>> done. results in: $LOG_DIR"
-echo "    plot (single platform, paths resolved to absolute):"
+echo "    plot (after all cache modes done; auto-discovers L1/L2/L3_file):"
 echo "      python3 plot_cascade.py \\"
-echo "          --Title \"${MODEL_NAME} cascade ${CACHE_MODE} ${TAG}${PLOT_TITLE_SUFFIX}\" \\"
-echo "          ${PLOT_FLAG} ${LOG_DIR}/bench_multiturn.jsonl \\"
-echo "          --out ${LOG_DIR}/cascade_${TAG}_${CACHE_MODE}.png"
-echo "    plot (cross-platform, after running on the OTHER box too):"
-echo "      python3 plot_cascade.py \\"
-echo "          --Title \"${MODEL_NAME} cascade ${CACHE_MODE}: MI355X vs B200\" \\"
-echo "          --MI355X <path-to-MI355X-${CACHE_MODE}-bench_multiturn.jsonl> \\"
-echo "          --B200   <path-to-B200-${CACHE_MODE}-bench_multiturn.jsonl> \\"
-echo "          --out    \$HOME/SGLang-benchmarks/results/cascade_${MODEL_NAME}_${CACHE_MODE}.png"
+echo "          ${PLATFORM_FLAG} ${BASE_LOG_DIR} \\"
+echo "          $([ "$PLATFORM_FLAG" = "--MI355X-dir" ] && echo "--B200-dir <B200-cascade-root>" || echo "--MI355X-dir <MI355X-cascade-root>") \\"
+echo "          --max-rounds 10"
+echo "    Writes 3 PNGs into the MI355X dir: MI355X.png, B200.png, MI355X_VS_B200.png"
