@@ -35,13 +35,27 @@ ulimit -n 65535
 HOST="localhost"
 PORT=30000
 MODEL_PATH=${MODEL_PATH:-/data/huggingface/hub/deepseek-ai/DeepSeek-R1-0528}
-ROUNDS_WARMUP=7
-ROUNDS_PROFILE=2
+TP_SIZE=8
+DOCKER="untagged-docker"
+
+# AUTO mode knobs (mirror cascade_L2_torchprofile.sh)
+L1_SIZE=""             # GB per rank; setting this triggers AUTO mode
+L2_SIZE=""             # GB per rank; must be >= L1_SIZE
+KV_BYTES_PER_TOKEN=$((34 * 1024))   # DSR1-0528 default
+BUFFER_GB=12
+CACHE_MODE="L3_file"
+WAIT_FOR_HEALTH_SEC=1500
+
+# MANUAL mode + shared knobs
+ROUNDS_WARMUP=""
+ROUNDS_PROFILE=2       # default 2 so the slice has time for loggers
+NUM_ROUNDS_OVERRIDE=""
 NUM_CLIENTS=300
 REQUEST_LENGTH=4096
 OUTPUT_LENGTH=1
 MAX_PARALLEL=8
 REQUEST_RATE=32
+
 TAG=""
 OUTPUT_DIR=""
 SAMPLE_INTERVAL_MS=200
@@ -53,8 +67,16 @@ while [[ $# -gt 0 ]]; do
     --host)              HOST="$2"; shift 2;;
     --port)              PORT="$2"; shift 2;;
     --model)             MODEL_PATH="$2"; shift 2;;
+    --tp)                TP_SIZE="$2"; shift 2;;
+    --docker)            DOCKER="$2"; shift 2;;
+    --L1-size)           L1_SIZE="$2"; shift 2;;
+    --L2-size)           L2_SIZE="$2"; shift 2;;
+    --kv-bytes-per-token) KV_BYTES_PER_TOKEN="$2"; shift 2;;
+    --buffer-gb)         BUFFER_GB="$2"; shift 2;;
+    --cache-mode)        CACHE_MODE="$2"; shift 2;;
     --rounds-warmup)     ROUNDS_WARMUP="$2"; shift 2;;
     --rounds-profile)    ROUNDS_PROFILE="$2"; shift 2;;
+    --num-rounds)        NUM_ROUNDS_OVERRIDE="$2"; shift 2;;
     --num-clients)       NUM_CLIENTS="$2"; shift 2;;
     --request-length)    REQUEST_LENGTH="$2"; shift 2;;
     --output-length)     OUTPUT_LENGTH="$2"; shift 2;;
@@ -69,15 +91,28 @@ while [[ $# -gt 0 ]]; do
       cat <<EOF
 Usage: $0 --tag TAG [opts]
 
-L3 system profile: iostat + vendor PCIe + (optional) strace, time-aligned
-to the profile slice of a continuous cascade.
+AUTO mode (recommended; fair B200 vs MI355X):
+  $0 --tag X --model PATH --L1-size 40 --L2-size 80 [--docker IMG]
+  Auto-derives mem-fraction-static / hicache-size / num-rounds via
+  compute_profile_params.py and launches its own server through
+  cascade_dsr1_lite.sh. Loggers run for ROUNDS_PROFILE rounds starting
+  the moment L1 first overflows (= floor(L1/KV_per_round) + 1).
+
+MANUAL mode (legacy; server must already be running):
+  $0 --tag X --rounds-warmup 7 --rounds-profile 2
 
 Required: --tag TAG
+AUTO-mode required: --model PATH --L1-size N --L2-size N
+
 Common opts:
   --host/--port              server location (default localhost:30000)
-  --model PATH               must match server-launched model
-  --rounds-warmup N          (default 7)
+  --tp N                     (default 8) for AUTO-mode launch
+  --docker NAME              container tag for results dir naming
+  --kv-bytes-per-token N     (default 34*1024 for DSR1-0528 MLA fp8)
+  --buffer-gb N              (default 12) per-rank HBM headroom in AUTO
+  --cache-mode MODE          (default L3_file) for AUTO-mode launch
   --rounds-profile M         (default 2) rounds during which loggers run
+  --num-rounds N             override auto-derived total rounds
   --num-clients N            (default 300)
   --hicache-file-dir DIR     L3 backend dir; auto-picked from
                              SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR env
@@ -85,7 +120,7 @@ Common opts:
   --interval-ms N            PCIe / nvsmi poll period (default 200)
   --enable-strace            attach strace to sglang scheduler workers
                              during slice; high overhead, off by default
-  --output-dir DIR           default ~/SGLang-benchmarks/profiles/<tag>/<ts>
+  --output-dir DIR           default ~/SGLang-benchmarks/profiles/<tag>_l3sys/<ts>
 EOF
       exit 0
       ;;
@@ -94,7 +129,21 @@ EOF
 done
 
 [ -z "$TAG" ] && { echo "ERROR: --tag required" >&2; exit 1; }
-TOTAL_ROUNDS=$(( ROUNDS_WARMUP + ROUNDS_PROFILE ))
+
+# ============================== Mode arbitration ==============================
+AUTO_MODE=false
+if [ -n "$L1_SIZE" ] || [ -n "$L2_SIZE" ]; then
+  if [ -z "$L1_SIZE" ] || [ -z "$L2_SIZE" ]; then
+    echo "ERROR: AUTO mode requires BOTH --L1-size and --L2-size" >&2
+    exit 1
+  fi
+  AUTO_MODE=true
+fi
+if [ "$AUTO_MODE" = false ] && [ -z "$ROUNDS_WARMUP" ]; then
+  echo "ERROR: must pass either --L1-size + --L2-size (AUTO) or --rounds-warmup (MANUAL)" >&2
+  exit 1
+fi
+[ "$AUTO_MODE" = false ] && TOTAL_ROUNDS=$(( ROUNDS_WARMUP + ROUNDS_PROFILE ))
 
 # ============================== Locate bench script ==============================
 BENCH_SCRIPT=""
@@ -142,23 +191,6 @@ TS=$(date +%Y%m%d_%H%M%S)
 mkdir -p "$OUTPUT_DIR"
 echo ">>> output dir: $OUTPUT_DIR"
 
-# ============================== Pre-flight ==============================
-if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://${HOST}:${PORT}/health" 2>/dev/null)" != "200" ]; then
-  echo "ERROR: $HOST:$PORT /health not 200; start server first" >&2
-  exit 1
-fi
-if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://${HOST}:${PORT}/metrics" 2>/dev/null)" != "200" ]; then
-  echo "ERROR: /metrics not reachable; relaunch with --enable-metrics" >&2
-  exit 1
-fi
-
-echo ">>> flushing /flush_cache + drop_caches"
-curl -s -X POST "http://${HOST}:${PORT}/flush_cache" >/dev/null || true
-sleep 2
-sync
-echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-sleep 2
-
 # ============================== Helpers ==============================
 metric_baseline_count() {
   curl -s "http://${HOST}:${PORT}/metrics" \
@@ -168,31 +200,151 @@ metric_baseline_count() {
         END { printf "%d\n", f + a }'
 }
 
-BASELINE_DONE=$(metric_baseline_count)
-TARGET_FOR_PROFILE=$(( BASELINE_DONE + ROUNDS_WARMUP * NUM_CLIENTS ))
-echo ">>> baseline num_requests_done=${BASELINE_DONE}; loggers start at ${TARGET_FOR_PROFILE}"
+# ============================== AUTO mode: derive params + launch ==============================
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+CASCADE_PID=""
+CASCADE_LOG=""
+BENCH_PID=""
 
-# ============================== Launch bench (background) ==============================
-BENCH_LOG="$OUTPUT_DIR/bench_multiturn.log"
-BENCH_JSONL="$OUTPUT_DIR/bench_multiturn.jsonl"
-echo ">>> launching bench_multiturn (total rounds=${TOTAL_ROUNDS})"
-python3 "$BENCH_SCRIPT" \
-  --host "$HOST" --port "$PORT" \
-  --model-path "$MODEL_PATH" \
-  --num-clients "$NUM_CLIENTS" \
-  --num-rounds "$TOTAL_ROUNDS" \
-  --request-length "$REQUEST_LENGTH" \
-  --output-length "$OUTPUT_LENGTH" \
-  --max-parallel "$MAX_PARALLEL" \
-  --request-rate "$REQUEST_RATE" \
-  --ready-queue-policy random \
-  --log-file "$BENCH_JSONL" \
-  --tag "${TAG}-warmup${ROUNDS_WARMUP}-l3sys" \
-  --disable-random-sample \
-  --disable-auto-run \
-  --enable-round-barrier \
-  > "$BENCH_LOG" 2>&1 &
-BENCH_PID=$!
+if [ "$AUTO_MODE" = true ]; then
+  HELPER="$SCRIPT_DIR/compute_profile_params.py"
+  [ -f "$HELPER" ] || { echo "ERROR: $HELPER not found" >&2; exit 1; }
+
+  echo ">>> AUTO mode: computing params from --L1-size=${L1_SIZE} --L2-size=${L2_SIZE}"
+  PARAMS=$(python3 "$HELPER" \
+    --model "$MODEL_PATH" \
+    --tp "$TP_SIZE" \
+    --L1-size "$L1_SIZE" \
+    --L2-size "$L2_SIZE" \
+    --num-clients "$NUM_CLIENTS" \
+    --request-length "$REQUEST_LENGTH" \
+    --kv-bytes-per-token "$KV_BYTES_PER_TOKEN" \
+    --buffer-gb "$BUFFER_GB" \
+    --rounds-profile "$ROUNDS_PROFILE" 2>&1) || { echo "$PARAMS" >&2; exit 1; }
+  echo "$PARAMS" | grep -E '^(WARN|ERROR)' >&2 || true
+  eval "$(echo "$PARAMS" | grep -E '^[A-Z_]+=')"
+  echo "    weights/rank=${WEIGHTS_GB_PER_RANK}GB  HBM/rank=${HBM_GB_PER_RANK}GB"
+  echo "    KV/round/rank=${KV_GB_PER_ROUND_PER_RANK}GB  → WARMUP=${WARMUP_ROUNDS} rounds"
+  echo "    derived: mem-fraction-static=${MEM_FRACTION_STATIC}  num-rounds=${NUM_ROUNDS}"
+  echo "    profile target: round ${PROFILE_TARGET_ROUND_1IDX} (1-indexed)"
+  ROUNDS_WARMUP="$WARMUP_ROUNDS"
+  [ -n "$NUM_ROUNDS_OVERRIDE" ] && NUM_ROUNDS="$NUM_ROUNDS_OVERRIDE"
+  TOTAL_ROUNDS="$NUM_ROUNDS"
+  echo "$PARAMS" > "$OUTPUT_DIR/profile_params.txt"
+
+  CASCADE_LITE="$SCRIPT_DIR/cascade_dsr1_lite.sh"
+  [ -f "$CASCADE_LITE" ] || { echo "ERROR: $CASCADE_LITE not found" >&2; exit 1; }
+
+  if pgrep -f sglang.launch_server >/dev/null 2>&1; then
+    echo "ERROR: sglang already running. 'pkill -9 sglang && sleep 10' first." >&2
+    exit 1
+  fi
+  if curl -s -o /dev/null -w '%{http_code}' "http://${HOST}:${PORT}/health" 2>/dev/null | grep -q '^200$'; then
+    echo "ERROR: port ${PORT} already serves /health 200" >&2
+    exit 1
+  fi
+
+  CASCADE_LOG="$OUTPUT_DIR/cascade_dsr1_lite.log"
+  echo ">>> launching cascade_dsr1_lite.sh in background; log: $CASCADE_LOG"
+  "$CASCADE_LITE" \
+    --tag "${TAG}_L1${L1_SIZE}_L2${L2_SIZE}" \
+    --docker "$DOCKER" \
+    --model "$MODEL_PATH" \
+    --tp "$TP_SIZE" \
+    --port "$PORT" \
+    --cache-mode "$CACHE_MODE" \
+    --hicache-size "$L2_SIZE" \
+    --mem-fraction-static "$MEM_FRACTION_STATIC" \
+    --num-clients "$NUM_CLIENTS" \
+    --num-rounds "$TOTAL_ROUNDS" \
+    --request-length "$REQUEST_LENGTH" \
+    --max-parallel "$MAX_PARALLEL" \
+    --request-rate "$REQUEST_RATE" \
+    --no-gsm8k-precheck \
+    > "$CASCADE_LOG" 2>&1 &
+  CASCADE_PID=$!
+
+  echo ">>> waiting up to ${WAIT_FOR_HEALTH_SEC}s for /health=200..."
+  deadline=$(( $(date +%s) + WAIT_FOR_HEALTH_SEC ))
+  while true; do
+    if curl -s -o /dev/null -w '%{http_code}' "http://${HOST}:${PORT}/health" 2>/dev/null | grep -q '^200$'; then
+      echo ">>> server up"; break
+    fi
+    if ! kill -0 "$CASCADE_PID" 2>/dev/null; then
+      echo "ERROR: cascade_dsr1_lite.sh died before server came up; tail of $CASCADE_LOG:" >&2
+      tail -n 40 "$CASCADE_LOG" >&2 || true
+      exit 1
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "ERROR: /health timeout" >&2; exit 1
+    fi
+    sleep 5
+  done
+
+  echo ">>> waiting for bench_multiturn to start"
+  deadline=$(( $(date +%s) + 600 ))
+  while true; do
+    if [ -f "$CASCADE_LOG" ] && grep -q '^>>> bench multiturn' "$CASCADE_LOG" 2>/dev/null; then
+      break
+    fi
+    if ! kill -0 "$CASCADE_PID" 2>/dev/null; then
+      echo "ERROR: cascade_dsr1_lite.sh died before bench started" >&2
+      tail -n 60 "$CASCADE_LOG" >&2 || true
+      exit 1
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "ERROR: bench start timeout" >&2; exit 1
+    fi
+    sleep 2
+  done
+  echo ">>> bench_multiturn started"
+
+  BASELINE_DONE=$(metric_baseline_count)
+  TARGET_FOR_PROFILE=$(( BASELINE_DONE + ROUNDS_WARMUP * NUM_CLIENTS ))
+  echo ">>> baseline num_requests_done=${BASELINE_DONE}; loggers start at ${TARGET_FOR_PROFILE}"
+
+else
+  # ============================== MANUAL mode pre-flight ==============================
+  if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://${HOST}:${PORT}/health" 2>/dev/null)" != "200" ]; then
+    echo "ERROR: $HOST:$PORT /health not 200; start server first" >&2
+    exit 1
+  fi
+  if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://${HOST}:${PORT}/metrics" 2>/dev/null)" != "200" ]; then
+    echo "ERROR: /metrics not reachable; relaunch with --enable-metrics" >&2
+    exit 1
+  fi
+
+  echo ">>> flushing /flush_cache + drop_caches"
+  curl -s -X POST "http://${HOST}:${PORT}/flush_cache" >/dev/null || true
+  sleep 2; sync
+  echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+  sleep 2
+
+  BASELINE_DONE=$(metric_baseline_count)
+  TARGET_FOR_PROFILE=$(( BASELINE_DONE + ROUNDS_WARMUP * NUM_CLIENTS ))
+  echo ">>> baseline num_requests_done=${BASELINE_DONE}; loggers start at ${TARGET_FOR_PROFILE}"
+
+  BENCH_LOG="$OUTPUT_DIR/bench_multiturn.log"
+  BENCH_JSONL="$OUTPUT_DIR/bench_multiturn.jsonl"
+  echo ">>> launching bench_multiturn (total rounds=${TOTAL_ROUNDS})"
+  python3 "$BENCH_SCRIPT" \
+    --host "$HOST" --port "$PORT" \
+    --model-path "$MODEL_PATH" \
+    --num-clients "$NUM_CLIENTS" \
+    --num-rounds "$TOTAL_ROUNDS" \
+    --request-length "$REQUEST_LENGTH" \
+    --output-length "$OUTPUT_LENGTH" \
+    --max-parallel "$MAX_PARALLEL" \
+    --request-rate "$REQUEST_RATE" \
+    --ready-queue-policy random \
+    --log-file "$BENCH_JSONL" \
+    --tag "${TAG}-warmup${ROUNDS_WARMUP}-l3sys" \
+    --disable-random-sample \
+    --disable-auto-run \
+    --enable-round-barrier \
+    > "$BENCH_LOG" 2>&1 &
+  BENCH_PID=$!
+fi
 
 LOGGER_PIDS=()
 ROCPROF_TMPDIR=""
@@ -202,22 +354,25 @@ cleanup() {
     kill "$pid" 2>/dev/null || true
   done
   if [ -n "$ROCPROF_TMPDIR" ] && [ -d "$ROCPROF_TMPDIR" ]; then
-    # rocprofv3 leaves a control pipe; tearing down the spawned process
-    # group catches the trace flush.
     pkill -P $$ rocprofv3 2>/dev/null || true
   fi
-  if kill -0 "$BENCH_PID" 2>/dev/null; then
-    echo ">>> killing bench_multiturn (pid=$BENCH_PID)"
-    kill "$BENCH_PID" 2>/dev/null || true
-    wait "$BENCH_PID" 2>/dev/null || true
-  fi
+  for pid in "$BENCH_PID" "$CASCADE_PID"; do
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      echo ">>> killing pid=$pid"
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  [ "$AUTO_MODE" = true ] && pkill -9 sglang 2>/dev/null || true
 }
 trap cleanup EXIT
 
 # ============================== Wait until warmup done ==============================
 echo ">>> waiting for warmup to finish (${ROUNDS_WARMUP} rounds)"
 LAST_LOG=0
-while kill -0 "$BENCH_PID" 2>/dev/null; do
+DRIVER_PID="$BENCH_PID"
+[ "$AUTO_MODE" = true ] && DRIVER_PID="$CASCADE_PID"
+while kill -0 "$DRIVER_PID" 2>/dev/null; do
   done_now=$(metric_baseline_count)
   reqs_done=$(( done_now - BASELINE_DONE ))
   if [ "$done_now" -ge "$TARGET_FOR_PROFILE" ]; then
@@ -327,7 +482,7 @@ fi
 # ============================== Wait for profile slice ==============================
 echo ">>> loggers running; waiting for ${ROUNDS_PROFILE} profile rounds to complete"
 TARGET_FOR_DONE=$(( BASELINE_DONE + TOTAL_ROUNDS * NUM_CLIENTS ))
-while kill -0 "$BENCH_PID" 2>/dev/null; do
+while kill -0 "$DRIVER_PID" 2>/dev/null; do
   done_now=$(metric_baseline_count)
   if [ "$done_now" -ge "$TARGET_FOR_DONE" ]; then
     break
@@ -347,8 +502,9 @@ done
 wait "${LOGGER_PIDS[@]}" 2>/dev/null || true
 LOGGER_PIDS=()
 
-wait "$BENCH_PID" 2>/dev/null || true
+wait "$DRIVER_PID" 2>/dev/null || true
 trap - EXIT
+[ "$AUTO_MODE" = true ] && pkill -9 sglang 2>/dev/null && sleep 5 || true
 
 # ============================== Summary ==============================
 echo ""

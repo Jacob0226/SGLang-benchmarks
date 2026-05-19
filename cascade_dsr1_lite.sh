@@ -98,6 +98,18 @@ if [ -n "$CACHE_MODES" ]; then
     sleep 10
   done
   echo ">>> chain done (${CACHE_MODES})"
+
+  # Cross-mode summary: combine all per-mode bench_multiturn.jsonl +
+  # cache_tiers.csv into a single $BASE_LOG_DIR/cascade_summary.csv. Re-
+  # derive BASE_LOG_DIR here because the chain dispatcher exits before
+  # the single-mode path computes it.
+  CHAIN_MODEL_NAME=$(basename "${MODEL_PATH%/}")
+  CHAIN_DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
+  CHAIN_BASE_LOG_DIR="$HOME/SGLang-benchmarks/results/$CHAIN_DOCKER_FILENAME/${CHAIN_MODEL_NAME}-cascade-${TAG}"
+  CHAIN_SUMMARIZER="$(dirname "$(readlink -f "$0")")/summarize_cascade.py"
+  if [ -f "$CHAIN_SUMMARIZER" ] && [ -d "$CHAIN_BASE_LOG_DIR" ]; then
+    python3 "$CHAIN_SUMMARIZER" cross_mode "$CHAIN_BASE_LOG_DIR" || true
+  fi
   exit 0
 fi
 
@@ -363,6 +375,16 @@ python3 "$BENCH_SCRIPT" \
 if [ -n "$CACHE_MONITOR_PID" ] && kill -0 "$CACHE_MONITOR_PID" 2>/dev/null; then
   kill "$CACHE_MONITOR_PID" 2>/dev/null || true
   wait "$CACHE_MONITOR_PID" 2>/dev/null || true
+fi
+
+# ============================== Per-mode round summary ==============================
+# Joins this mode's bench_multiturn.jsonl (per-round TTFT + hit rate)
+# with cache_tiers.csv (per-round L2 fill + L3 prefetch BW p50/p99) into
+# a single round_summary.csv. Tolerates missing cache_tiers.csv (older
+# runs) and missing/partial bench_multiturn.jsonl (failed runs).
+SUMMARIZER="$(dirname "$(readlink -f "$0")")/summarize_cascade.py"
+if [ -f "$SUMMARIZER" ]; then
+  python3 "$SUMMARIZER" per_mode "$LOG_DIR" || true
 fi
 
 # ============================== Cleanup ==============================
