@@ -29,7 +29,21 @@ MEM_FRACTION_STATIC=0.85
 PAGE_SIZE=64
 CONTEXT_LENGTH=65536
 HICACHE_WRITE_POLICY="write_through"
-HICACHE_MEM_LAYOUT="page_first_direct"
+# Layout × io backend compatibility matrix (server_args.py:3108-3125
+# silently rewrites incompatible pairs, so we pin the recommended one).
+#
+#   layout              kernel (rec.)   direct
+#   ----------------    -------------   ------
+#   layer_first         OK              OK
+#   page_first          OK              -> forced to page_first_direct
+#   page_first_direct   -> forced direct OK
+#
+# We want page-first organisation (better for L3 file backend, which
+# reads / writes whole pages) AND kernel io backend (GPU-assisted KV
+# transfer kernels, recommended in SGLang docs over plain cudaMemcpy).
+# That intersection is `page_first + kernel`, NOT `page_first_direct
+# + kernel` (which silently downgrades io to direct).
+HICACHE_MEM_LAYOUT="page_first"
 HICACHE_IO_BACKEND="kernel"
 GSM8K_PRECHECK="true"
 GSM8K_NUM_QUESTIONS=1200
