@@ -29,6 +29,8 @@ MEM_FRACTION_STATIC=0.85
 PAGE_SIZE=64
 CONTEXT_LENGTH=65536
 HICACHE_WRITE_POLICY="write_through"
+HICACHE_MEM_LAYOUT="page_first_direct"
+HICACHE_IO_BACKEND="kernel"
 GSM8K_PRECHECK="true"
 GSM8K_NUM_QUESTIONS=1200
 GSM8K_PARALLEL=1200
@@ -54,6 +56,8 @@ while [[ $# -gt 0 ]]; do
     --request-rate)        REQUEST_RATE="$2"; shift 2;;
     --mem-fraction-static) MEM_FRACTION_STATIC="$2"; shift 2;;
     --page-size)           PAGE_SIZE="$2"; shift 2;;
+    --hicache-mem-layout)  HICACHE_MEM_LAYOUT="$2"; shift 2;;
+    --hicache-io-backend)  HICACHE_IO_BACKEND="$2"; shift 2;;
     --gsm8k-num-questions) GSM8K_NUM_QUESTIONS="$2"; shift 2;;
     --no-gsm8k-precheck)   GSM8K_PRECHECK="false"; shift 1;;
     -h|--help)
@@ -143,6 +147,8 @@ cat > "$LOG_DIR/bench_meta.json" <<EOF
   "tp_size": $TP_SIZE,
   "hicache_size_gb": $META_HICACHE,
   "hicache_write_policy": "$HICACHE_WRITE_POLICY",
+  "hicache_mem_layout": "$HICACHE_MEM_LAYOUT",
+  "hicache_io_backend": "$HICACHE_IO_BACKEND",
   "mem_fraction_static": $MEM_FRACTION_STATIC,
   "num_clients": $NUM_CLIENTS,
   "num_rounds": $NUM_ROUNDS,
@@ -212,19 +218,23 @@ case "$CACHE_MODE" in
   none) SERVER_CMD+=(--disable-radix-cache);;
   L1)   :;;
   L2)
-    # --hicache-mem-layout omitted: defaults to layer_first. On DSR1-0528
-    # cascade workload, page_first cost ~2.1% extra TTFT vs default.
+    # page_first_direct: page-contiguous in L2 (zero-copy L2<->L3) while keeping
+    # same-layer tokens grouped within a page for aggregated L2->GPU transfers.
+    # Requires sgl-kernel with PR #10339+ on ROCm (>= v0.5.4); v0.5.11 covers both
+    # MI355X (rocm720 image) and B200 (cu130 image).
     SERVER_CMD+=(
       --enable-hierarchical-cache
       --hicache-size "$HICACHE_SIZE"
-      --hicache-io-backend kernel
+      --hicache-io-backend "$HICACHE_IO_BACKEND"
+      --hicache-mem-layout "$HICACHE_MEM_LAYOUT"
       --hicache-write-policy "$HICACHE_WRITE_POLICY"
     );;
   L3_file)
     SERVER_CMD+=(
       --enable-hierarchical-cache
       --hicache-size "$HICACHE_SIZE"
-      --hicache-io-backend kernel
+      --hicache-io-backend "$HICACHE_IO_BACKEND"
+      --hicache-mem-layout "$HICACHE_MEM_LAYOUT"
       --hicache-write-policy "$HICACHE_WRITE_POLICY"
       --hicache-storage-backend file
       --hicache-storage-prefetch-policy best_effort
