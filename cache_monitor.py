@@ -73,6 +73,31 @@ L1_pct             100 * round_device_delta / round_prompt_delta (so far)
 L2_pct             100 * round_host_delta   / round_prompt_delta (so far)
 L3_pct             100 * round_storage_delta/ round_prompt_delta (so far)
 any_pct            100 * (L1+L2+L3 hits)    / round_prompt_delta (so far)
+
+HiCache L2 fill level
+---------------------
+hicache_host_used_pct  100 * sglang:hicache_host_used_tokens
+                       / sglang:hicache_host_total_tokens; ~100% means
+                       L2 saturated and write_through is now evicting
+
+HiCache L3 storage backend (only non-zero in L3 modes)
+------------------------------------------------------
+prefetched_total       sglang:prefetched_tokens_total (cumulative)
+backuped_total         sglang:backuped_tokens_total   (cumulative)
+round_prefetched_delta tokens prefetched (L3->L2) this round
+round_backuped_delta   tokens written back (L2->L3) this round
+prefetch_count         # of prefetch ops observed this round (the
+                       histogram observation count; if 0 the percentiles
+                       below are 0)
+prefetch_bw_avg_gbps   per-round mean of sglang:prefetch_bandwidth (GB/s)
+prefetch_bw_p50_gbps   per-round p50 via linear bucket interpolation;
+                       Histogram buckets are [0.1,0.5,1,5,10,50,100] GB/s
+                       so resolution is coarse but p50 vs p99 still
+                       distinguishes "all loads slow" vs "tail of slow loads"
+prefetch_bw_p99_gbps   per-round p99
+backup_bw_avg_gbps     per-round mean of sglang:backup_bandwidth (GB/s)
+backup_bw_p50_gbps     per-round p50
+backup_bw_p99_gbps     per-round p99
 """
 
 import argparse
@@ -90,6 +115,18 @@ METRIC_PROMPT_TOTAL = "sglang:prompt_tokens_total"
 METRIC_CACHED_TOTAL = "sglang:cached_tokens_total"
 METRIC_NUM_REQUESTS = "sglang:num_requests_total"
 METRIC_NUM_ABORTED = "sglang:num_aborted_requests_total"
+METRIC_PREFETCHED_TOKENS = "sglang:prefetched_tokens_total"
+METRIC_BACKUPED_TOKENS = "sglang:backuped_tokens_total"
+METRIC_HICACHE_HOST_USED = "sglang:hicache_host_used_tokens"
+METRIC_HICACHE_HOST_TOTAL = "sglang:hicache_host_total_tokens"
+
+# Prometheus histograms we extract per-round percentiles from. Each
+# expands into <prefix>_bucket{le=...}, <prefix>_sum, <prefix>_count
+# label-sets (one per TP worker) which we sum across labels.
+HIST_METRICS = {
+    "sglang:prefetch_bandwidth": "prefetch_bw",
+    "sglang:backup_bandwidth": "backup_bw",
+}
 
 MEMINFO_PATH = "/proc/meminfo"
 # Subset of /proc/meminfo keys we project into CSV. All others are skipped
@@ -131,14 +168,40 @@ CSV_FIELDS = (
     "L2_pct",
     "L3_pct",
     "any_pct",
+    # HiCache L2 fill level + L3 storage backend signals (appended to
+    # preserve backward compatibility with existing CSV parsers).
+    "hicache_host_used_pct",
+    "prefetched_total",
+    "backuped_total",
+    "round_prefetched_delta",
+    "round_backuped_delta",
+    "prefetch_count",
+    "prefetch_bw_avg_gbps",
+    "prefetch_bw_p50_gbps",
+    "prefetch_bw_p99_gbps",
+    "backup_bw_avg_gbps",
+    "backup_bw_p50_gbps",
+    "backup_bw_p99_gbps",
 )
 
 
-def parse_prometheus_metrics(text):
-    """Aggregate the few metrics we care about from a Prometheus text payload.
+def _empty_histogram():
+    """Per-histogram accumulator: {le_value: cumulative_count}, plus _sum/_count.
 
-    Sums across all label combinations of a given (metric, cache_source).
-    Returns a dict with float counters; downstream casts to int as needed.
+    The le=+Inf bucket's count equals the total observation count by
+    Prometheus convention; we still store _count separately because it's
+    cheaper to delta on its own at percentile time.
+    """
+    return {"buckets": {}, "sum": 0.0, "count": 0.0}
+
+
+def parse_prometheus_metrics(text):
+    """Aggregate the metrics we care about from a Prometheus text payload.
+
+    Counters/gauges are summed across all label combinations.
+    Histograms are summed bucket-by-bucket across labels (one TP worker
+    per label set), which is what Prometheus' rate-then-aggregate path
+    does too.
     """
     out = {
         "prompt": 0.0,
@@ -148,6 +211,11 @@ def parse_prometheus_metrics(text):
         "fallback": 0.0,
         "num_finished": 0.0,
         "num_aborted": 0.0,
+        "prefetched": 0.0,
+        "backuped": 0.0,
+        "hicache_host_used": 0.0,
+        "hicache_host_total": 0.0,
+        "histograms": {key: _empty_histogram() for key in HIST_METRICS.values()},
     }
     for raw in text.splitlines():
         line = raw.strip()
@@ -158,6 +226,39 @@ def parse_prometheus_metrics(text):
             value = float(value_str)
         except ValueError:
             continue
+
+        # Histograms first: each histogram emits 3 line shapes
+        # (<prefix>_bucket, <prefix>_sum, <prefix>_count). Match the
+        # longest prefix to avoid e.g. prefetch_bandwidth_sum being
+        # mistaken for prefetch_bandwidth_count.
+        matched_hist = False
+        for full_name, key in HIST_METRICS.items():
+            if not metric_part.startswith(full_name):
+                continue
+            tail = metric_part[len(full_name):]
+            if tail.startswith("_bucket"):
+                le_idx = metric_part.find('le="')
+                if le_idx == -1:
+                    matched_hist = True
+                    break
+                le_end = metric_part.find('"', le_idx + 4)
+                le_str = metric_part[le_idx + 4:le_end]
+                le_val = float("inf") if le_str == "+Inf" else float(le_str)
+                buckets = out["histograms"][key]["buckets"]
+                buckets[le_val] = buckets.get(le_val, 0.0) + value
+                matched_hist = True
+                break
+            if tail.startswith("_sum"):
+                out["histograms"][key]["sum"] += value
+                matched_hist = True
+                break
+            if tail.startswith("_count"):
+                out["histograms"][key]["count"] += value
+                matched_hist = True
+                break
+        if matched_hist:
+            continue
+
         if metric_part.startswith(METRIC_PROMPT_TOTAL):
             out["prompt"] += value
         elif metric_part.startswith(METRIC_CACHED_TOTAL):
@@ -173,7 +274,84 @@ def parse_prometheus_metrics(text):
             out["num_finished"] += value
         elif metric_part.startswith(METRIC_NUM_ABORTED):
             out["num_aborted"] += value
+        elif metric_part.startswith(METRIC_PREFETCHED_TOKENS):
+            out["prefetched"] += value
+        elif metric_part.startswith(METRIC_BACKUPED_TOKENS):
+            out["backuped"] += value
+        elif metric_part.startswith(METRIC_HICACHE_HOST_USED):
+            out["hicache_host_used"] += value
+        elif metric_part.startswith(METRIC_HICACHE_HOST_TOTAL):
+            out["hicache_host_total"] += value
     return out
+
+
+def histogram_quantile(buckets_cumulative, p):
+    """Standard Prometheus histogram_quantile via linear bucket interpolation.
+
+    `buckets_cumulative` is a list of (le, cumulative_count) sorted by le
+    ascending; le=+Inf carries the total observation count. With only a
+    handful of buckets the answer is a step function inside each bucket,
+    so p50 vs p99 mostly differs by which bucket they fall into. That's
+    still useful for "tail vs typical" framing.
+    """
+    if not buckets_cumulative:
+        return 0.0
+    total = buckets_cumulative[-1][1]
+    if total <= 0:
+        return 0.0
+    target = total * p
+    prev_le = 0.0
+    prev_count = 0.0
+    for le, cnt in buckets_cumulative:
+        if cnt >= target:
+            if le == float("inf"):
+                # All target mass landed in the open-ended last bucket;
+                # the best lower bound we have is the previous boundary.
+                return prev_le
+            bucket_count = cnt - prev_count
+            if bucket_count <= 0:
+                return prev_le
+            frac = (target - prev_count) / bucket_count
+            return prev_le + frac * (le - prev_le)
+        prev_le = le
+        prev_count = cnt
+    return prev_le
+
+
+def round_histogram_stats(current, baseline):
+    """Subtract a snapshot to get just this round's histogram, then derive
+    avg/p50/p99 + the per-round observation count.
+
+    Returns (count, avg, p50, p99). All zero if no observations this round.
+    """
+    delta_count = max(current["count"] - baseline["count"], 0.0)
+    delta_sum = max(current["sum"] - baseline["sum"], 0.0)
+    if delta_count <= 0:
+        return 0, 0.0, 0.0, 0.0
+    all_le = set(current["buckets"]) | set(baseline["buckets"])
+    delta_buckets = sorted(
+        (le, current["buckets"].get(le, 0.0) - baseline["buckets"].get(le, 0.0))
+        for le in all_le
+    )
+    avg = delta_sum / delta_count
+    p50 = histogram_quantile(delta_buckets, 0.50)
+    p99 = histogram_quantile(delta_buckets, 0.99)
+    return int(delta_count), avg, p50, p99
+
+
+def snapshot_histograms(metrics):
+    """Deep-copy histogram state for use as round-start baseline.
+
+    Just dict-of-dict-of-dict so a manual copy is cheap and explicit.
+    """
+    return {
+        key: {
+            "buckets": dict(metrics["histograms"][key]["buckets"]),
+            "sum": metrics["histograms"][key]["sum"],
+            "count": metrics["histograms"][key]["count"],
+        }
+        for key in HIST_METRICS.values()
+    }
 
 
 def read_meminfo():
@@ -324,6 +502,9 @@ def main():
         "device": metrics["device"],
         "host": metrics["host"],
         "storage": metrics["storage"],
+        "prefetched": metrics["prefetched"],
+        "backuped": metrics["backuped"],
+        "histograms": snapshot_histograms(metrics),
     }
 
     deadline = (start_mono + args.duration) if args.duration > 0 else float("inf")
@@ -395,6 +576,9 @@ def main():
                 "device": m["device"],
                 "host": m["host"],
                 "storage": m["storage"],
+                "prefetched": m["prefetched"],
+                "backuped": m["backuped"],
+                "histograms": snapshot_histograms(m),
             }
             if not args.quiet and cur_round >= 0:
                 print(
@@ -407,6 +591,26 @@ def main():
         d_device = max(int(m["device"] - round_start["device"]), 0)
         d_host = max(int(m["host"] - round_start["host"]), 0)
         d_storage = max(int(m["storage"] - round_start["storage"]), 0)
+        d_prefetched = max(int(m["prefetched"] - round_start["prefetched"]), 0)
+        d_backuped = max(int(m["backuped"] - round_start["backuped"]), 0)
+
+        # L2 fill level: gauge values in tokens; total can be 0 in
+        # non-hicache modes, fall back to 0 to avoid div-by-zero.
+        host_total = m["hicache_host_total"]
+        host_used_pct = (
+            100.0 * m["hicache_host_used"] / host_total if host_total > 0 else 0.0
+        )
+
+        # Per-round prefetch / backup bandwidth percentiles. In L1/L2-only
+        # modes these histograms have no observations and all return 0.
+        pf_count, pf_avg, pf_p50, pf_p99 = round_histogram_stats(
+            m["histograms"]["prefetch_bw"],
+            round_start["histograms"]["prefetch_bw"],
+        )
+        bk_count, bk_avg, bk_p50, bk_p99 = round_histogram_stats(
+            m["histograms"]["backup_bw"],
+            round_start["histograms"]["backup_bw"],
+        )
 
         mem_total = kb_to_gb(mi["MemTotal"])
         mem_avail = kb_to_gb(mi["MemAvailable"])
@@ -453,20 +657,38 @@ def main():
                 "L2_pct": round(l2p, 3),
                 "L3_pct": round(l3p, 3),
                 "any_pct": round(anyp, 3),
+                "hicache_host_used_pct": round(host_used_pct, 2),
+                "prefetched_total": int(m["prefetched"]),
+                "backuped_total": int(m["backuped"]),
+                "round_prefetched_delta": d_prefetched,
+                "round_backuped_delta": d_backuped,
+                "prefetch_count": pf_count,
+                "prefetch_bw_avg_gbps": round(pf_avg, 3),
+                "prefetch_bw_p50_gbps": round(pf_p50, 3),
+                "prefetch_bw_p99_gbps": round(pf_p99, 3),
+                "backup_bw_avg_gbps": round(bk_avg, 3),
+                "backup_bw_p50_gbps": round(bk_p50, 3),
+                "backup_bw_p99_gbps": round(bk_p99, 3),
             }
         )
         csv_file.flush()
 
         if not args.quiet:
             round_label = f"R{cur_round:>2}" if cur_round >= 0 else "warm"
+            l3_bw_str = (
+                f"L3_bw={pf_avg:>5.2f}GB/s(p99={pf_p99:>5.2f})"
+                if pf_count > 0
+                else "L3_bw= ----"
+            )
             print(
                 f"[{ts_iso}] t={elapsed:>6.0f}s {round_label} "
                 f"reqs={round_reqs:>3d}/{args.num_clients} "
                 f"mem_used={mem_used_pct:>5.1f}% "
                 f"mlocked={mlocked:>5.0f}GB "
                 f"page_cache={page_cache:>4.0f}GB "
-                f"swap={swap_used:>4.1f}GB "
-                f"L1/L2/L3={l1p:>5.1f}/{l2p:>5.1f}/{l3p:>5.1f}%",
+                f"L2_full={host_used_pct:>5.1f}% "
+                f"L1/L2/L3={l1p:>5.1f}/{l2p:>5.1f}/{l3p:>5.1f}% "
+                f"{l3_bw_str}",
                 flush=True,
             )
 
