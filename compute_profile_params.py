@@ -27,17 +27,21 @@ Why these specific numbers
   divided by tp_size. This is the on-disk size which equals the
   in-VRAM weight footprint for any single dtype (fp8/bf16/fp16).
 * Framework reserve per rank: HBM locked up by PyTorch CUDA/HIP
-  context + RCCL/NCCL communicator buffers + driver JIT cache BEFORE
-  SGLang runs `torch.cuda.mem_get_info()` and computes its mem_fraction
-  budget. SGLang prints this implicitly as `Load weight begin. avail
-  mem=X GB` — comparing X to `rocm-smi`/`nvidia-smi` HBM gives the
-  reserve. Empirically:
-    MI355X TP=8 (RCCL + QuickReduce):  ~6 GB/rank
-    B200 TP=8 (NCCL):                  ~4-6 GB/rank (estimate)
-  Stable for a fixed (HW, driver, RCCL/NCCL, TP, env) tuple; varies
-  little across models. Default `--framework-reserve-gb 8` is slightly
-  conservative on both platforms; for precise calibration pass
-  `--reserve-from-server-log <path>` to a previous run's server.log.
+  context + RCCL/NCCL communicator buffers + driver JIT cache +
+  attention/MoE backend workspaces BEFORE SGLang runs
+  `torch.cuda.mem_get_info()` and computes its mem_fraction budget.
+  SGLang prints this implicitly as `Load weight begin. avail mem=X GB`
+  — comparing X to `rocm-smi`/`nvidia-smi` HBM gives the reserve.
+  Measured on the cascade_dsr1_lite.sh DSR1-0528 TP=8 config:
+    MI355X (RCCL + QuickReduce, aiter):                ~6 GB/rank
+    B200 (NCCL + flashinfer_trtllm + allreduce-fusion): ~16 GB/rank
+  Stable for a fixed (HW, driver, comm lib, TP, backend) tuple; varies
+  little across models because the dominant terms are workspace
+  pre-allocations sized by TP / context_length, not weights.
+  Defaults `_DEFAULT_FRAMEWORK_RESERVE_BY_VENDOR` add a ~2 GB safety
+  margin over measured values to avoid undersubtracting. For precise
+  calibration pass `--reserve-from-server-log <path>` to a previous
+  run's server.log.
 * Buffer per rank: 12 GB default minimum HBM reserved for activations
   + cuda graph + KV scratch + framework bookkeeping. Tightening below
   8 GB risks OOM.
@@ -94,8 +98,24 @@ import subprocess
 import sys
 
 
-def detect_hbm_per_rank_gb():
-    """Return one GPU's HBM in GiB. Tries NVIDIA first, then AMD."""
+# Per-vendor default for framework_reserve_gb, applied when the user does
+# not pass --framework-reserve-gb or --reserve-from-server-log. Each
+# value is the measured framework reserve on the cascade_dsr1_lite.sh
+# DSR1-0528 TP=8 config + ~2 GB safety margin (to slightly oversubtract,
+# which is safer than under-subtracting — the worst case is a KV pool
+# that's a hair smaller than --L1-size, never OOM).
+#
+#   AMD:   measured 6.08 GB on MI355X (rocm720, RCCL + QuickReduce,
+#                                       aiter, fp8 KV)        → default 8
+#   NV:    measured 15.83 GB on B200 (cu130, NCCL, trtllm_mla +
+#                                       flashinfer_trtllm MoE +
+#                                       allreduce-fusion, fp8 KV) → default 18
+_DEFAULT_FRAMEWORK_RESERVE_BY_VENDOR = {"amd": 8.0, "nvidia": 18.0}
+
+
+def detect_gpu_info():
+    """Return (vendor, hbm_per_rank_gb). vendor is one of 'nvidia' / 'amd'.
+    Raises RuntimeError if neither nvidia-smi nor rocm-smi works."""
     # NVIDIA: simple, deterministic.
     try:
         out = subprocess.check_output(
@@ -104,7 +124,7 @@ def detect_hbm_per_rank_gb():
         ).decode().strip()
         if out:
             mb = int(out.splitlines()[0].strip())
-            return mb // 1024  # MiB → GiB
+            return ("nvidia", mb // 1024)  # MiB → GiB
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
         pass
     # AMD: rocm-smi has multiple output schemas across versions; --json is
@@ -125,7 +145,7 @@ def detect_hbm_per_rank_gb():
                     except (TypeError, ValueError):
                         continue
         if biggest_bytes > 0:
-            return biggest_bytes // (1024 ** 3)
+            return ("amd", biggest_bytes // (1024 ** 3))
     except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError):
         pass
     raise RuntimeError(
@@ -188,15 +208,17 @@ def main():
     p.add_argument("--buffer-gb", type=int, default=12,
                    help="Per-rank HBM reserved for activations / cuda graph / "
                         "KV scratch")
-    p.add_argument("--framework-reserve-gb", type=float, default=8.0,
+    p.add_argument("--framework-reserve-gb", type=float, default=None,
                    help="HBM/rank locked up by PyTorch CUDA/HIP context + "
-                        "RCCL/NCCL communicator buffers + driver JIT cache "
-                        "BEFORE SGLang computes its mem_fraction_static "
-                        "budget. Subtracted from rocm-smi/nvidia-smi HBM "
-                        "before dividing. Default 8 GB is conservative for "
-                        "MI355X TP=8 (~6 GB measured) and B200 TP=8 "
-                        "(~4-6 GB est.). Use --reserve-from-server-log to "
-                        "calibrate precisely from a previous run.")
+                        "RCCL/NCCL communicator buffers + driver JIT cache + "
+                        "attention/MoE backend workspaces BEFORE SGLang "
+                        "computes its mem_fraction_static budget. Subtracted "
+                        "from rocm-smi/nvidia-smi HBM before dividing. When "
+                        "omitted, uses the vendor default (AMD=8 GB / "
+                        "NV=18 GB), which covers measured values "
+                        "(MI355X TP=8: ~6 GB, B200 TP=8: ~16 GB) with ~2 GB "
+                        "slack. Use --reserve-from-server-log to calibrate "
+                        "precisely from a previous run.")
     p.add_argument("--reserve-from-server-log", type=str, default=None,
                    help="Path to a previous SGLang server.log. Reads the "
                         "first 'Load weight begin. avail mem=X GB' line and "
@@ -232,22 +254,34 @@ def main():
         sys.exit(1)
     weights_per_rank_gb = weights_gb / args.tp
 
-    hbm_per_rank_gb = detect_hbm_per_rank_gb()
+    vendor, hbm_per_rank_gb = detect_gpu_info()
 
-    # Framework reserve: HBM that PyTorch + RCCL/NCCL + driver lock up
-    # BEFORE SGLang sees mem_get_info(). If --reserve-from-server-log is
-    # given, derive the exact value for this (HW, driver, TP) combo.
-    framework_reserve_gb = args.framework_reserve_gb
-    reserve_source = "default"
+    # Framework reserve: HBM that PyTorch + RCCL/NCCL + driver + backend
+    # workspaces lock up BEFORE SGLang sees mem_get_info(). Resolution
+    # order:
+    #   1. --reserve-from-server-log <path>  -> measured exact value
+    #   2. --framework-reserve-gb <N>        -> user-specified
+    #   3. vendor default (8 AMD / 18 NV)    -> from
+    #                                       _DEFAULT_FRAMEWORK_RESERVE_BY_VENDOR
     if args.reserve_from_server_log:
         sglang_usable_hbm = extract_sglang_usable_hbm_gb(
             args.reserve_from_server_log
         )
         if sglang_usable_hbm is None:
+            framework_reserve_gb = (
+                args.framework_reserve_gb
+                if args.framework_reserve_gb is not None
+                else _DEFAULT_FRAMEWORK_RESERVE_BY_VENDOR.get(vendor, 8.0)
+            )
             sys.stderr.write(
                 f"WARN: no 'Load weight begin. avail mem=' line in "
                 f"{args.reserve_from_server_log}; falling back to "
-                f"--framework-reserve-gb={args.framework_reserve_gb}.\n"
+                f"framework_reserve={framework_reserve_gb} GB.\n"
+            )
+            reserve_source = (
+                "user-specified"
+                if args.framework_reserve_gb is not None
+                else f"vendor default ({vendor})"
             )
         else:
             framework_reserve_gb = hbm_per_rank_gb - sglang_usable_hbm
@@ -255,6 +289,14 @@ def main():
                 f"measured from {args.reserve_from_server_log} "
                 f"(SGLang avail={sglang_usable_hbm:.2f} GB)"
             )
+    elif args.framework_reserve_gb is not None:
+        framework_reserve_gb = args.framework_reserve_gb
+        reserve_source = "user-specified"
+    else:
+        framework_reserve_gb = _DEFAULT_FRAMEWORK_RESERVE_BY_VENDOR.get(
+            vendor, 8.0
+        )
+        reserve_source = f"vendor default ({vendor})"
 
     usable_hbm_gb = hbm_per_rank_gb - framework_reserve_gb
     if usable_hbm_gb <= 0:
