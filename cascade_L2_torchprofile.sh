@@ -24,9 +24,8 @@
 # cache state on both platforms.
 #
 # Cross-platform note:
-#   B200  (CUDA): --cpu --gpu  → torch.profiler with CPU+CUDA backend
+#   B200  (CUDA):  --cpu --gpu  → torch.profiler with CPU+CUDA backend
 #   MI355X (ROCm): --cpu --gpu  → torch.profiler with HIP via roctracer
-#   On AMD, --rpd auto-enables for richer rocmProfileData layer.
 
 set -euo pipefail
 ulimit -n 65535
@@ -64,7 +63,6 @@ REQUEST_RATE=32
 NUM_PROFILE_STEPS=5
 TAG=""
 OUTPUT_DIR=""
-USE_RPD="auto"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -88,8 +86,6 @@ while [[ $# -gt 0 ]]; do
     --num-profile-steps) NUM_PROFILE_STEPS="$2"; shift 2;;
     --tag)               TAG="$2"; shift 2;;
     --output-dir)        OUTPUT_DIR="$2"; shift 2;;
-    --rpd)               USE_RPD="true"; shift 1;;
-    --no-rpd)            USE_RPD="false"; shift 1;;
     -h|--help)
       cat <<EOF
 Usage: $0 --tag TAG --model PATH --L1-size N --L2-size N [opts]
@@ -118,7 +114,6 @@ Common opts:
   --request-length N           (default 4096)
   --num-profile-steps K        (default 5) torch.profiler --num-steps
   --output-dir DIR             default ~/SGLang-benchmarks/profiles/<tag>
-  --rpd / --no-rpd             force ROCm rpd profiler on/off (auto-detect)
 EOF
       exit 0
       ;;
@@ -147,9 +142,6 @@ case "$VENDOR" in
   amd)    echo ">>> platform: AMD ROCm";;
   *)      echo ">>> platform: unknown (no nvidia-smi or rocm-smi found, continuing anyway)";;
 esac
-[ "$USE_RPD" = "auto" ] && {
-  if [ "$VENDOR" = "amd" ]; then USE_RPD="true"; else USE_RPD="false"; fi
-}
 
 # ============================== Output dir ==============================
 [ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="$HOME/SGLang-benchmarks/profiles/${TAG}"
@@ -325,10 +317,6 @@ PROFILER_ARGS=(
   --profile-by-stage
   --cpu --gpu
 )
-if [ "$USE_RPD" = "true" ]; then
-  echo ">>> enabling --rpd (ROCm rocmProfileData)"
-  PROFILER_ARGS+=(--rpd)
-fi
 
 export SGLANG_TORCH_PROFILER_DIR="$OUTPUT_DIR"
 
@@ -344,7 +332,7 @@ pkill -9 sglang 2>/dev/null && sleep 5 || true
 # ============================== Summary ==============================
 echo ""
 echo ">>> done. artifacts in: $OUTPUT_DIR"
-ls -la "$OUTPUT_DIR" 2>/dev/null | grep -E '\.(json|gz|pickle|rpd|trace|txt|log)' || true
+ls -la "$OUTPUT_DIR" 2>/dev/null | grep -E '\.(json|gz|pickle|trace|txt|log)' || true
 
 cat <<EOF
 
@@ -355,5 +343,5 @@ Triage the trace with:
 Look for:
   - "Memcpy HtoD" gpu kernels  → L2 host-pinned -> device transfer
   - hiradix_cache.py:load_back / prefetch_from_storage frames (CPU side)
-  - File backend syscalls (pread/io_uring) for L3
+  - File backend syscalls (pread/io_uring) for L3 (cache-mode=L3_file only)
 EOF
