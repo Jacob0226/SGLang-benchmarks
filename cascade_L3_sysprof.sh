@@ -222,7 +222,8 @@ if [ "$AUTO_MODE" = true ]; then
     --buffer-gb "$BUFFER_GB" \
     --rounds-profile "$ROUNDS_PROFILE" 2>&1) || { echo "$PARAMS" >&2; exit 1; }
   echo "$PARAMS" | grep -E '^(WARN|ERROR)' >&2 || true
-  eval "$(echo "$PARAMS" | grep -E '^[A-Z_]+=')"
+  # Regex needs digits too: PROFILE_TARGET_ROUND_1IDX has a `1` in it.
+  eval "$(echo "$PARAMS" | grep -E '^[A-Z0-9_]+=')"
   echo "    weights/rank=${WEIGHTS_GB_PER_RANK}GB  HBM/rank=${HBM_GB_PER_RANK}GB"
   echo "    KV/round/rank=${KV_GB_PER_ROUND_PER_RANK}GB  → WARMUP=${WARMUP_ROUNDS} rounds"
   echo "    derived: mem-fraction-static=${MEM_FRACTION_STATIC}  num-rounds=${NUM_ROUNDS}"
