@@ -50,7 +50,10 @@ L1_SIZE=""             # GB per rank; trigger AUTO mode when set
 L2_SIZE=""             # GB per rank; must be >= L1_SIZE
 KV_BYTES_PER_TOKEN=$((34 * 1024))   # DSR1-0528 default: 34 KB
 BUFFER_GB=12
-CACHE_MODE="L3_file"   # AUTO mode passes this to cascade_dsr1_lite.sh
+CACHE_MODE="L2"        # AUTO mode passes this to cascade_dsr1_lite.sh
+                       # (script name says "L2" — keep server hierarchy = L1+L2
+                       #  by default so L3 file backend doesn't kick in mid-run.
+                       #  Pass --cache-mode L3_file to opt in to the 3-tier run.)
 WAIT_FOR_HEALTH_SEC=1500
 
 # MANUAL mode knobs (also serve as overrides in AUTO mode)
@@ -124,7 +127,7 @@ Common opts:
   --docker NAME                container tag for results dir naming
   --kv-bytes-per-token N       (default 34*1024 for DSR1-0528 MLA fp8)
   --buffer-gb N                (default 12) per-rank HBM headroom in AUTO
-  --cache-mode MODE            (default L3_file) for AUTO-mode launch
+  --cache-mode MODE            (default L2; one of none|L1|L2|L3_file) for AUTO-mode launch
   --rounds-profile M           (default 1) rounds the profiler covers
   --num-rounds N               override auto-derived total rounds
   --num-clients N              (default 300)
@@ -178,8 +181,7 @@ esac
 }
 
 # ============================== Output dir ==============================
-TS=$(date +%Y%m%d_%H%M%S)
-[ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="$HOME/SGLang-benchmarks/profiles/${TAG}/${TS}"
+[ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="$HOME/SGLang-benchmarks/profiles/${TAG}"
 mkdir -p "$OUTPUT_DIR"
 echo ">>> profile output dir: $OUTPUT_DIR"
 
@@ -207,7 +209,8 @@ if [ "$AUTO_MODE" = true ]; then
       exit 1
     }
   echo "$PARAMS" | grep -E '^(WARN|ERROR)' >&2 || true
-  eval "$(echo "$PARAMS" | grep -E '^[A-Z_]+=')"
+  # Regex needs digits too: PROFILE_TARGET_ROUND_1IDX has a `1` in it.
+  eval "$(echo "$PARAMS" | grep -E '^[A-Z0-9_]+=')"
   echo "    weights/rank=${WEIGHTS_GB_PER_RANK}GB  HBM/rank=${HBM_GB_PER_RANK}GB"
   echo "    KV/round/rank=${KV_GB_PER_ROUND_PER_RANK}GB  → WARMUP=${WARMUP_ROUNDS} rounds"
   echo "    derived: mem-fraction-static=${MEM_FRACTION_STATIC}  num-rounds=${NUM_ROUNDS}"
