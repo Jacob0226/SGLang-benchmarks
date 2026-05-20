@@ -57,15 +57,15 @@ Usage:
   python3 plot_cascade.py \
       --Title "DSR1-0528 B200 cascade" \
       --B200 $HOME/SGLang-benchmarks/results/.../L1/bench_multiturn.jsonl \
-             $HOME/SGLang-benchmarks/results/.../L2/size_192/bench_multiturn.jsonl \
-             $HOME/SGLang-benchmarks/results/.../L3_file/size_192/bench_multiturn.jsonl \
+             $HOME/SGLang-benchmarks/results/.../L2_size_192/bench_multiturn.jsonl \
+             $HOME/SGLang-benchmarks/results/.../L3file_L2_size_192/bench_multiturn.jsonl \
       --out  $HOME/SGLang-benchmarks/results/cascade_b200_3modes.png
 
   # Cross-platform 3x3 cascade compare (produces 3 PNGs):
   python3 plot_cascade.py \
       --Title "DSR1-0528 cascade" \
-      --B200 .../B200_cascade/{L1,L2/size_192,L3_file/size_192}/bench_multiturn.jsonl \
-      --MI355X .../MI355X_cascade/{L1,L2/size_192,L3_file/size_192}/bench_multiturn.jsonl \
+      --B200 .../B200_cascade/{L1,L2_size_192,L3file_L2_size_192}/bench_multiturn.jsonl \
+      --MI355X .../MI355X_cascade/{L1,L2_size_192,L3file_L2_size_192}/bench_multiturn.jsonl \
       --out $HOME/SGLang-benchmarks/results/cascade_compare.png
   # → cascade_compare.png + cascade_compare.B200.png + cascade_compare.MI355X.png
 """
@@ -87,11 +87,20 @@ except ImportError:
     sys.exit(1)
 
 
+# Accept both layouts a cascade root may produce under the model-tag dir:
+#   Current (flat): L1/, none/, L2_size_<N>/, L3file_L2_size_<N>/
+#   Legacy (nested): L1/, none/, L2/size_<N>/, L3_file/size_<N>/
 PATH_RE = re.compile(
     r"results/(?P<docker>[^/]+)/"
     r"(?P<model_tag>[^/]+?)-(?:HiCache|cascade)(?:-(?P<tag>[^/]+))?/"
-    r"(?P<cache_mode>[^/]+)"
-    r"(?:/size_(?P<size>\d+))?/bench_multiturn\.jsonl$"
+    r"(?:"
+        r"L2_size_(?P<l2_size>\d+)"
+        r"|"
+        r"L3file_L2_size_(?P<l3_size>\d+)"
+        r"|"
+        r"(?P<cache_mode>[^/]+?)(?:/size_(?P<nested_size>\d+))?"
+    r")"
+    r"/bench_multiturn\.jsonl$"
 )
 
 CACHE_MODE_ORDER = [
@@ -196,21 +205,44 @@ def parse_path(path: Path) -> dict | None:
     sub = abs_str[idx + 1:]
     m = PATH_RE.search(sub)
     if m:
+        if m.group("l2_size"):
+            cache_mode = "L2"
+            size = int(m.group("l2_size"))
+        elif m.group("l3_size"):
+            cache_mode = "L3_file"
+            size = int(m.group("l3_size"))
+        else:
+            cache_mode = m.group("cache_mode")
+            size = int(m.group("nested_size")) if m.group("nested_size") else None
         return {
             "docker":     m.group("docker"),
             "model":      m.group("model_tag"),
             "tag":        m.group("tag") or "",
-            "cache_mode": m.group("cache_mode"),
-            "size":       int(m.group("size")) if m.group("size") else None,
+            "cache_mode": cache_mode,
+            "size":       size,
             "path":       path,
         }
     # Fallback: walk segments looking for a recognized cache_mode and an
     # optional size_N sibling. Keeps the legend informative even when the
-    # parent dir doesn't follow the -HiCache / -cascade naming.
+    # parent dir doesn't follow the -HiCache / -cascade naming. Handles
+    # both the flat layout (L2_size_<N>, L3file_L2_size_<N>) and the
+    # legacy nested form (L2/size_<N>, L3_file/size_<N>).
     parts = sub.split("/")
     cache_mode = ""
     size = None
     for i, seg in enumerate(parts):
+        # Flat layout: L2_size_<N> or L3file_L2_size_<N>
+        flat_m = re.match(r"^L2_size_(\d+)$", seg)
+        if flat_m:
+            cache_mode = "L2"
+            size = int(flat_m.group(1))
+            break
+        flat_m = re.match(r"^L3file_L2_size_(\d+)$", seg)
+        if flat_m:
+            cache_mode = "L3_file"
+            size = int(flat_m.group(1))
+            break
+        # Nested layout: <mode>/size_<N>, or bare <mode> for L1 / none
         if seg in CACHE_MODE_ORDER:
             cache_mode = seg
             if i + 1 < len(parts) and parts[i + 1].startswith("size_"):
@@ -492,9 +524,10 @@ def plot_cascade(runs: list[dict], out_path: Path,
         mode_label = CACHE_MODE_LABEL.get(r["cache_mode"], r["cache_mode"])
         # Size suffix only on L2: that's the GB number that actually describes
         # the *L2 host pool*. For L3_file the same number is still the L2
-        # host pool (the path is .../L3_file/size_<HICACHE_SIZE>/), but
-        # writing "L1+L2+L3 (file) (320 GB)" misleadingly reads as "L3 has
-        # 320 GB capacity" so we drop it for L3.
+        # host pool (the path is .../L3file_L2_size_<HICACHE_SIZE>/, or
+        # legacy .../L3_file/size_<HICACHE_SIZE>/), but writing
+        # "L1+L2+L3 (file) (320 GB)" misleadingly reads as "L3 has 320 GB
+        # capacity" so we drop it for L3.
         if r["cache_mode"] == "L2" and r["size"] is not None:
             size_suffix = f" ({r['size']} GB)"
         else:
@@ -541,36 +574,55 @@ MODEL_DISPLAY_NAME = {
 
 
 def discover_jsonls(cascade_dir: Path) -> list[Path]:
-    """Walk a cascade root dir looking for bench_multiturn.jsonl under
-    L1/, L2/size_*, L3_file/size_*, none/. Returns one jsonl per mode in
-    CACHE_MODE_ORDER. When multiple size_* dirs exist under L2 or L3,
-    picks the largest size."""
-    found: list[tuple[str, int, Path]] = []
-    for mode in CACHE_MODE_ORDER:
-        mode_dir = cascade_dir / mode
-        if not mode_dir.is_dir():
+    """Walk a cascade root dir looking for bench_multiturn.jsonl. Returns one
+    jsonl per cache_mode in CACHE_MODE_ORDER. Handles both layouts the cascade
+    chain may have produced:
+      Current (flat): L1/, none/, L2_size_<N>/, L3file_L2_size_<N>/
+      Legacy (nested): L1/, none/, L2/size_<N>/, L3_file/size_<N>/
+    When multiple sizes exist for the same mode (e.g. an L2 swept across
+    several --hicache-size values in the same cascade dir), picks the largest.
+    """
+    # mode -> (size, jsonl_path); size sentinel 0 for modes without a size knob.
+    best: dict[str, tuple[int, Path]] = {}
+
+    def offer(mode: str, size: int, j: Path):
+        if not (j.is_file() and j.stat().st_size > 0):
+            return
+        cur = best.get(mode)
+        if cur is None or size > cur[0]:
+            best[mode] = (size, j)
+
+    for entry in cascade_dir.iterdir():
+        if not entry.is_dir():
             continue
-        # L1 / no_cache: no size subdir.
-        direct = mode_dir / "bench_multiturn.jsonl"
-        if direct.is_file() and direct.stat().st_size > 0:
-            found.append((mode, 0, direct))
+        name = entry.name
+
+        # Flat layout: L2_size_<N>
+        m = re.match(r"^L2_size_(\d+)$", name)
+        if m:
+            offer("L2", int(m.group(1)), entry / "bench_multiturn.jsonl")
             continue
-        # L2 / L3_file: pick the size_<N>/ with the largest N.
-        size_dirs = sorted(
-            (d for d in mode_dir.iterdir() if d.is_dir() and d.name.startswith("size_")),
-            key=lambda d: int(d.name.split("_", 1)[1]) if d.name.split("_", 1)[1].isdigit() else 0,
-            reverse=True,
-        )
-        for sd in size_dirs:
-            j = sd / "bench_multiturn.jsonl"
-            if j.is_file() and j.stat().st_size > 0:
+        # Flat layout: L3file_L2_size_<N>
+        m = re.match(r"^L3file_L2_size_(\d+)$", name)
+        if m:
+            offer("L3_file", int(m.group(1)), entry / "bench_multiturn.jsonl")
+            continue
+
+        # L1 / none / no_cache and legacy aliases: bench lives directly inside.
+        if name in CACHE_MODE_ORDER:
+            offer(name, 0, entry / "bench_multiturn.jsonl")
+            # Legacy nested layout: <mode>/size_<N>/ for L2 / L3_file.
+            for sd in entry.iterdir():
+                if not sd.is_dir() or not sd.name.startswith("size_"):
+                    continue
                 try:
                     sz = int(sd.name.split("_", 1)[1])
                 except (ValueError, IndexError):
-                    sz = 0
-                found.append((mode, sz, j))
-                break
-    return [p for _, _, p in found]
+                    continue
+                offer(name, sz, sd / "bench_multiturn.jsonl")
+            continue
+
+    return [best[m][1] for m in CACHE_MODE_ORDER if m in best]
 
 
 def unmangle_docker(name: str) -> str:
