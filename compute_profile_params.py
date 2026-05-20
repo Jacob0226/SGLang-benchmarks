@@ -386,16 +386,22 @@ def main():
     profile_target_round_1idx = warmup_rounds + 1
     num_rounds = warmup_rounds + args.rounds_profile + args.rounds_margin
 
-    # Stderr diagnostics: not eval'd by the bash caller (whitelist regex
-    # in cascade_dsr1_lite.sh only captures stdout `^[A-Z0-9_]+=` lines),
-    # but visible in chain.log for postmortem.
+    # MEM_FRACTION_STATIC is emitted with 4-decimal precision rather than
+    # rounded to 2dp. SGLang's --mem-fraction-static arg uses argparse
+    # `type=float` with no quantization, so the full precision propagates
+    # through to the actual KV pool sizing. Empirically, going from .2f
+    # to .4f shrinks the ROCm-vs-NV effective L1 gap from ~1.2 GB
+    # (e.g. 35.1 vs 36.3) to ~0.06 GB (35.9 vs 36.0) for the
+    # cascade_dsr1_lite.sh DSR1-0528 + --L1-size 35 config. No OOM risk:
+    # the .4f emission is at most 0.005 above the .2f-rounded value,
+    # which translates to <1.5 GB of additional KV pool on a 287 GB HBM
+    # rank and the activation budget stays well above --buffer-gb.
     sys.stderr.write(
         f"INFO: HBM/rank={hbm_per_rank_gb}GB, "
         f"framework_reserve={framework_reserve_gb:.2f}GB ({reserve_source}), "
         f"usable={usable_hbm_gb:.2f}GB, "
         f"weights={weights_per_rank_gb:.1f}GB, L1={args.L1_size}GB, "
-        f"derived mem_fraction_static={mem_fraction:.4f} -> "
-        f"emitted as {mem_fraction:.2f}\n"
+        f"mem_fraction_static={mem_fraction:.4f}\n"
     )
 
     # Shell-eval-able output. All numeric so eval is safe.
@@ -404,7 +410,7 @@ def main():
     print(f"USABLE_HBM_GB_PER_RANK={usable_hbm_gb:.2f}")
     print(f"FRAMEWORK_RESERVE_GB={framework_reserve_gb:.2f}")
     print(f"KV_GB_PER_ROUND_PER_RANK={kv_gb_per_round_per_rank:.2f}")
-    print(f"MEM_FRACTION_STATIC={mem_fraction:.2f}")
+    print(f"MEM_FRACTION_STATIC={mem_fraction:.4f}")
     print(f"WARMUP_ROUNDS={warmup_rounds}")
     print(f"NUM_ROUNDS={num_rounds}")
     print(f"L1_SIZE_GB={args.L1_size}")
