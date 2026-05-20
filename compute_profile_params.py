@@ -26,10 +26,23 @@ Why these specific numbers
 * Weights per rank: sum of *.safetensors file sizes in $MODEL_PATH,
   divided by tp_size. This is the on-disk size which equals the
   in-VRAM weight footprint for any single dtype (fp8/bf16/fp16).
-* Buffer per rank: 12 GB default for activations + cuda graph + KV
-  scratch + framework bookkeeping. Tightening below 8 GB risks OOM.
-* mem_fraction_static = (weights + L1_KV + buffer) / HBM. Anything
-  >0.92 is rejected (no headroom for fragmentation), >0.85 is warned.
+* Buffer per rank: 12 GB default minimum HBM reserved for activations
+  + cuda graph + KV scratch + framework bookkeeping. Tightening below
+  8 GB risks OOM.
+* mem_fraction_static = (weights + L1_KV) / HBM. This matches SGLang's
+  own definition in server_args.py:
+      mem_fraction_static = (weights + KV cache pool) / HBM
+  i.e. the activation / cuda graph reservation lives in the OTHER
+  (1 - mem_fraction_static) portion, not inside the numerator. Putting
+  --buffer-gb inside the numerator inflates mem_fraction_static and
+  causes SGLang to allocate a KV pool larger than --L1-size by
+  buffer_gb (12 GB by default) — which then violates the HiCache
+  "host_pool > device_pool" invariant the moment --L2-size is set to
+  any value near --L1-size + 12 GB.
+  Validation: we still enforce `(1 - mem_fraction) * HBM >= buffer_gb`
+  so the activation budget can't get squeezed to zero. Anything that
+  would push mem-fraction-static above --max-mem-fraction (default
+  0.92, no headroom for fragmentation) is rejected; >0.85 is warned.
 * KV per token (replicated MLA): default 34 KB for DSR1-0528.
   Override with --kv-bytes-per-token for other models. Math:
     DSR1: kv_lora_rank(512) + qk_rope_head_dim(64) = 576 B/layer
@@ -162,17 +175,32 @@ def main():
     weights_per_rank_gb = weights_gb / args.tp
 
     hbm_per_rank_gb = detect_hbm_per_rank_gb()
-    needed_gb = weights_per_rank_gb + args.L1_size + args.buffer_gb
-    mem_fraction = needed_gb / hbm_per_rank_gb
+    # SGLang's mem_fraction_static = (weights + KV pool) / HBM. Buffer
+    # lives in the OTHER (1 - mem_fraction_static) portion; including it
+    # in the numerator would inflate the KV pool by buffer_gb and trip the
+    # HiCache "host_pool > device_pool" assertion when --L2-size is sized
+    # to L1 + small margin. See cascade-FairCompare_0520_v2 postmortem.
+    static_gb = weights_per_rank_gb + args.L1_size
+    mem_fraction = static_gb / hbm_per_rank_gb
+    remaining_gb = hbm_per_rank_gb - static_gb  # for activations + cuda graph
 
     if mem_fraction > args.max_mem_fraction:
         sys.stderr.write(
             f"ERROR: derived mem-fraction-static={mem_fraction:.3f} exceeds "
             f"--max-mem-fraction={args.max_mem_fraction}.\n"
             f"  weights/rank={weights_per_rank_gb:.1f}GB + "
-            f"L1={args.L1_size}GB + buffer={args.buffer_gb}GB = "
-            f"{needed_gb:.1f}GB; HBM/rank={hbm_per_rank_gb}GB.\n"
+            f"L1={args.L1_size}GB = {static_gb:.1f}GB; "
+            f"HBM/rank={hbm_per_rank_gb}GB.\n"
             f"  Reduce --L1-size, raise --tp, or use a smaller-weight model.\n"
+        )
+        sys.exit(2)
+    if remaining_gb < args.buffer_gb:
+        sys.stderr.write(
+            f"ERROR: only {remaining_gb:.1f}GB/rank left for activations + "
+            f"cuda graph after weights ({weights_per_rank_gb:.1f}GB) + "
+            f"L1 ({args.L1_size}GB), need >= --buffer-gb={args.buffer_gb}GB.\n"
+            f"  Reduce --L1-size, raise --tp, or lower --buffer-gb if you "
+            f"know the activation footprint.\n"
         )
         sys.exit(2)
     if mem_fraction > 0.85:
