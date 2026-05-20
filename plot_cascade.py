@@ -724,11 +724,13 @@ def main():
                     "platform), auto-discovers L1/L2/L3_file jsonls inside, "
                     "and writes 3 PNGs: MI355X.png, B200.png, MI355X_VS_B200.png.",
     )
-    p.add_argument("--MI355X-dir", required=True,
+    p.add_argument("--MI355X-dir", default=None,
                    help="Path to MI355X cascade root, e.g. "
-                        "results/<docker>/<MODEL>-cascade-<tag>/")
-    p.add_argument("--B200-dir", required=True,
-                   help="Path to B200 cascade root, same layout.")
+                        "results/<docker>/<MODEL>-cascade-<tag>/. Optional; "
+                        "either --MI355X-dir or --B200-dir (or both) must "
+                        "be given.")
+    p.add_argument("--B200-dir", default=None,
+                   help="Path to B200 cascade root, same layout. Optional.")
     p.add_argument("--out-dir", default=None,
                    help="Where to write the 3 PNGs. Default: MI355X-dir.")
     p.add_argument("--model-name", default=None,
@@ -740,52 +742,66 @@ def main():
                         "want a fair window (--max-rounds 10).")
     args = p.parse_args()
 
-    mi_dir   = Path(args.MI355X_dir).expanduser().resolve()
-    b2_dir   = Path(args.B200_dir).expanduser().resolve()
-    out_dir  = Path(args.out_dir).expanduser().resolve() if args.out_dir else mi_dir
+    if not args.MI355X_dir and not args.B200_dir:
+        sys.exit("ERROR: at least one of --MI355X-dir or --B200-dir is required.")
+
+    mi_dir = Path(args.MI355X_dir).expanduser().resolve() if args.MI355X_dir else None
+    b2_dir = Path(args.B200_dir).expanduser().resolve()   if args.B200_dir   else None
+
+    # Default out_dir = whichever single platform dir was given, or MI355X
+    # when both are given (matches the pre-optional-flag behavior).
+    if args.out_dir:
+        out_dir = Path(args.out_dir).expanduser().resolve()
+    else:
+        out_dir = mi_dir or b2_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for d in (mi_dir, b2_dir):
-        if not d.is_dir():
+        if d is not None and not d.is_dir():
             sys.exit(f"ERROR: not a directory: {d}")
 
-    runs_mi = load_runs(mi_dir, "MI355X", args.max_rounds)
-    runs_b2 = load_runs(b2_dir, "B200",   args.max_rounds)
+    runs_mi = load_runs(mi_dir, "MI355X", args.max_rounds) if mi_dir else []
+    runs_b2 = load_runs(b2_dir, "B200",   args.max_rounds) if b2_dir else []
     all_runs = runs_mi + runs_b2
 
     # Shared TTFT Y-axis: round(max + 0.5) + 1 → e.g. 12.6 → 14, 11.7 → 13.
-    # Same rule for all three PNGs so they're visually directly comparable.
+    # Same rule for all PNGs so they're visually directly comparable.
     max_ttft = max((max(r["ttft"]) for r in all_runs), default=1.0)
     ymax_ttft = round(max_ttft + 0.5) + 1
 
-    model = extract_model_display(mi_dir, args.model_name)
+    # Model name comes from whichever cascade dir we have. Both dirs should
+    # share the same model — we don't enforce, but the title only uses one.
+    name_dir = mi_dir or b2_dir
+    model = extract_model_display(name_dir, args.model_name)
     # Docker tag (parent dir of the cascade root) -> 'docker pull'-able
     # image name. Each PNG's subtitle lists ONLY the docker(s) whose curves
-    # are actually drawn on that figure, so a standalone B200.png viewer
-    # doesn't see an MI355X docker tag that has nothing to do with the
-    # plot. The combined MI355X_VS_B200.png lists both, one per line.
-    docker_mi = unmangle_docker(mi_dir.parent.name) if mi_dir.parent else ""
-    docker_b2 = unmangle_docker(b2_dir.parent.name) if b2_dir.parent else ""
+    # are actually drawn on that figure.
+    docker_mi = unmangle_docker(mi_dir.parent.name) if mi_dir and mi_dir.parent else ""
+    docker_b2 = unmangle_docker(b2_dir.parent.name) if b2_dir and b2_dir.parent else ""
 
-    # 3 outputs.
-    plot_cascade(
-        runs_mi,
-        out_dir / "MI355X.png",
-        title=f"{model}\nMI355X {docker_mi}".strip(),
-        ymax_ttft=ymax_ttft,
-    )
-    plot_cascade(
-        runs_b2,
-        out_dir / "B200.png",
-        title=f"{model}\nB200 {docker_b2}".strip(),
-        ymax_ttft=ymax_ttft,
-    )
-    plot_cascade(
-        all_runs,
-        out_dir / "MI355X_VS_B200.png",
-        title=f"{model}\nMI355X {docker_mi}\nB200 {docker_b2}".strip(),
-        ymax_ttft=ymax_ttft,
-    )
+    # Emit each platform's PNG only when its dir was actually given.
+    if runs_mi:
+        plot_cascade(
+            runs_mi,
+            out_dir / "MI355X.png",
+            title=f"{model}\nMI355X {docker_mi}".strip(),
+            ymax_ttft=ymax_ttft,
+        )
+    if runs_b2:
+        plot_cascade(
+            runs_b2,
+            out_dir / "B200.png",
+            title=f"{model}\nB200 {docker_b2}".strip(),
+            ymax_ttft=ymax_ttft,
+        )
+    # Combined comparison PNG only when both platforms have curves.
+    if runs_mi and runs_b2:
+        plot_cascade(
+            all_runs,
+            out_dir / "MI355X_VS_B200.png",
+            title=f"{model}\nMI355X {docker_mi}\nB200 {docker_b2}".strip(),
+            ymax_ttft=ymax_ttft,
+        )
 
 
 if __name__ == "__main__":
