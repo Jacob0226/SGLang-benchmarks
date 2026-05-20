@@ -31,17 +31,23 @@ Why these specific numbers
   attention/MoE backend workspaces BEFORE SGLang runs
   `torch.cuda.mem_get_info()` and computes its mem_fraction budget.
   SGLang prints this implicitly as `Load weight begin. avail mem=X GB`
-  — comparing X to `rocm-smi`/`nvidia-smi` HBM gives the reserve.
+  — comparing X to **`rocm-smi`/`nvidia-smi`-reported HBM** (NOT the
+  vendor marketing capacity!) gives the reserve. Both tools already
+  subtract ECC + firmware reservation from the marketing capacity, so:
+    MI355X marketing 288 GB → rocm-smi reports ~287 GB
+    B200 marketing  192 GB → nvidia-smi reports ~179 GB (13 GB reserved
+                              for ECC / on-die firmware tables)
   Measured on the cascade_dsr1_lite.sh DSR1-0528 TP=8 config:
-    MI355X (RCCL + QuickReduce, aiter):                ~6 GB/rank
-    B200 (NCCL + flashinfer_trtllm + allreduce-fusion): ~16 GB/rank
-  Stable for a fixed (HW, driver, comm lib, TP, backend) tuple; varies
-  little across models because the dominant terms are workspace
-  pre-allocations sized by TP / context_length, not weights.
-  Defaults `_DEFAULT_FRAMEWORK_RESERVE_BY_VENDOR` add a ~2 GB safety
-  margin over measured values to avoid undersubtracting. For precise
-  calibration pass `--reserve-from-server-log <path>` to a previous
-  run's server.log.
+    MI355X (RCCL + QuickReduce, aiter):                 ~6 GB/rank
+      287 GB rocm-smi - 280.92 GB SGLang avail
+    B200 (NCCL + flashinfer_trtllm + allreduce-fusion): ~3 GB/rank
+      179 GB nvidia-smi - 176.17 GB SGLang avail
+  Reserve is stable for a fixed (HW, driver, comm lib, TP, backend)
+  tuple; varies little across models. NCCL is significantly leaner on
+  P2P buffers than RCCL+QuickReduce, which explains the AMD/NV gap.
+  Defaults `_DEFAULT_FRAMEWORK_RESERVE_BY_VENDOR` add a ~1-2 GB safety
+  margin over measured values. For precise calibration pass
+  `--reserve-from-server-log <path>` to a previous run's server.log.
 * Buffer per rank: 12 GB default minimum HBM reserved for activations
   + cuda graph + KV scratch + framework bookkeeping. Tightening below
   8 GB risks OOM.
@@ -101,16 +107,26 @@ import sys
 # Per-vendor default for framework_reserve_gb, applied when the user does
 # not pass --framework-reserve-gb or --reserve-from-server-log. Each
 # value is the measured framework reserve on the cascade_dsr1_lite.sh
-# DSR1-0528 TP=8 config + ~2 GB safety margin (to slightly oversubtract,
-# which is safer than under-subtracting — the worst case is a KV pool
-# that's a hair smaller than --L1-size, never OOM).
+# DSR1-0528 TP=8 config + ~1-2 GB safety margin to slightly oversubtract.
 #
-#   AMD:   measured 6.08 GB on MI355X (rocm720, RCCL + QuickReduce,
-#                                       aiter, fp8 KV)        → default 8
-#   NV:    measured 15.83 GB on B200 (cu130, NCCL, trtllm_mla +
-#                                       flashinfer_trtllm MoE +
-#                                       allreduce-fusion, fp8 KV) → default 18
-_DEFAULT_FRAMEWORK_RESERVE_BY_VENDOR = {"amd": 8.0, "nvidia": 18.0}
+# CRITICAL: "HBM" here means what `rocm-smi`/`nvidia-smi` reports (after
+# ECC + firmware reservation), NOT the vendor marketing capacity:
+#   MI355X marketing 288 GB → rocm-smi reports 287 GB → SGLang sees 280.92 GB
+#   B200   marketing 192 GB → nvidia-smi reports 179 GB → SGLang sees 176.17 GB
+#
+# Measured reserves on cascade_dsr1_lite.sh DSR1-0528 TP=8:
+#   AMD MI355X (rocm720, RCCL + QuickReduce, aiter, fp8 KV):
+#     287 - 280.92 = 6.08 GB             → default 8.0  (+1.92 margin)
+#   NV B200 (cu130, NCCL, trtllm_mla + flashinfer_trtllm MoE +
+#                          allreduce-fusion, fp8 KV):
+#     179 - 176.17 =  2.83 GB             → default 4.0  (+1.17 margin)
+#
+# NCCL is leaner on P2P buffers than RCCL+QuickReduce, which is why the
+# NV reserve is half AMD's despite both running on 8 ranks. An earlier
+# version of this file defaulted NV to 18 GB (mistakenly using B200's
+# marketing 192 GB as the divisor); that would have inflated the KV
+# pool by ~9 GB. Always anchor against rocm-smi/nvidia-smi reported HBM.
+_DEFAULT_FRAMEWORK_RESERVE_BY_VENDOR = {"amd": 8.0, "nvidia": 4.0}
 
 
 def detect_gpu_info():
@@ -213,12 +229,13 @@ def main():
                         "RCCL/NCCL communicator buffers + driver JIT cache + "
                         "attention/MoE backend workspaces BEFORE SGLang "
                         "computes its mem_fraction_static budget. Subtracted "
-                        "from rocm-smi/nvidia-smi HBM before dividing. When "
-                        "omitted, uses the vendor default (AMD=8 GB / "
-                        "NV=18 GB), which covers measured values "
-                        "(MI355X TP=8: ~6 GB, B200 TP=8: ~16 GB) with ~2 GB "
-                        "slack. Use --reserve-from-server-log to calibrate "
-                        "precisely from a previous run.")
+                        "from rocm-smi/nvidia-smi-reported HBM (NOT vendor "
+                        "marketing capacity) before dividing. When omitted, "
+                        "uses the vendor default (AMD=8 GB / NV=4 GB), "
+                        "covering measured values (MI355X TP=8: ~6 GB, "
+                        "B200 TP=8: ~3 GB) with ~1-2 GB slack. Use "
+                        "--reserve-from-server-log to calibrate precisely "
+                        "from a previous run.")
     p.add_argument("--reserve-from-server-log", type=str, default=None,
                    help="Path to a previous SGLang server.log. Reads the "
                         "first 'Load weight begin. avail mem=X GB' line and "
