@@ -49,6 +49,7 @@ GSM8K_PRECHECK="true"
 GSM8K_NUM_QUESTIONS=1200
 GSM8K_PARALLEL=1200
 WAIT_FOR_SERVER_SEC=1500
+ATTENTION_BACKEND=""   # "" = auto-detect by vendor: NV->trtllm_mla, AMD->aiter
 
 ORIG_ARGS=("$@")
 
@@ -72,6 +73,7 @@ while [[ $# -gt 0 ]]; do
     --page-size)           PAGE_SIZE="$2"; shift 2;;
     --hicache-mem-layout)  HICACHE_MEM_LAYOUT="$2"; shift 2;;
     --hicache-io-backend)  HICACHE_IO_BACKEND="$2"; shift 2;;
+    --attention-backend)   ATTENTION_BACKEND="$2"; shift 2;;
     --gsm8k-num-questions) GSM8K_NUM_QUESTIONS="$2"; shift 2;;
     --no-gsm8k-precheck)   GSM8K_PRECHECK="false"; shift 1;;
     -h|--help)
@@ -212,13 +214,41 @@ trap '
   sleep 10
   true' EXIT
 
+# ============================== Platform detection ==============================
+# attention_backend / moe_runner_backend / env vars are vendor-specific.
+# We auto-detect once and gate every NV-only or AMD-only flag below.
+VENDOR="unknown"
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+  VENDOR="nvidia"
+fi
+if command -v rocm-smi >/dev/null 2>&1 && rocm-smi --showid >/dev/null 2>&1; then
+  # Pick AMD only when nvidia-smi isn't there OR ROCM_PATH is set (i.e.
+  # we're inside an ROCm container). Same heuristic as the profile scripts.
+  if [ "$VENDOR" = "unknown" ] || [ -n "${ROCM_PATH:-}" ]; then
+    VENDOR="amd"
+  fi
+fi
+echo ">>> platform: ${VENDOR}"
+
+if [ -z "$ATTENTION_BACKEND" ]; then
+  case "$VENDOR" in
+    nvidia) ATTENTION_BACKEND="trtllm_mla";;   # MLA-aware NV backend (DSR1)
+    amd)    ATTENTION_BACKEND="aiter";;        # AMD ROCm aiter
+    *)      ATTENTION_BACKEND="aiter";;        # legacy default
+  esac
+fi
+
 # ============================== Server cmd ==============================
-# DSR1-0528 + ROCm aiter + page_size=64: must disable PR #18528 FP8 prefill kernel.
 export PYTHONUNBUFFERED=1
 export SAFETENSORS_FAST_GPU=1
-export SGLANG_USE_AITER=1
-export ROCM_QUICK_REDUCE_QUANTIZATION=NONE
-export SGLANG_AITER_FP8_PREFILL_ATTN=0
+if [ "$VENDOR" = "amd" ]; then
+  # DSR1-0528 + ROCm aiter + page_size=64: must disable PR #18528 FP8
+  # prefill kernel; SGLANG_USE_AITER picks the aiter prefill/decode path;
+  # ROCM_QUICK_REDUCE_QUANTIZATION=NONE keeps allreduce in fp16/bf16.
+  export SGLANG_USE_AITER=1
+  export ROCM_QUICK_REDUCE_QUANTIZATION=NONE
+  export SGLANG_AITER_FP8_PREFILL_ATTN=0
+fi
 
 SERVER_CMD=(
   python3 -u -m sglang.launch_server
@@ -235,8 +265,16 @@ SERVER_CMD=(
     --context-length "$CONTEXT_LENGTH"
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
     --max-prefill-tokens "$MAX_PREFILL_TOKENS"
-    --attention-backend aiter
+    --attention-backend "$ATTENTION_BACKEND"
 )
+if [ "$VENDOR" = "nvidia" ]; then
+  # Matches the previously-validated B200 cascade (May-12 run): use
+  # FlashInfer's TRT-LLM kernels for MoE + fused allreduce.
+  SERVER_CMD+=(
+    --moe-runner-backend flashinfer_trtllm
+    --enable-flashinfer-allreduce-fusion
+  )
+fi
 # Only pass --cuda-graph-max-bs if user explicitly overrode (>0).
 [ "$CUDA_GRAPH_MAX_BS" -gt 0 ] && SERVER_CMD+=(--cuda-graph-max-bs "$CUDA_GRAPH_MAX_BS")
 
