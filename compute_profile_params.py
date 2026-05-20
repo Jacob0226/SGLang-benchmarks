@@ -39,8 +39,16 @@ Why these specific numbers
   This is REPLICATED across TP ranks because MLA's c_kv is shared
   across heads, not sharded by head.
 * WARMUP_ROUNDS = ceil(L1_size / KV_per_round). The (warmup+1)-th round
-  is the first one where L1 starts evicting, i.e. the "cliff" event.
-  That's the profile target.
+  is the first one where L1 is ALREADY 100% full at the round's first
+  prefill step, so every insertion in that round triggers an L1->L2
+  eviction. That's the profile target ("steady-state L1->L2 cliff").
+
+  Why ceil and not floor: if L1 isn't a multiple of KV_per_round,
+  floor(L1/KV) leaves L1 with `(L1 mod KV)` GB free at the end of
+  warmup. The target round's early prefill steps would then just fill
+  that remaining space (no eviction); only the later prefills would
+  evict. With --num-steps 5, that early window often dominates the
+  trace and the L1->L2 kernels never show up.
 """
 
 import argparse
@@ -179,13 +187,22 @@ def main():
     )
     kv_gb_per_round_per_rank = kv_bytes_per_round_per_rank / (1024 ** 3)
 
-    # Profile target = first round where L1 starts EVICTING.
-    # After R rounds, cumulative KV = R × KV_per_round_gb. L1 evicts in
-    # the first R where R × KV > L1, i.e., R = floor(L1/KV) + 1.
-    # WARMUP_ROUNDS = TARGET - 1 = floor(L1/KV). max(1, ...) to avoid a
-    # degenerate "no warmup" case when L1 < KV_per_round (target round
-    # would be R1 itself, which has no prior cache to hit).
-    warmup_rounds = max(1, int(args.L1_size / kv_gb_per_round_per_rank))
+    # Profile target = first round whose ENTIRE prefill runs against a
+    # 100%-full L1, so every insertion triggers an L1->L2 eviction.
+    # That requires warmup to have written at least L1 bytes into the
+    # cache, i.e. warmup × KV >= L1, i.e. warmup = ceil(L1 / KV).
+    #
+    # Using floor here is a subtle bug: if L1 isn't a multiple of KV,
+    # the (floor+1)-th round STARTS with `L1 mod KV` GB free in L1, so
+    # the early prefill steps just fill that residual headroom without
+    # evicting. A --num-steps 5 trace then frequently captures only
+    # those non-evicting steps and misses the L1->L2 kernels entirely
+    # (e.g. L1=60, KV=40: floor gives target=R2 which is half "fill
+    # remaining 20 GB" + half "evict 20 GB to L2"; ceil gives target=R3
+    # which is pure eviction).
+    #
+    # max(1, ...) is a safety net; ceil of any positive ratio is >= 1.
+    warmup_rounds = max(1, math.ceil(args.L1_size / kv_gb_per_round_per_rank))
     profile_target_round_1idx = warmup_rounds + 1
     num_rounds = warmup_rounds + args.rounds_profile + args.rounds_margin
 
