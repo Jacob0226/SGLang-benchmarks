@@ -234,8 +234,11 @@ fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
 BASE_LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}-cascade-${TAG}"
 case "$CACHE_MODE" in
-  none|L1)    LOG_DIR="${BASE_LOG_DIR}/${CACHE_MODE}" ;;
-  L2|L3_file) LOG_DIR="${BASE_LOG_DIR}/${CACHE_MODE}/size_${HICACHE_SIZE}" ;;
+  none|L1)  LOG_DIR="${BASE_LOG_DIR}/${CACHE_MODE}" ;;
+  L2)       LOG_DIR="${BASE_LOG_DIR}/L2_size_${HICACHE_SIZE}" ;;
+  # L3_file mode also uses HICACHE_SIZE as its L2 (host) pool size, so we
+  # encode it as "L3file_L2_size_<N>" to disambiguate from a plain L2 run.
+  L3_file)  LOG_DIR="${BASE_LOG_DIR}/L3file_L2_size_${HICACHE_SIZE}" ;;
 esac
 mkdir -p "$LOG_DIR"
 

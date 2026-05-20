@@ -156,20 +156,29 @@ def write_per_mode(log_dir, out_path):
 # In a cascade chain, $BASE_LOG_DIR has these subdirs:
 #   none/                     -- always
 #   L1/                       -- always
-#   L2/size_<N>/              -- one or more sizes
-#   L3_file/size_<N>/         -- one or more sizes
-# We pick the largest size_<N> subdir for L2/L3_file (matches what the
-# cascade_dsr1_lite.sh chain produces for a single --hicache-size run).
+#   L2_size_<N>/              -- one or more sizes (current layout)
+#   L3file_L2_size_<N>/       -- one or more sizes (current layout)
+# Legacy (pre-FairCompare_0520_v3) layout used a nested form:
+#   L2/size_<N>/
+#   L3_file/size_<N>/
+# We accept both so old result trees still summarize. For L2/L3 we pick
+# the largest <N> if multiple sizes exist (matches what the cascade
+# chain produces for a single --hicache-size run).
 
-def _resolve_mode_dir(base, mode):
-    direct = os.path.join(base, mode)
-    if not os.path.isdir(direct):
-        return None
-    if mode in ("none", "L1"):
-        return direct
+# Prefix used to encode each mode's L2 (host) pool size as a flat dir.
+_MODE_DIR_PREFIX = {
+    "L2": "L2_size_",
+    "L3_file": "L3file_L2_size_",
+}
+
+
+def _largest_size_subdir(parent):
+    """Return the (size, full_path) with the largest int suffix under parent,
+    looking for entries named 'size_<N>'. Returns (None, None) if none found.
+    Used only for the legacy nested layout."""
     sizes = []
-    for entry in os.listdir(direct):
-        full = os.path.join(direct, entry)
+    for entry in os.listdir(parent):
+        full = os.path.join(parent, entry)
         if entry.startswith("size_") and os.path.isdir(full):
             try:
                 sz = int(entry.split("_", 1)[1])
@@ -177,9 +186,39 @@ def _resolve_mode_dir(base, mode):
                 continue
             sizes.append((sz, full))
     if not sizes:
-        return None
+        return None, None
     sizes.sort(reverse=True)
-    return sizes[0][1]
+    return sizes[0]
+
+
+def _resolve_mode_dir(base, mode):
+    if mode in ("none", "L1"):
+        direct = os.path.join(base, mode)
+        return direct if os.path.isdir(direct) else None
+
+    prefix = _MODE_DIR_PREFIX.get(mode)
+    if prefix is not None:
+        sizes = []
+        for entry in os.listdir(base):
+            full = os.path.join(base, entry)
+            if entry.startswith(prefix) and os.path.isdir(full):
+                try:
+                    sz = int(entry[len(prefix):])
+                except ValueError:
+                    continue
+                sizes.append((sz, full))
+        if sizes:
+            sizes.sort(reverse=True)
+            return sizes[0][1]
+
+    # Legacy nested layout: <base>/<mode>/size_<N>/
+    legacy_parent = os.path.join(base, mode)
+    if os.path.isdir(legacy_parent):
+        _, legacy_dir = _largest_size_subdir(legacy_parent)
+        if legacy_dir is not None:
+            return legacy_dir
+
+    return None
 
 
 def write_cross_mode(base_dir, out_path):
