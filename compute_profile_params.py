@@ -26,23 +26,43 @@ Why these specific numbers
 * Weights per rank: sum of *.safetensors file sizes in $MODEL_PATH,
   divided by tp_size. This is the on-disk size which equals the
   in-VRAM weight footprint for any single dtype (fp8/bf16/fp16).
+* Framework reserve per rank: HBM locked up by PyTorch CUDA/HIP
+  context + RCCL/NCCL communicator buffers + driver JIT cache BEFORE
+  SGLang runs `torch.cuda.mem_get_info()` and computes its mem_fraction
+  budget. SGLang prints this implicitly as `Load weight begin. avail
+  mem=X GB` — comparing X to `rocm-smi`/`nvidia-smi` HBM gives the
+  reserve. Empirically:
+    MI355X TP=8 (RCCL + QuickReduce):  ~6 GB/rank
+    B200 TP=8 (NCCL):                  ~4-6 GB/rank (estimate)
+  Stable for a fixed (HW, driver, RCCL/NCCL, TP, env) tuple; varies
+  little across models. Default `--framework-reserve-gb 8` is slightly
+  conservative on both platforms; for precise calibration pass
+  `--reserve-from-server-log <path>` to a previous run's server.log.
 * Buffer per rank: 12 GB default minimum HBM reserved for activations
   + cuda graph + KV scratch + framework bookkeeping. Tightening below
   8 GB risks OOM.
-* mem_fraction_static = (weights + L1_KV) / HBM. This matches SGLang's
-  own definition in server_args.py:
+* mem_fraction_static = (weights + L1_KV) / (HBM - framework_reserve).
+  SGLang's own server_args.py defines it as
       mem_fraction_static = (weights + KV cache pool) / HBM
-  i.e. the activation / cuda graph reservation lives in the OTHER
+  where HBM here is what `torch.cuda.mem_get_info()` returns AFTER
+  framework init — i.e. SGLang's "usable" HBM, not the raw vendor
+  total. Subtracting --framework-reserve-gb from the rocm-smi/nvidia-smi
+  total before dividing makes the helper's mem_fraction land on
+  SGLang's internal denominator, so the actual KV pool ends up equal
+  to --L1-size (instead of being short by the framework reserve, as
+  happened in cascade-FairCompare_0520_v3 with 32.25 GB vs 35 GB).
+  The activation / cuda graph reservation lives in the OTHER
   (1 - mem_fraction_static) portion, not inside the numerator. Putting
   --buffer-gb inside the numerator inflates mem_fraction_static and
   causes SGLang to allocate a KV pool larger than --L1-size by
   buffer_gb (12 GB by default) — which then violates the HiCache
   "host_pool > device_pool" invariant the moment --L2-size is set to
   any value near --L1-size + 12 GB.
-  Validation: we still enforce `(1 - mem_fraction) * HBM >= buffer_gb`
-  so the activation budget can't get squeezed to zero. Anything that
-  would push mem-fraction-static above --max-mem-fraction (default
-  0.92, no headroom for fragmentation) is rejected; >0.85 is warned.
+  Validation: we still enforce
+  `(1 - mem_fraction) * usable_HBM >= buffer_gb` so the activation
+  budget can't get squeezed to zero. Anything that would push
+  mem-fraction-static above --max-mem-fraction (default 0.92, no
+  headroom for fragmentation) is rejected; >0.85 is warned.
 * KV per token (replicated MLA): default 34 KB for DSR1-0528.
   Override with --kv-bytes-per-token for other models. Math:
     DSR1: kv_lora_rank(512) + qk_rope_head_dim(64) = 576 B/layer
@@ -69,6 +89,7 @@ import glob
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 
@@ -112,6 +133,26 @@ def detect_hbm_per_rank_gb():
     )
 
 
+_LOAD_WEIGHT_BEGIN_RE = re.compile(r"Load weight begin\. avail mem=([\d.]+)\s*GB")
+
+
+def extract_sglang_usable_hbm_gb(server_log_path):
+    """Return the first 'Load weight begin. avail mem=X GB' value from a
+    SGLang server.log (in GB). That value IS SGLang's usable HBM per rank
+    on the box that produced this log — i.e. rocm-smi/nvidia-smi total
+    minus everything PyTorch / RCCL / NCCL / driver JIT pre-allocated.
+    Returns None if no matching line is found."""
+    try:
+        with open(server_log_path, "r", errors="ignore") as f:
+            for line in f:
+                m = _LOAD_WEIGHT_BEGIN_RE.search(line)
+                if m:
+                    return float(m.group(1))
+    except OSError:
+        return None
+    return None
+
+
 def model_weights_gb(model_path):
     """Sum sizes of *.safetensors in MODEL_PATH (in GiB)."""
     total_bytes = 0
@@ -147,6 +188,23 @@ def main():
     p.add_argument("--buffer-gb", type=int, default=12,
                    help="Per-rank HBM reserved for activations / cuda graph / "
                         "KV scratch")
+    p.add_argument("--framework-reserve-gb", type=float, default=8.0,
+                   help="HBM/rank locked up by PyTorch CUDA/HIP context + "
+                        "RCCL/NCCL communicator buffers + driver JIT cache "
+                        "BEFORE SGLang computes its mem_fraction_static "
+                        "budget. Subtracted from rocm-smi/nvidia-smi HBM "
+                        "before dividing. Default 8 GB is conservative for "
+                        "MI355X TP=8 (~6 GB measured) and B200 TP=8 "
+                        "(~4-6 GB est.). Use --reserve-from-server-log to "
+                        "calibrate precisely from a previous run.")
+    p.add_argument("--reserve-from-server-log", type=str, default=None,
+                   help="Path to a previous SGLang server.log. Reads the "
+                        "first 'Load weight begin. avail mem=X GB' line and "
+                        "computes framework reserve = HBM - X, overriding "
+                        "--framework-reserve-gb. Use this once per "
+                        "(HW, driver, TP) combination to get exact "
+                        "calibration; the reserve is stable across models "
+                        "for a fixed env.")
     p.add_argument("--rounds-profile", type=int, default=1,
                    help="How many rounds the profiler will cover")
     p.add_argument("--rounds-margin", type=int, default=1,
@@ -175,14 +233,48 @@ def main():
     weights_per_rank_gb = weights_gb / args.tp
 
     hbm_per_rank_gb = detect_hbm_per_rank_gb()
-    # SGLang's mem_fraction_static = (weights + KV pool) / HBM. Buffer
-    # lives in the OTHER (1 - mem_fraction_static) portion; including it
-    # in the numerator would inflate the KV pool by buffer_gb and trip the
-    # HiCache "host_pool > device_pool" assertion when --L2-size is sized
-    # to L1 + small margin. See cascade-FairCompare_0520_v2 postmortem.
+
+    # Framework reserve: HBM that PyTorch + RCCL/NCCL + driver lock up
+    # BEFORE SGLang sees mem_get_info(). If --reserve-from-server-log is
+    # given, derive the exact value for this (HW, driver, TP) combo.
+    framework_reserve_gb = args.framework_reserve_gb
+    reserve_source = "default"
+    if args.reserve_from_server_log:
+        sglang_usable_hbm = extract_sglang_usable_hbm_gb(
+            args.reserve_from_server_log
+        )
+        if sglang_usable_hbm is None:
+            sys.stderr.write(
+                f"WARN: no 'Load weight begin. avail mem=' line in "
+                f"{args.reserve_from_server_log}; falling back to "
+                f"--framework-reserve-gb={args.framework_reserve_gb}.\n"
+            )
+        else:
+            framework_reserve_gb = hbm_per_rank_gb - sglang_usable_hbm
+            reserve_source = (
+                f"measured from {args.reserve_from_server_log} "
+                f"(SGLang avail={sglang_usable_hbm:.2f} GB)"
+            )
+
+    usable_hbm_gb = hbm_per_rank_gb - framework_reserve_gb
+    if usable_hbm_gb <= 0:
+        sys.stderr.write(
+            f"ERROR: framework_reserve_gb={framework_reserve_gb:.1f} >= "
+            f"HBM/rank={hbm_per_rank_gb}; nothing left for the model.\n"
+        )
+        sys.exit(2)
+
+    # SGLang's mem_fraction_static = (weights + KV pool) / usable_HBM.
+    # Using rocm-smi's raw HBM as the denominator (instead of usable_HBM)
+    # makes mem_fraction land too low, producing a KV pool that's short
+    # by `framework_reserve_gb * mem_fraction`. Buffer lives in the OTHER
+    # (1 - mem_fraction_static) portion; including it in the numerator
+    # inflates the KV pool by buffer_gb and trips the HiCache
+    # "host_pool > device_pool" assertion when --L2-size is sized to
+    # L1 + small margin. See cascade-FairCompare_0520_v2 / v3 postmortems.
     static_gb = weights_per_rank_gb + args.L1_size
-    mem_fraction = static_gb / hbm_per_rank_gb
-    remaining_gb = hbm_per_rank_gb - static_gb  # for activations + cuda graph
+    mem_fraction = static_gb / usable_hbm_gb
+    remaining_gb = usable_hbm_gb - static_gb  # for activations + cuda graph
 
     if mem_fraction > args.max_mem_fraction:
         sys.stderr.write(
@@ -190,7 +282,8 @@ def main():
             f"--max-mem-fraction={args.max_mem_fraction}.\n"
             f"  weights/rank={weights_per_rank_gb:.1f}GB + "
             f"L1={args.L1_size}GB = {static_gb:.1f}GB; "
-            f"HBM/rank={hbm_per_rank_gb}GB.\n"
+            f"usable HBM/rank={usable_hbm_gb:.1f}GB "
+            f"(raw {hbm_per_rank_gb}GB - reserve {framework_reserve_gb:.1f}GB).\n"
             f"  Reduce --L1-size, raise --tp, or use a smaller-weight model.\n"
         )
         sys.exit(2)
@@ -234,9 +327,23 @@ def main():
     profile_target_round_1idx = warmup_rounds + 1
     num_rounds = warmup_rounds + args.rounds_profile + args.rounds_margin
 
+    # Stderr diagnostics: not eval'd by the bash caller (whitelist regex
+    # in cascade_dsr1_lite.sh only captures stdout `^[A-Z0-9_]+=` lines),
+    # but visible in chain.log for postmortem.
+    sys.stderr.write(
+        f"INFO: HBM/rank={hbm_per_rank_gb}GB, "
+        f"framework_reserve={framework_reserve_gb:.2f}GB ({reserve_source}), "
+        f"usable={usable_hbm_gb:.2f}GB, "
+        f"weights={weights_per_rank_gb:.1f}GB, L1={args.L1_size}GB, "
+        f"derived mem_fraction_static={mem_fraction:.4f} -> "
+        f"emitted as {mem_fraction:.2f}\n"
+    )
+
     # Shell-eval-able output. All numeric so eval is safe.
     print(f"WEIGHTS_GB_PER_RANK={weights_per_rank_gb:.1f}")
     print(f"HBM_GB_PER_RANK={hbm_per_rank_gb}")
+    print(f"USABLE_HBM_GB_PER_RANK={usable_hbm_gb:.2f}")
+    print(f"FRAMEWORK_RESERVE_GB={framework_reserve_gb:.2f}")
     print(f"KV_GB_PER_ROUND_PER_RANK={kv_gb_per_round_per_rank:.2f}")
     print(f"MEM_FRACTION_STATIC={mem_fraction:.2f}")
     print(f"WARMUP_ROUNDS={warmup_rounds}")

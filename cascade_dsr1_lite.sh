@@ -193,7 +193,7 @@ if [ -n "$L1_SIZE" ]; then
     --L2-size "$HELPER_L2" \
     --num-clients "$NUM_CLIENTS" \
     --request-length "$REQUEST_LENGTH" 2>&1) || { echo "$PARAMS" >&2; exit 1; }
-  echo "$PARAMS" | grep -E '^(WARN|ERROR)' >&2 || true
+  echo "$PARAMS" | grep -E '^(WARN|ERROR|INFO)' >&2 || true
   # Whitelist only the vars we actually consume below. Helper also prints
   # NUM_ROUNDS=..., which would silently shadow the user's --num-rounds.
   # See bench_meta.json mismatch postmortem (cascade-FairCompare_0520).
