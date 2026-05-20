@@ -26,6 +26,10 @@ CUDA_GRAPH_MAX_BS=0
 CHUNKED_PREFILL_SIZE=32768
 MAX_PREFILL_TOKENS=32768
 MEM_FRACTION_STATIC=0.85
+MEM_FRACTION_EXPLICIT=false   # flipped true when --mem-fraction-static is passed
+L1_SIZE=""                    # GB/rank; when set, mem-fraction-static is auto-derived
+                              # via compute_profile_params.py (mutually exclusive
+                              # with --mem-fraction-static)
 PAGE_SIZE=64
 CONTEXT_LENGTH=65536
 HICACHE_WRITE_POLICY="write_through"
@@ -69,7 +73,8 @@ while [[ $# -gt 0 ]]; do
     --request-length)      REQUEST_LENGTH="$2"; shift 2;;
     --max-parallel)        MAX_PARALLEL="$2"; shift 2;;
     --request-rate)        REQUEST_RATE="$2"; shift 2;;
-    --mem-fraction-static) MEM_FRACTION_STATIC="$2"; shift 2;;
+    --mem-fraction-static) MEM_FRACTION_STATIC="$2"; MEM_FRACTION_EXPLICIT=true; shift 2;;
+    --L1-size)             L1_SIZE="$2"; shift 2;;
     --page-size)           PAGE_SIZE="$2"; shift 2;;
     --hicache-mem-layout)  HICACHE_MEM_LAYOUT="$2"; shift 2;;
     --hicache-io-backend)  HICACHE_IO_BACKEND="$2"; shift 2;;
@@ -77,8 +82,18 @@ while [[ $# -gt 0 ]]; do
     --gsm8k-num-questions) GSM8K_NUM_QUESTIONS="$2"; shift 2;;
     --no-gsm8k-precheck)   GSM8K_PRECHECK="false"; shift 1;;
     -h|--help)
-      echo "Usage: $0 --tag TAG --docker DOCKER [--cache-mode MODE | --cache-modes 'MODE1 MODE2 ...']"
-      echo "Modes: none | L1 | L2 | L3_file"
+      cat <<EOF
+Usage: $0 --tag TAG --docker DOCKER [--cache-mode MODE | --cache-modes 'MODE1 MODE2 ...']
+Modes: none | L1 | L2 | L3_file
+
+Memory sizing (pick one):
+  --mem-fraction-static F        explicit fraction (default 0.85)
+  --L1-size N                    GB/rank for L1 (GPU radix); auto-derives
+                                 --mem-fraction-static via
+                                 compute_profile_params.py. Requires
+                                 --hicache-size when cache-mode is L2/L3_file.
+                                 Mutually exclusive with --mem-fraction-static.
+EOF
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 1;;
@@ -127,6 +142,49 @@ if [ -n "$CACHE_MODES" ]; then
     python3 "$CHAIN_SUMMARIZER" cross_mode "$CHAIN_BASE_LOG_DIR" || true
   fi
   exit 0
+fi
+
+# ============================== Auto-derive mem-fraction-static ==============================
+# When --L1-size is given, run compute_profile_params.py to get the
+# mem-fraction-static that exactly fits weights/rank + L1 + buffer on
+# the local GPU. Lets you run identical L1 sizes across MI355X/B200
+# without hand-computing the fraction (HBM/rank differs per platform).
+#
+# Placed after the chain dispatcher: in chain mode the parent exits
+# above without ever using MEM_FRACTION_STATIC, while each re-exec'd
+# child hits this block exactly once for its own --cache-mode.
+if [ -n "$L1_SIZE" ]; then
+  if [ "$MEM_FRACTION_EXPLICIT" = true ]; then
+    echo "ERROR: pass either --L1-size (auto mem-fraction) OR --mem-fraction-static, not both" >&2
+    exit 1
+  fi
+  # Helper validates L2 >= L1 and uses L2 only for PROFILE_TARGET math
+  # (which we don't consume here). For none/L1 modes L2 is irrelevant,
+  # so we alias L2 = L1 just to pass validation. For L2/L3_file modes
+  # we need a real --hicache-size.
+  HELPER_L2="$L1_SIZE"
+  if [ "$CACHE_MODE" = "L2" ] || [ "$CACHE_MODE" = "L3_file" ]; then
+    if [ "$HICACHE_SIZE" = "auto" ]; then
+      echo "ERROR: --L1-size with --cache-mode=$CACHE_MODE also requires explicit --hicache-size (no 'auto')" >&2
+      exit 1
+    fi
+    HELPER_L2="$HICACHE_SIZE"
+  fi
+  HELPER="$(dirname "$(readlink -f "$0")")/compute_profile_params.py"
+  [ -f "$HELPER" ] || { echo "ERROR: $HELPER not found" >&2; exit 1; }
+  echo ">>> deriving --mem-fraction-static from --L1-size=${L1_SIZE} (L2-placeholder=${HELPER_L2})"
+  PARAMS=$(python3 "$HELPER" \
+    --model "$MODEL_PATH" \
+    --tp "$TP_SIZE" \
+    --L1-size "$L1_SIZE" \
+    --L2-size "$HELPER_L2" \
+    --num-clients "$NUM_CLIENTS" \
+    --request-length "$REQUEST_LENGTH" 2>&1) || { echo "$PARAMS" >&2; exit 1; }
+  echo "$PARAMS" | grep -E '^(WARN|ERROR)' >&2 || true
+  # Regex needs digits too: PROFILE_TARGET_ROUND_1IDX has a `1` in it.
+  eval "$(echo "$PARAMS" | grep -E '^[A-Z0-9_]+=')"
+  echo "    weights/rank=${WEIGHTS_GB_PER_RANK}GB  HBM/rank=${HBM_GB_PER_RANK}GB"
+  echo "    derived: --mem-fraction-static=${MEM_FRACTION_STATIC}"
 fi
 
 # ============================== Auto-size hicache ==============================
