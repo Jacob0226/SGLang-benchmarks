@@ -111,6 +111,16 @@ MODEL_NAME=$(basename "${MODEL_PATH%/}")
 # ============================== Chain dispatcher ==============================
 # --cache-modes "none L1 L2 L3_file" → re-exec self per mode, pkill+sleep between.
 if [ -n "$CACHE_MODES" ]; then
+  # Pre-create base log dir so we can capture chain dispatcher stdout to it.
+  # Mirrors the single-mode BASE_LOG_DIR computation below (line 219); kept
+  # in sync manually because we need it before any child runs.
+  CHAIN_DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
+  CHAIN_BASE_LOG_DIR="$HOME/SGLang-benchmarks/results/$CHAIN_DOCKER_FILENAME/${MODEL_NAME}-cascade-${TAG}"
+  mkdir -p "$CHAIN_BASE_LOG_DIR"
+  CHAIN_LOG="$CHAIN_BASE_LOG_DIR/chain.log"
+  : > "$CHAIN_LOG"
+  exec > >(tee -a "$CHAIN_LOG") 2>&1
+
   FORWARD_ARGS=()
   i=0
   while [ "$i" -lt "${#ORIG_ARGS[@]}" ]; do
@@ -122,13 +132,16 @@ if [ -n "$CACHE_MODES" ]; then
   for MODE in $CACHE_MODES; do
     echo ""
     echo ">>> ============================================================"
-    echo ">>> chain: starting cache_mode=${MODE}"
+    echo ">>> chain: starting cache_mode=${MODE}  (t=$(date +%H:%M:%S))"
     echo ">>> ============================================================"
-    "$0" --cache-mode "$MODE" "${FORWARD_ARGS[@]}"
+    if ! "$0" --cache-mode "$MODE" "${FORWARD_ARGS[@]}"; then
+      rc=$?
+      echo ">>> chain: cache_mode=${MODE} FAILED with exit code ${rc}; continuing to next mode"
+    fi
     pkill -9 sglang 2>/dev/null || true
     sleep 10
   done
-  echo ">>> chain done (${CACHE_MODES})"
+  echo ">>> chain done (${CACHE_MODES})  (t=$(date +%H:%M:%S))"
 
   # Cross-mode summary: combine all per-mode bench_multiturn.jsonl +
   # cache_tiers.csv into a single $BASE_LOG_DIR/cascade_summary.csv. Re-
@@ -181,8 +194,11 @@ if [ -n "$L1_SIZE" ]; then
     --num-clients "$NUM_CLIENTS" \
     --request-length "$REQUEST_LENGTH" 2>&1) || { echo "$PARAMS" >&2; exit 1; }
   echo "$PARAMS" | grep -E '^(WARN|ERROR)' >&2 || true
-  # Regex needs digits too: PROFILE_TARGET_ROUND_1IDX has a `1` in it.
-  eval "$(echo "$PARAMS" | grep -E '^[A-Z0-9_]+=')"
+  # Whitelist only the vars we actually consume below. Helper also prints
+  # NUM_ROUNDS=..., which would silently shadow the user's --num-rounds.
+  # See bench_meta.json mismatch postmortem (cascade-FairCompare_0520).
+  ALLOW='^(MEM_FRACTION_STATIC|PROFILE_TARGET_ROUND_1IDX|WEIGHTS_GB_PER_RANK|HBM_GB_PER_RANK)='
+  eval "$(echo "$PARAMS" | grep -E "$ALLOW")"
   echo "    weights/rank=${WEIGHTS_GB_PER_RANK}GB  HBM/rank=${HBM_GB_PER_RANK}GB"
   echo "    derived: --mem-fraction-static=${MEM_FRACTION_STATIC}"
 fi
@@ -222,6 +238,14 @@ case "$CACHE_MODE" in
   L2|L3_file) LOG_DIR="${BASE_LOG_DIR}/${CACHE_MODE}/size_${HICACHE_SIZE}" ;;
 esac
 mkdir -p "$LOG_DIR"
+
+{
+  printf '%s' "$0"
+  for a in "${ORIG_ARGS[@]}"; do
+    printf ' %q' "$a"
+  done
+  printf '\n'
+} > "$LOG_DIR/cmdline.txt"
 
 META_HICACHE=$([ "$CACHE_MODE" = "none" ] || [ "$CACHE_MODE" = "L1" ] && echo "null" || echo "$HICACHE_SIZE")
 cat > "$LOG_DIR/bench_meta.json" <<EOF
