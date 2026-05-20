@@ -1,0 +1,36 @@
+/sgl-workspace/sglang/python/sglang/launch_server.py:54: UserWarning: 'python -m sglang.launch_server' is still supported, but 'sglang serve' is the recommended entrypoint.
+  Example: sglang serve --model-path <model> [options]
+  warnings.warn(
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] ROCm/HIP JIT runtime not available: Unsupported `flydsl` version: expected `0.1.2`, got `0.1.5.dev504`.. CK and HIP ops are disabled. Triton ops remain available.
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/usr/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/sgl-workspace/sglang/python/sglang/launch_server.py", line 66, in <module>
+    server_args = prepare_server_args(sys.argv[1:])
+  File "/sgl-workspace/sglang/python/sglang/srt/server_args.py", line 7188, in prepare_server_args
+    return ServerArgs.from_cli_args(raw_args)
+  File "/sgl-workspace/sglang/python/sglang/srt/server_args.py", line 6585, in from_cli_args
+    return cls(**{attr: getattr(args, attr) for attr in attrs})
+  File "<string>", line 368, in __init__
+  File "/sgl-workspace/sglang/python/sglang/srt/server_args.py", line 819, in __post_init__
+    self._handle_piecewise_cuda_graph()
+  File "/sgl-workspace/sglang/python/sglang/srt/server_args.py", line 1188, in _handle_piecewise_cuda_graph
+    if self.get_model_config().is_piecewise_cuda_graph_disabled_model:
+  File "/sgl-workspace/sglang/python/sglang/srt/server_args.py", line 6631, in get_model_config
+    from sglang.srt.configs.model_config import ModelConfig
+  File "/sgl-workspace/sglang/python/sglang/srt/configs/model_config.py", line 27, in <module>
+    from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/quantization/__init__.py", line 20, in <module>
+    from sglang.srt.layers.quantization.awq import AWQConfig, AWQCPUConfig, AWQMarlinConfig
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/quantization/awq/__init__.py", line 3, in <module>
+    from .awq import (
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/quantization/awq/awq.py", line 24, in <module>
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/quantization/unquant.py", line 56, in <module>
+    from aiter.fused_moe import fused_moe
+  File "/sgl-workspace/aiter/aiter/fused_moe.py", line 572, in <module>
+    (ActivationType.Silu,          QuantType.No,  dtypes.bf16,   dtypes.bf16,   dtypes.bf16,   False,   False) : aiter.fmoe,
+AttributeError: module 'aiter' has no attribute 'fmoe'

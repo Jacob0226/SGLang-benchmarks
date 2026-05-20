@@ -1,0 +1,697 @@
++ ulimit -n 65535
++ TP=2
++ LOG_DIR=/home/jacchang/SGLang-benchmarks/results/_pr25742_matrix/v0.5.10.post1-rocm720-mi35x-20260428_TP2
++ MODEL_PATH=/data/huggingface/hub/amd/GLM-5.1-MXFP4
++ HOST=localhost
++ PORT=8552
++ TOKENIZER_WORKER_NUM=4
++ mkdir -p /home/jacchang/SGLang-benchmarks/results/_pr25742_matrix/v0.5.10.post1-rocm720-mi35x-20260428_TP2
++ SERVER_LOG=/home/jacchang/SGLang-benchmarks/results/_pr25742_matrix/v0.5.10.post1-rocm720-mi35x-20260428_TP2/server.log
++ GSM8K_LOG=/home/jacchang/SGLang-benchmarks/results/_pr25742_matrix/v0.5.10.post1-rocm720-mi35x-20260428_TP2/Accuracy_GSM8K.log
++ export SAFETENSORS_FAST_GPU=1
++ SAFETENSORS_FAST_GPU=1
++ export SGLANG_ROCM_FUSED_DECODE_MLA=0
++ SGLANG_ROCM_FUSED_DECODE_MLA=0
++ '[' -d /sgl-workspace/aiter/aiter ']'
++ export PYTHONPATH=/sgl-workspace/aiter:
++ PYTHONPATH=/sgl-workspace/aiter:
++ '[' -d /sgl-workspace/sglang/python/sglang ']'
++ export PYTHONPATH=/sgl-workspace/sglang/python:/sgl-workspace/aiter:
++ PYTHONPATH=/sgl-workspace/sglang/python:/sgl-workspace/aiter:
++ cleanup_sglang
++ pkill -9 -f 'sglang\.launch_server'
++ true
++ pkill -9 -f sglang::scheduler
++ true
++ pkill -9 -f sglang::detokenizer
++ true
++ pkill -9 -f sglang::tokenizer
++ true
++ pkill -9 -f _inductor/compile_worker
++ true
++ sleep 3
+>>> launched sglang server pid=20  (TP=2, log=/home/jacchang/SGLang-benchmarks/results/_pr25742_matrix/v0.5.10.post1-rocm720-mi35x-20260428_TP2/server.log)
++ SERVER_PID=20
++ echo '>>> launched sglang server pid=20  (TP=2, log=/home/jacchang/SGLang-benchmarks/results/_pr25742_matrix/v0.5.10.post1-rocm720-mi35x-20260428_TP2/server.log)'
++ python3 -m sglang.launch_server --model /data/huggingface/hub/amd/GLM-5.1-MXFP4 --tp 2 --host localhost --port 8552 --trust-remote-code --tool-call-parser glm47 --reasoning-parser glm45 --watchdog-timeout 1200 --mem-fraction-static 0.85 --kv-cache-dtype fp8_e4m3 --disable-radix-cache --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' --nsa-prefill-backend tilelang --nsa-decode-backend tilelang --tokenizer-worker-num 4
+++ date +%s
++ start_ts=1779265865
++ last_progress=0
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265865
++ ((  now - last_progress >= 30  ))
++ echo '... waiting (elapsed 0s, last code=000000)'
++ last_progress=1779265865
++ sleep 5
+... waiting (elapsed 0s, last code=000000)
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265870
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265875
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265880
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265885
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265890
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265895
++ ((  now - last_progress >= 30  ))
++ echo '... waiting (elapsed 30s, last code=000000)'
++ last_progress=1779265895
++ sleep 5
+... waiting (elapsed 30s, last code=000000)
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265900
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265905
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265910
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265915
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265920
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265925
++ ((  now - last_progress >= 30  ))
++ echo '... waiting (elapsed 60s, last code=000000)'
++ last_progress=1779265925
++ sleep 5
+... waiting (elapsed 60s, last code=000000)
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265930
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265935
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265940
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265945
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265950
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265955
++ ((  now - last_progress >= 30  ))
++ echo '... waiting (elapsed 90s, last code=000000)'
++ last_progress=1779265955
++ sleep 5
+... waiting (elapsed 90s, last code=000000)
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265960
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265965
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265970
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265975
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265980
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265985
++ ((  now - last_progress >= 30  ))
++ echo '... waiting (elapsed 120s, last code=000000)'
++ last_progress=1779265985
++ sleep 5
+... waiting (elapsed 120s, last code=000000)
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265990
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779265995
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266000
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266005
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266010
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266015
++ ((  now - last_progress >= 30  ))
++ echo '... waiting (elapsed 150s, last code=000000)'
++ last_progress=1779266015
++ sleep 5
+... waiting (elapsed 150s, last code=000000)
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266020
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266025
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266030
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266035
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266040
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266045
++ ((  now - last_progress >= 30  ))
++ echo '... waiting (elapsed 180s, last code=000000)'
++ last_progress=1779266045
++ sleep 5
+... waiting (elapsed 180s, last code=000000)
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266050
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266055
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266060
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266065
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266070
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266075
++ ((  now - last_progress >= 30  ))
++ echo '... waiting (elapsed 210s, last code=000000)'
++ last_progress=1779266075
++ sleep 5
+... waiting (elapsed 210s, last code=000000)
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266080
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266085
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266090
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266095
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266100
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
+... waiting (elapsed 240s, last code=000000)
++ now=1779266105
++ ((  now - last_progress >= 30  ))
++ echo '... waiting (elapsed 240s, last code=000000)'
++ last_progress=1779266105
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266110
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266115
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266120
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266125
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266130
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266135
++ ((  now - last_progress >= 30  ))
++ echo '... waiting (elapsed 270s, last code=000000)'
++ last_progress=1779266135
++ sleep 5
+... waiting (elapsed 270s, last code=000000)
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266140
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
+++ echo 000
++ code=000000
++ '[' 000000 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266145
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
++ code=503
++ '[' 503 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266150
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
++ code=503
++ '[' 503 = 200 ']'
++ kill -0 20
+++ date +%s
++ now=1779266155
++ ((  now - last_progress >= 30  ))
++ sleep 5
++ true
+++ curl -s -o /dev/null -w '%{http_code}' http://localhost:8552/health
++ code=200
++ '[' 200 = 200 ']'
+++ date +%s
+>>> server healthy after 296s
+>>> running GSM8K bench_sglang.py ...
++ echo '>>> server healthy after 296s'
++ break
++ echo '>>> running GSM8K bench_sglang.py ...'
++ echo '>>>Executing command:'
++ echo 'python3 /sgl-workspace/sglang/benchmark/gsm8k/bench_sglang.py --port 8552 --num-questions 1200 --parallel 1200'
++ echo ---
++ python3 /sgl-workspace/sglang/benchmark/gsm8k/bench_sglang.py --port 8552 --num-questions 1200 --parallel 1200
++ tee -a /home/jacchang/SGLang-benchmarks/results/_pr25742_matrix/v0.5.10.post1-rocm720-mi35x-20260428_TP2/Accuracy_GSM8K.log
+Downloading from https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl to /tmp/test.jsonl
+/tmp/test.jsonl:   0%|          | 0.00/237k [00:00<?, ?B/s]/tmp/test.jsonl: 732kB [00:00, 9.43MB/s]                   
+  0%|          | 0/1200 [00:00<?, ?it/s]  0%|          | 1/1200 [00:59<19:48:32, 59.48s/it]  0%|          | 2/1200 [01:00<8:19:41, 25.03s/it]   0%|          | 3/1200 [01:00<4:32:34, 13.66s/it]  0%|          | 4/1200 [01:00<2:45:56,  8.32s/it]  1%|          | 7/1200 [01:01<1:03:14,  3.18s/it]  1%|          | 11/1200 [01:01<29:48,  1.50s/it]   1%|▏         | 16/1200 [01:01<15:59,  1.23it/s]  1%|▏         | 17/1200 [01:01<09:23,  2.10it/s]  2%|▏         | 21/1200 [01:02<07:58,  2.47it/s]  2%|▏         | 26/1200 [01:03<05:50,  3.35it/s]  2%|▏         | 29/1200 [01:03<05:20,  3.66it/s]  3%|▎         | 33/1200 [01:04<04:17,  4.54it/s]  3%|▎         | 38/1200 [01:04<03:24,  5.68it/s]  3%|▎         | 41/1200 [01:05<03:29,  5.53it/s]  4%|▎         | 42/1200 [01:05<04:03,  4.75it/s]  4%|▍         | 47/1200 [01:05<02:47,  6.90it/s]  4%|▍         | 54/1200 [01:06<02:07,  8.98it/s]  5%|▍         | 59/1200 [01:07<02:19,  8.20it/s]  5%|▌         | 62/1200 [01:07<02:35,  7.32it/s]  6%|▌         | 69/1200 [01:08<02:03,  9.19it/s]  6%|▋         | 76/1200 [01:08<01:55,  9.74it/s]  7%|▋         | 81/1200 [01:09<02:08,  8.74it/s]  7%|▋         | 88/1200 [01:10<01:58,  9.37it/s]  8%|▊         | 90/1200 [01:10<01:48, 10.27it/s]  8%|▊         | 97/1200 [01:10<01:49, 10.11it/s]  8%|▊         | 101/1200 [01:11<02:16,  8.07it/s]  9%|▊         | 103/1200 [01:12<02:33,  7.15it/s] 10%|▉         | 116/1200 [01:12<01:28, 12.24it/s] 10%|█         | 120/1200 [01:13<02:05,  8.64it/s] 11%|█         | 130/1200 [01:14<01:41, 10.49it/s] 12%|█▏        | 138/1200 [01:15<01:46, 10.00it/s] 12%|█▏        | 144/1200 [01:16<01:55,  9.15it/s] 12%|█▏        | 148/1200 [01:16<02:09,  8.13it/s] 13%|█▎        | 155/1200 [01:17<01:50,  9.44it/s] 14%|█▎        | 163/1200 [01:18<01:44,  9.93it/s] 14%|█▍        | 172/1200 [01:18<01:39, 10.37it/s] 14%|█▍        | 174/1200 [01:18<01:32, 11.06it/s] 15%|█▌        | 180/1200 [01:19<01:45,  9.66it/s] 15%|█▌        | 183/1200 [01:20<02:09,  7.86it/s] 16%|█▌        | 189/1200 [01:21<01:55,  8.78it/s] 16%|█▋        | 197/1200 [01:21<01:42,  9.80it/s] 17%|█▋        | 202/1200 [01:22<01:55,  8.62it/s] 17%|█▋        | 204/1200 [01:23<02:20,  7.07it/s] 17%|█▋        | 209/1200 [01:23<01:58,  8.37it/s] 18%|█▊        | 211/1200 [01:23<01:37, 10.17it/s] 18%|█▊        | 217/1200 [01:24<01:35, 10.27it/s] 19%|█▉        | 228/1200 [01:24<01:23, 11.64it/s] 19%|█▉        | 233/1200 [01:25<01:49,  8.81it/s] 20%|█▉        | 239/1200 [01:26<01:47,  8.94it/s] 21%|██        | 248/1200 [01:27<01:32, 10.32it/s] 21%|██▏       | 255/1200 [01:28<01:37,  9.74it/s] 22%|██▏       | 263/1200 [01:28<01:35,  9.77it/s] 22%|██▎       | 270/1200 [01:29<01:38,  9.41it/s] 23%|██▎       | 272/1200 [01:30<02:03,  7.52it/s] 23%|██▎       | 278/1200 [01:30<01:44,  8.81it/s] 24%|██▎       | 283/1200 [01:31<01:48,  8.48it/s] 24%|██▍       | 285/1200 [01:31<01:45,  8.70it/s] 24%|██▍       | 286/1200 [01:32<02:15,  6.74it/s] 25%|██▍       | 296/1200 [01:32<01:25, 10.52it/s] 25%|██▌       | 300/1200 [01:33<01:55,  7.82it/s] 25%|██▌       | 302/1200 [01:33<02:16,  6.59it/s] 25%|██▌       | 303/1200 [01:33<02:16,  6.59it/s] 26%|██▌       | 311/1200 [01:34<01:52,  7.88it/s] 26%|██▋       | 318/1200 [01:34<01:55,  7.64it/s] 27%|██▋       | 327/1200 [01:35<01:41,  8.64it/s] 27%|██▋       | 328/1200 [01:35<01:29,  9.71it/s] 28%|██▊       | 335/1200 [01:36<01:38,  8.75it/s] 28%|██▊       | 342/1200 [01:37<01:38,  8.71it/s] 29%|██▉       | 348/1200 [01:38<01:42,  8.35it/s] 30%|██▉       | 354/1200 [01:38<01:38,  8.57it/s] 30%|██▉       | 357/1200 [01:39<01:53,  7.46it/s] 30%|███       | 360/1200 [01:40<01:56,  7.19it/s] 31%|███       | 369/1200 [01:40<01:21, 10.22it/s] 31%|███       | 371/1200 [01:40<01:02, 13.36it/s] 32%|███▏      | 380/1200 [01:41<01:05, 12.54it/s] 32%|███▏      | 389/1200 [01:42<01:13, 10.96it/s] 33%|███▎      | 395/1200 [01:43<01:27,  9.24it/s] 33%|███▎      | 401/1200 [01:44<01:29,  8.94it/s] 34%|███▍      | 406/1200 [01:44<01:32,  8.60it/s] 34%|███▍      | 407/1200 [01:44<01:30,  8.76it/s] 34%|███▍      | 409/1200 [01:45<01:53,  6.96it/s] 35%|███▍      | 416/1200 [01:45<01:30,  8.69it/s] 35%|███▌      | 421/1200 [01:46<01:36,  8.08it/s] 36%|███▌      | 429/1200 [01:47<01:19,  9.74it/s] 36%|███▌      | 434/1200 [01:47<01:30,  8.50it/s] 36%|███▋      | 438/1200 [01:48<01:37,  7.82it/s] 37%|███▋      | 444/1200 [01:49<01:25,  8.86it/s] 37%|███▋      | 447/1200 [01:49<01:39,  7.54it/s] 38%|███▊      | 454/1200 [01:50<01:20,  9.21it/s] 38%|███▊      | 462/1200 [01:50<01:12, 10.20it/s] 39%|███▉      | 467/1200 [01:51<01:23,  8.78it/s] 39%|███▉      | 473/1200 [01:52<01:21,  8.93it/s] 40%|███▉      | 477/1200 [01:52<01:29,  8.10it/s] 40%|███▉      | 478/1200 [01:52<01:30,  7.97it/s] 40%|████      | 482/1200 [01:53<01:39,  7.23it/s] 41%|████      | 490/1200 [01:54<01:19,  8.94it/s] 41%|████      | 494/1200 [01:54<01:32,  7.62it/s] 42%|████▏     | 499/1200 [01:55<01:28,  7.90it/s] 42%|████▏     | 508/1200 [01:56<01:08, 10.13it/s] 43%|████▎     | 513/1200 [01:56<01:19,  8.68it/s] 43%|████▎     | 514/1200 [01:56<01:23,  8.23it/s] 43%|████▎     | 516/1200 [01:57<01:28,  7.77it/s] 43%|████▎     | 521/1200 [01:57<01:06, 10.25it/s] 44%|████▎     | 522/1200 [01:57<00:48, 13.91it/s] 44%|████▍     | 528/1200 [01:57<00:37, 17.88it/s] 45%|████▍     | 538/1200 [01:57<00:24, 26.72it/s] 46%|████▌     | 547/1200 [01:57<00:19, 33.90it/s] 46%|████▋     | 555/1200 [01:57<00:16, 38.94it/s] 47%|████▋     | 561/1200 [01:58<00:16, 39.83it/s] 47%|████▋     | 562/1200 [01:58<00:15, 42.33it/s] 47%|████▋     | 568/1200 [01:58<00:32, 19.53it/s] 48%|████▊     | 573/1200 [01:58<00:27, 22.51it/s] 48%|████▊     | 581/1200 [01:58<00:20, 29.55it/s] 49%|████▉     | 586/1200 [01:59<00:19, 31.57it/s] 50%|████▉     | 595/1200 [01:59<00:14, 40.45it/s] 50%|█████     | 601/1200 [01:59<00:14, 42.41it/s] 51%|█████     | 607/1200 [01:59<00:13, 43.97it/s] 52%|█████▏    | 619/1200 [01:59<00:09, 58.66it/s] 52%|█████▏    | 627/1200 [01:59<00:09, 60.54it/s] 53%|█████▎    | 637/1200 [01:59<00:08, 66.65it/s] 54%|█████▍    | 645/1200 [01:59<00:08, 66.42it/s] 54%|█████▍    | 646/1200 [01:59<00:08, 68.60it/s] 55%|█████▍    | 654/1200 [02:00<00:24, 22.42it/s] 56%|█████▌    | 666/1200 [02:01<00:16, 31.63it/s] 56%|█████▌    | 674/1200 [02:01<00:14, 36.55it/s] 57%|█████▋    | 681/1200 [02:01<00:13, 39.82it/s] 57%|█████▋    | 688/1200 [02:01<00:11, 43.68it/s] 58%|█████▊    | 696/1200 [02:01<00:10, 46.49it/s] 58%|█████▊    | 697/1200 [02:01<00:09, 50.50it/s] 59%|█████▉    | 706/1200 [02:01<00:09, 54.03it/s] 60%|█████▉    | 714/1200 [02:01<00:08, 57.07it/s] 60%|██████    | 721/1200 [02:01<00:08, 57.08it/s] 61%|██████    | 729/1200 [02:02<00:07, 59.91it/s] 61%|██████▏   | 737/1200 [02:02<00:07, 61.89it/s] 62%|██████▎   | 750/1200 [02:02<00:05, 75.84it/s] 63%|██████▎   | 758/1200 [02:02<00:06, 73.29it/s] 64%|██████▍   | 766/1200 [02:02<00:05, 72.36it/s] 64%|██████▍   | 774/1200 [02:02<00:07, 55.43it/s] 66%|██████▌   | 786/1200 [02:02<00:06, 67.45it/s] 66%|██████▌   | 794/1200 [02:02<00:05, 68.43it/s] 67%|██████▋   | 802/1200 [02:03<00:05, 69.39it/s] 68%|██████▊   | 810/1200 [02:03<00:05, 69.70it/s] 68%|██████▊   | 818/1200 [02:03<00:06, 55.49it/s] 69%|██████▉   | 825/1200 [02:03<00:06, 57.59it/s] 69%|██████▉   | 832/1200 [02:03<00:06, 59.91it/s] 70%|██████▉   | 839/1200 [02:03<00:07, 49.20it/s] 71%|███████   | 847/1200 [02:03<00:06, 55.74it/s] 71%|███████▏  | 855/1200 [02:04<00:05, 61.11it/s] 72%|███████▏  | 866/1200 [02:04<00:04, 73.13it/s] 73%|███████▎  | 874/1200 [02:04<00:05, 59.09it/s] 73%|███████▎  | 881/1200 [02:04<00:05, 61.50it/s] 74%|███████▍  | 888/1200 [02:04<00:06, 51.25it/s] 74%|███████▍  | 889/1200 [02:04<00:06, 47.36it/s] 75%|███████▍  | 898/1200 [02:04<00:06, 45.10it/s] 76%|███████▌  | 911/1200 [02:05<00:05, 52.09it/s] 76%|███████▌  | 912/1200 [02:05<00:04, 58.24it/s] 77%|███████▋  | 921/1200 [02:05<00:05, 53.29it/s] 78%|███████▊  | 931/1200 [02:05<00:05, 53.30it/s] 78%|███████▊  | 940/1200 [02:05<00:05, 51.92it/s] 79%|███████▉  | 947/1200 [02:05<00:05, 47.75it/s] 80%|███████▉  | 954/1200 [02:05<00:05, 45.24it/s] 80%|████████  | 966/1200 [02:06<00:04, 52.25it/s] 81%|████████▏ | 976/1200 [02:06<00:04, 53.99it/s] 82%|████████▏ | 986/1200 [02:06<00:03, 55.53it/s] 83%|████████▎ | 993/1200 [02:06<00:04, 51.67it/s] 83%|████████▎ | 994/1200 [02:06<00:04, 50.64it/s] 83%|████████▎ | 1000/1200 [02:06<00:04, 46.53it/s] 84%|████████▍ | 1008/1200 [02:06<00:04, 47.25it/s] 85%|████████▍ | 1017/1200 [02:07<00:03, 50.01it/s] 85%|████████▌ | 1023/1200 [02:07<00:04, 40.98it/s] 85%|████████▌ | 1024/1200 [02:07<00:04, 37.24it/s] 86%|████████▌ | 1034/1200 [02:07<00:03, 42.66it/s] 87%|████████▋ | 1040/1200 [02:07<00:03, 41.85it/s] 87%|████████▋ | 1049/1200 [02:07<00:03, 46.81it/s] 88%|████████▊ | 1054/1200 [02:07<00:03, 43.54it/s] 88%|████████▊ | 1060/1200 [02:08<00:03, 43.05it/s] 89%|████████▉ | 1065/1200 [02:08<00:03, 40.78it/s] 89%|████████▉ | 1070/1200 [02:08<00:03, 34.36it/s] 90%|████████▉ | 1074/1200 [02:08<00:03, 33.38it/s] 90%|█████████ | 1081/1200 [02:08<00:03, 39.27it/s] 90%|█████████ | 1082/1200 [02:08<00:02, 46.04it/s] 91%|█████████ | 1088/1200 [02:08<00:02, 47.20it/s] 91%|█████████▏| 1095/1200 [02:08<00:02, 50.36it/s] 92%|█████████▏| 1101/1200 [02:09<00:01, 50.59it/s] 92%|█████████▏| 1107/1200 [02:09<00:02, 39.97it/s] 93%|█████████▎| 1114/1200 [02:09<00:01, 45.38it/s] 93%|█████████▎| 1121/1200 [02:09<00:01, 50.06it/s] 94%|█████████▍| 1127/1200 [02:09<00:01, 41.04it/s] 94%|█████████▍| 1132/1200 [02:10<00:02, 29.41it/s] 95%|█████████▌| 1141/1200 [02:10<00:01, 36.78it/s] 95%|█████████▌| 1142/1200 [02:10<00:01, 44.44it/s] 96%|█████████▌| 1148/1200 [02:10<00:01, 40.30it/s] 96%|█████████▌| 1153/1200 [02:10<00:01, 36.34it/s] 96%|█████████▋| 1157/1200 [02:10<00:01, 32.34it/s] 97%|█████████▋| 1161/1200 [02:10<00:01, 29.61it/s] 97%|█████████▋| 1165/1200 [02:11<00:01, 24.52it/s] 97%|█████████▋| 1168/1200 [02:11<00:01, 24.37it/s] 98%|█████████▊| 1171/1200 [02:11<00:01, 24.47it/s] 98%|█████████▊| 1174/1200 [02:11<00:01, 15.21it/s] 98%|█████████▊| 1177/1200 [02:11<00:01, 16.20it/s] 98%|█████████▊| 1179/1200 [02:12<00:01, 16.58it/s] 98%|█████████▊| 1181/1200 [02:12<00:01, 13.22it/s] 99%|█████████▉| 1185/1200 [02:12<00:00, 15.85it/s] 99%|█████████▉| 1186/1200 [02:12<00:00, 19.44it/s] 99%|█████████▉| 1189/1200 [02:13<00:00, 12.30it/s] 99%|█████████▉| 1191/1200 [02:13<00:00, 10.98it/s] 99%|█████████▉| 1193/1200 [02:13<00:00,  8.97it/s]100%|█████████▉| 1195/1200 [02:13<00:00,  9.69it/s]100%|█████████▉| 1197/1200 [02:14<00:00,  7.73it/s]100%|█████████▉| 1198/1200 [02:14<00:00,  7.71it/s]100%|█████████▉| 1199/1200 [02:14<00:00,  7.23it/s]100%|██████████| 1200/1200 [02:16<00:00,  1.83it/s]100%|██████████| 1200/1200 [02:16<00:00,  8.78it/s]
+Accuracy: 0.932
+Invalid: 0.002
+Latency: 136.698 s
+Output throughput: 934.681 token/s
++ echo '>>> killing server ...'
++ kill -9 20
+>>> killing server ...
++ cleanup_sglang
++ pkill -9 -f 'sglang\.launch_server'
++ true
++ pkill -9 -f sglang::scheduler
++ pkill -9 -f sglang::detokenizer
++ pkill -9 -f sglang::tokenizer
++ pkill -9 -f _inductor/compile_worker
++ sleep 3
+/home/jacchang/SGLang-benchmarks/repro_pr25742_acc_matrix.sh: line 62:    20 Killed                  python3 -m sglang.launch_server --model "$MODEL_PATH" --tp "$TP" --host "$HOST" --port "$PORT" --trust-remote-code --tool-call-parser glm47 --reasoning-parser glm45 --watchdog-timeout 1200 --mem-fraction-static 0.85 --kv-cache-dtype fp8_e4m3 --disable-radix-cache --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' --nsa-prefill-backend tilelang --nsa-decode-backend tilelang --tokenizer-worker-num "$TOKENIZER_WORKER_NUM" > "$SERVER_LOG" 2>&1
+DONE TP=2 log=/home/jacchang/SGLang-benchmarks/results/_pr25742_matrix/v0.5.10.post1-rocm720-mi35x-20260428_TP2
++ echo 'DONE TP=2 log=/home/jacchang/SGLang-benchmarks/results/_pr25742_matrix/v0.5.10.post1-rocm720-mi35x-20260428_TP2'
++ grep -E 'Accuracy:|Invalid:|Latency:' /home/jacchang/SGLang-benchmarks/results/_pr25742_matrix/v0.5.10.post1-rocm720-mi35x-20260428_TP2/Accuracy_GSM8K.log
+Accuracy: 0.932
+Invalid: 0.002
+Latency: 136.698 s

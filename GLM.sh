@@ -23,6 +23,9 @@ MTP_ENABLED="false"
 PROF_ENABLED="false"
 PROF_COMBINED="false"   # if true: single combined trace (no --profile-by-stage)
 DUAL_STREAM_ROCM="false"
+ACCURACY_ONLY="false"   # if true: skip warmup+run_benchmarks, only run accuracy_test (gsm8k)
+LM_EVAL_ENABLED="false" # if true: also run lm-eval-harness gsm8k via /v1/chat/completions
+MATCH_PR_ARGS=()        # populated by --match-pr to mirror sglang issue #25742 launch flags
 MTP_TAG=""
 USER_TAG=""
 # TP_SIZE="auto" means: pick from MODEL_NAME after --model is parsed.
@@ -55,6 +58,24 @@ while [[ $# -gt 0 ]]; do
         ;;
     --dual-stream-rocm)
         DUAL_STREAM_ROCM="true"
+        shift 1
+        ;;
+    --accuracy-only)
+        ACCURACY_ONLY="true"
+        shift 1
+        ;;
+    --match-pr)
+        # Mirror the launch flags from sglang issue #25742 that aren't in
+        # GLM.sh's defaults (TP is left to the user to set via --tp 2).
+        MATCH_PR_ARGS=(--cuda-graph-max-bs 256 --context-length 9472)
+        shift 1
+        ;;
+    --lm-eval)
+        # Also run lm-eval-harness gsm8k (5-shot, generate-until,
+        # local-chat-completions + apply_chat_template) — this is the eval
+        # path used by sglang issue #25742 (and InferenceX). Requires
+        # `pip install lm-eval` inside the container.
+        LM_EVAL_ENABLED="true"
         shift 1
         ;;
     --model)
@@ -132,7 +153,7 @@ esac
 # InferenceMax tuning (from InferenceX/glm5_fp8_mi355x.sh)
 export SAFETENSORS_FAST_GPU=1
 export SGLANG_ROCM_FUSED_DECODE_MLA=0
-export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
+# export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
 # export AITER_ONLINE_TUNE=1
 HOST="localhost"
 PORT="8552"
@@ -391,6 +412,10 @@ start_server() {
         cmd+=("${EXTRA_SERVER_ARGS[@]}")
     fi
 
+    if [ ${#MATCH_PR_ARGS[@]} -gt 0 ]; then
+        cmd+=("${MATCH_PR_ARGS[@]}")
+    fi
+
     # Start server in background
     echo ">>> Executing command:" | tee -a "$logfile"
     echo "${cmd[*]}" | tee -a "$logfile"
@@ -423,7 +448,7 @@ warmup() {
 }
 
 accuracy_test() {
-    # GSM8K
+    # GSM8K via sglang's native bench (no chat template, sgl-DSL prompts).
     gsm8k_logfile=$LOG_DIR/Accuracy_GSM8K.log
     if ! grep -q "$gsm8k_logfile" "$FINISH_LOG"; then
         echo ">>> Running Accuracy check (GSM8K)..."
@@ -437,6 +462,38 @@ accuracy_test() {
         echo "$gsm8k_logfile" >> "$FINISH_LOG"
     else
         echo "Found Accuracy_GSM8K.log in ${FINISH_LOG}. Skipping."
+    fi
+
+    # GSM8K via lm-eval-harness over /v1/chat/completions + chat template.
+    # This is the eval path used by sglang issue #25742 (and InferenceX);
+    # the prompts go through the chat template, so the result is not
+    # directly comparable to bench_sglang.py above.
+    if [ "$LM_EVAL_ENABLED" == "true" ]; then
+        lm_eval_logfile=$LOG_DIR/Accuracy_GSM8K_lm_eval.log
+        lm_eval_outdir=$LOG_DIR/lm_eval_out
+        if ! grep -q "$lm_eval_logfile" "$FINISH_LOG"; then
+            echo ">>> Running Accuracy check (GSM8K via lm-eval-harness)..."
+            mkdir -p "$lm_eval_outdir"
+            lm_eval_cmd=(
+                python3 -m lm_eval --model local-chat-completions --apply_chat_template
+                --tasks gsm8k --output_path "$lm_eval_outdir" --log_samples
+                --model_args "model=${MODEL_PATH},base_url=http://${HOST}:${PORT}/v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=64,timeout=1800,tokenized_requests=False,max_length=9472"
+                --gen_kwargs "max_tokens=5376,temperature=0,top_p=1"
+            )
+            # Don't let lm_eval failures (missing deps, transient API errors)
+            # tear down the whole script via set -euo pipefail. Disable
+            # errexit/pipefail just for this call, log the rc, then restore.
+            set +e +o pipefail
+            log_command "$lm_eval_logfile" "${lm_eval_cmd[@]}"
+            local lm_eval_rc=$?
+            set -eo pipefail
+            if [ "$lm_eval_rc" -ne 0 ]; then
+                echo "[lm_eval] WARN: exited with rc=${lm_eval_rc}. See ${lm_eval_logfile}." | tee -a "$lm_eval_logfile"
+            fi
+            echo "$lm_eval_logfile" >> "$FINISH_LOG"
+        else
+            echo "Found Accuracy_GSM8K_lm_eval.log in ${FINISH_LOG}. Skipping."
+        fi
     fi
 }
 
@@ -543,14 +600,27 @@ for PROF_MODE in "${PROF_SERVER_MODES[@]}"; do
 
     echo ">>> [${PROF_MODE}] Starting server and benchmarks..."
     start_server
-    warmup
-    if [ "$PROF_MODE" == "default" ]; then
+    if [ "$ACCURACY_ONLY" == "true" ]; then
+        echo ">>> [${PROF_MODE}] --accuracy-only: skipping warmup and run_benchmarks."
         accuracy_test
+    else
+        warmup
+        if [ "$PROF_MODE" == "default" ]; then
+            accuracy_test
+        fi
+        run_benchmarks
     fi
-    run_benchmarks
 
-    pkill -9 python || true
-    pkill -f sglang || true
+    # Kill only sglang server processes. Avoid bare `pkill -f sglang`
+    # because it matches anything with "sglang" in its cmdline — including
+    # this script (when --docker lmsysorg/sglang-rocm:... is in argv) and
+    # any wrapper that chained us via &&, which would prevent the next
+    # invocation in a chain from starting.
+    pkill -9 -f "sglang\.launch_server" || true
+    pkill -9 -f "sglang::scheduler"   || true
+    pkill -9 -f "sglang::detokenizer" || true
+    pkill -9 -f "sglang::tokenizer"   || true
+    pkill -9 -f "_inductor/compile_worker" || true
     sleep 10
 done
 
