@@ -113,7 +113,7 @@ Common opts:
   --num-clients N              (default 300)
   --request-length N           (default 4096)
   --num-profile-steps K        (default 5) torch.profiler --num-steps
-  --output-dir DIR             default ~/SGLang-benchmarks/profiles/<tag>
+  --output-dir DIR             default ~/SGLang-benchmarks/results/<docker>/<model>-cascade-profile-<tag>
 EOF
       exit 0
       ;;
@@ -144,7 +144,9 @@ case "$VENDOR" in
 esac
 
 # ============================== Output dir ==============================
-[ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="$HOME/SGLang-benchmarks/profiles/${TAG}"
+MODEL_NAME=$(basename "${MODEL_PATH%/}")
+DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
+[ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}-cascade-profile-${TAG}"
 mkdir -p "$OUTPUT_DIR"
 echo ">>> profile output dir: $OUTPUT_DIR"
 
@@ -191,6 +193,64 @@ metric_baseline_count() {
         /^sglang:num_requests_total[^_]/        { f += $NF }
         /^sglang:num_aborted_requests_total/    { a += $NF }
         END { printf "%d\n", f + a }'
+}
+
+list_profiler_dirs() {
+  # torch.profiler creates one timestamp-named child dir under OUTPUT_DIR.
+  # Rename it after capture so artifacts are stable and meaningful.
+  find "$OUTPUT_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+    | awk '/^[0-9]+([.][0-9]+)?$/ { print }' || true
+}
+
+rename_profiler_dir() {
+  local before_dirs="$1"
+  local after_dirs="$2"
+  local new_dirs
+  local src_dir
+  local src_dir_path
+  local target_dir_name
+  local target_dir_path
+  local suffix=2
+
+  new_dirs=$(comm -13 <(printf '%s\n' "$before_dirs" | sort) <(printf '%s\n' "$after_dirs" | sort))
+  if [ -z "$new_dirs" ]; then
+    echo ">>> no new timestamp profiler directory found under $OUTPUT_DIR"
+    return 0
+  fi
+
+  src_dir=$(printf '%s\n' "$new_dirs" | tail -n 1)
+  src_dir_path="$OUTPUT_DIR/$src_dir"
+  target_dir_name="L1-${L1_SIZE}GB_L2-${L2_SIZE}GB-Client${NUM_CLIENTS}-ReqLen${REQUEST_LENGTH}"
+  target_dir_path="$OUTPUT_DIR/$target_dir_name"
+
+  while [ -e "$target_dir_path" ] && [ "$target_dir_path" != "$src_dir_path" ]; do
+    target_dir_path="$OUTPUT_DIR/${target_dir_name}_retry${suffix}"
+    suffix=$((suffix + 1))
+  done
+
+  if [ "$src_dir_path" != "$target_dir_path" ]; then
+    mv "$src_dir_path" "$target_dir_path"
+    echo ">>> renamed profiler dir: $src_dir -> $(basename "$target_dir_path")"
+  fi
+
+  rename_trace_files "$target_dir_path"
+}
+
+rename_trace_files() {
+  local profile_dir="$1"
+  local trace_file
+  local filename
+  local new_name
+
+  for trace_file in "$profile_dir"/*-TP-*.trace.json.gz; do
+    [ -f "$trace_file" ] || continue
+    filename=$(basename "$trace_file")
+    new_name=$(sed -E 's/-[0-9]+([.][0-9]+)?-TP-/-TP-/' <<< "$filename")
+    if [ "$new_name" != "$filename" ]; then
+      mv "$trace_file" "$profile_dir/$new_name"
+      echo ">>> renamed trace: $filename -> $new_name"
+    fi
+  done
 }
 
 cleanup() {
@@ -322,7 +382,10 @@ export SGLANG_TORCH_PROFILER_DIR="$OUTPUT_DIR"
 
 echo ">>> calling sglang.profiler (blocks until ${NUM_PROFILE_STEPS} prefill+decode steps captured)"
 echo "    args: ${PROFILER_ARGS[*]}"
+PROFILE_DIRS_BEFORE=$(list_profiler_dirs)
 python3 -m sglang.profiler "${PROFILER_ARGS[@]}" 2>&1 | tee "$OUTPUT_DIR/profiler.log"
+PROFILE_DIRS_AFTER=$(list_profiler_dirs)
+rename_profiler_dir "$PROFILE_DIRS_BEFORE" "$PROFILE_DIRS_AFTER"
 
 echo ">>> profiler returned; waiting for cascade to finish remaining rounds"
 wait "$CASCADE_PID" 2>/dev/null || true
