@@ -1,0 +1,5 @@
+case,method,page_size,gsm8k_accuracy
+page1_fp8off,SGLANG_AITER_FP8_PREFILL_ATTN=0,1,0.947
+page1_pr25556,PR25556,1,0.942
+page64_fp8off,SGLANG_AITER_FP8_PREFILL_ATTN=0,64,0.952
+page64_pr25556,PR25556,64,0.944

@@ -1,0 +1,3 @@
+page_size,metric,conc_4,conc_16,conc_64,conc_256
+1,PR25556_vs_fp8off_pct,-1.62%,-17.83%,24.11%,-5.27%
+64,PR25556_vs_fp8off_pct,-1.78%,-19.29%,-8.90%,-3.45%
