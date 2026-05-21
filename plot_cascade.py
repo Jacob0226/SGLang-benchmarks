@@ -111,14 +111,14 @@ CACHE_MODE_ORDER = [
 ]
 CACHE_MODE_LABEL = {
     "no_cache":         "no cache",
-    "L1":               "L1 (GPU radix)",
+    "L1":               "L1",
     "L2":               "L1+L2",
     "L3_file":          "L1+L2+L3 (file)",
     "L3_hf3fs":         "L1+L2+L3 (hf3fs)",
     "L3_mooncake":      "L1+L2+L3 (Mooncake)",
     # Legacy aliases:
     "no_radix":         "no cache",
-    "radix":            "L1 (GPU radix)",
+    "radix":            "L1",
     "hicache":          "L1+L2",
     "hicache_file":     "L1+L2+L3 (file)",
     "hicache_hf3fs":    "L1+L2+L3 (hf3fs)",
@@ -522,16 +522,18 @@ def plot_cascade(runs: list[dict], out_path: Path,
                                  color=line_color, fontsize=8, va="top", ha="left", alpha=0.95)
 
         mode_label = CACHE_MODE_LABEL.get(r["cache_mode"], r["cache_mode"])
-        # Size suffix only on L2: that's the GB number that actually describes
-        # the *L2 host pool*. For L3_file the same number is still the L2
-        # host pool (the path is .../L3file_L2_size_<HICACHE_SIZE>/, or
-        # legacy .../L3_file/size_<HICACHE_SIZE>/), but writing
-        # "L1+L2+L3 (file) (320 GB)" misleadingly reads as "L3 has 320 GB
-        # capacity" so we drop it for L3.
-        if r["cache_mode"] == "L2" and r["size"] is not None:
+        # Show per-tier GB only where the number is semantically clear:
+        # - L1 / radix: use measured KV pool size from fill_thresholds.l1_gib.
+        # - L2: use parsed L2 host pool size from directory naming.
+        # - L3 modes: keep unsuffixed (the parsed size there is still L2 pool).
+        size_suffix = ""
+        if r["cache_mode"] in {"L1", "radix"}:
+            thr = r.get("fill_thresholds") or {}
+            l1_gib = thr.get("l1_gib")
+            if l1_gib:
+                size_suffix = f" ({l1_gib:.0f} GB)"
+        elif r["cache_mode"] == "L2" and r["size"] is not None:
             size_suffix = f" ({r['size']} GB)"
-        else:
-            size_suffix = ""
         label = f"[{r['tag']}] {mode_label}{size_suffix}".strip()
 
         ax_ttft.plot(rounds, r["ttft"], label=label,
@@ -692,6 +694,77 @@ def extract_model_display(cascade_dir: Path, override: str | None = None) -> str
     return MODEL_DISPLAY_NAME.get(raw, raw)
 
 
+def infer_precision_from_server_log(server_log: Path) -> str:
+    """Infer short precision tag from launch args in server.log."""
+    if not server_log.exists():
+        return ""
+    try:
+        with open(server_log, "r", errors="ignore") as f:
+            for ln in f:
+                m = re.search(r"--kv-cache-dtype\s+([^\s]+)", ln)
+                if not m:
+                    m = re.search(r"kv_cache_dtype='([^']+)'", ln)
+                if not m:
+                    continue
+                dtype = m.group(1).lower()
+                if "fp8" in dtype:
+                    return "FP8"
+                if "mxfp4" in dtype:
+                    return "MXFP4"
+                if "fp16" in dtype:
+                    return "FP16"
+                if "bf16" in dtype:
+                    return "BF16"
+                if "fp32" in dtype:
+                    return "FP32"
+                return dtype.upper()
+    except Exception:
+        return ""
+    return ""
+
+
+def build_title_slug(cascade_dir: Path, model_override: str | None = None) -> str:
+    """Build title slug as '[Model]-[Prec]-TPX_ClientY_ReqLenZ' from run meta."""
+    model = extract_model_display(cascade_dir, model_override)
+    tp_size = None
+    num_clients = None
+    request_length = None
+    precision = ""
+
+    # Use the first available run folder that has bench_meta.json.
+    for p_jsonl in discover_jsonls(cascade_dir):
+        bench_dir = p_jsonl.parent
+        meta_path = bench_dir / "bench_meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text())
+        except Exception:
+            continue
+        raw_model = meta.get("model_name") or Path(str(meta.get("model_path", ""))).name
+        if raw_model:
+            model = MODEL_DISPLAY_NAME.get(raw_model, raw_model)
+        tp_size = meta.get("tp_size")
+        num_clients = meta.get("num_clients")
+        request_length = meta.get("request_length")
+        precision = infer_precision_from_server_log(bench_dir / "server.log")
+        break
+
+    model_head = model
+    if precision and precision not in model_head:
+        model_head = f"{model_head}-{precision}"
+    if tp_size:
+        model_head = f"{model_head}-TP{tp_size}"
+
+    if num_clients and request_length:
+        return f"{model_head}_Client{num_clients}_ReqLen{request_length}"
+    if num_clients:
+        return f"{model_head}_Client{num_clients}"
+    if request_length:
+        return f"{model_head}_ReqLen{request_length}"
+    return model_head
+
+
 def load_runs(cascade_dir: Path, tag: str, max_rounds: int | None) -> list[dict]:
     """Discover + load all bench_multiturn.jsonl files under a cascade root."""
     jsonls = discover_jsonls(cascade_dir)
@@ -772,7 +845,7 @@ def main():
     # Model name comes from whichever cascade dir we have. Both dirs should
     # share the same model — we don't enforce, but the title only uses one.
     name_dir = mi_dir or b2_dir
-    model = extract_model_display(name_dir, args.model_name)
+    model = build_title_slug(name_dir, args.model_name)
     # Docker tag (parent dir of the cascade root) -> 'docker pull'-able
     # image name. Each PNG's subtitle lists ONLY the docker(s) whose curves
     # are actually drawn on that figure.
