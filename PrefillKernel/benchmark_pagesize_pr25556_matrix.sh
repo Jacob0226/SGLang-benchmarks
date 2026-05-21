@@ -23,11 +23,14 @@ CASES="${CASES:-page1_fp8off page1_pr25556 page64_fp8off page64_pr25556}"
 GSM8K_ENABLED="${GSM8K_ENABLED:-1}"
 GSM8K_NUM_QUESTIONS="${GSM8K_NUM_QUESTIONS:-1200}"
 GSM8K_PARALLEL="${GSM8K_PARALLEL:-1200}"
-IN_TOKENS=4096
+INPUT_TOKENS_STR="${INPUT_TOKENS_STR:-${IN_TOKENS:-8192 16384}}"
+read -r -a INPUT_TOKENS <<< "${INPUT_TOKENS_STR}"
 OUT_TOKENS=1
 
 mkdir -p "${RESULT_ROOT}"
 echo "Results root: ${RESULT_ROOT}"
+echo "Input tokens: ${INPUT_TOKENS_STR}"
+echo "GSM8K enabled: ${GSM8K_ENABLED}"
 
 run_case() {
   local case_name="$1"
@@ -159,27 +162,29 @@ run_case() {
         fi
       fi
 
-      for c in ${CONCURRENCIES[*]}; do
-        num_prompt=\$(( c * ${PROMPT_MULTIPLIER} ))
-        out_json=\"\${LOG_DIR}/bench_in${IN_TOKENS}_out${OUT_TOKENS}_conc\${c}.jsonl\"
-        out_log=\"\${LOG_DIR}/bench_in${IN_TOKENS}_out${OUT_TOKENS}_conc\${c}.log\"
-        if [[ -s \"\${out_json}\" ]]; then
-          echo \"Skip conc=\${c}: found existing \${out_json}\" | tee -a \"\${out_log}\"
-          continue
-        fi
-        echo \"Running conc=\${c}, prompts=\${num_prompt}\" | tee -a \"\${out_log}\"
-        python3 -m sglang.bench_serving \
-          --host 127.0.0.1 \
-          --port '${port}' \
-          --model '${MODEL_PATH}' \
-          --dataset-name random \
-          --random-input '${IN_TOKENS}' \
-          --random-output '${OUT_TOKENS}' \
-          --random-range-ratio 1.0 \
-          --max-concurrency \"\${c}\" \
-          --num-prompt \"\${num_prompt}\" \
-          --output-file \"\${out_json}\" \
-          >> \"\${out_log}\" 2>&1
+      for in_tokens in ${INPUT_TOKENS[*]}; do
+        for c in ${CONCURRENCIES[*]}; do
+          num_prompt=\$(( c * ${PROMPT_MULTIPLIER} ))
+          out_json=\"\${LOG_DIR}/bench_in\${in_tokens}_out${OUT_TOKENS}_conc\${c}.jsonl\"
+          out_log=\"\${LOG_DIR}/bench_in\${in_tokens}_out${OUT_TOKENS}_conc\${c}.log\"
+          if [[ -s \"\${out_json}\" ]]; then
+            echo \"Skip input=\${in_tokens}, conc=\${c}: found existing \${out_json}\" | tee -a \"\${out_log}\"
+            continue
+          fi
+          echo \"Running input=\${in_tokens}, conc=\${c}, prompts=\${num_prompt}\" | tee -a \"\${out_log}\"
+          python3 -m sglang.bench_serving \
+            --host 127.0.0.1 \
+            --port '${port}' \
+            --model '${MODEL_PATH}' \
+            --dataset-name random \
+            --random-input \"\${in_tokens}\" \
+            --random-output '${OUT_TOKENS}' \
+            --random-range-ratio 1.0 \
+            --max-concurrency \"\${c}\" \
+            --num-prompt \"\${num_prompt}\" \
+            --output-file \"\${out_json}\" \
+            >> \"\${out_log}\" 2>&1
+        done
       done
     "
 
