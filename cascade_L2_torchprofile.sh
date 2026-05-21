@@ -113,7 +113,7 @@ Common opts:
   --num-clients N              (default 300)
   --request-length N           (default 4096)
   --num-profile-steps K        (default 5) torch.profiler --num-steps
-  --output-dir DIR             default ~/SGLang-benchmarks/results/<docker>/<model>-cascade-profile-<tag>
+  --output-dir DIR             default ~/SGLang-benchmarks/results/<docker>/<model>-cascade/profile-<tag>
 EOF
       exit 0
       ;;
@@ -143,10 +143,17 @@ case "$VENDOR" in
   *)      echo ">>> platform: unknown (no nvidia-smi or rocm-smi found, continuing anyway)";;
 esac
 
+if [ "$VENDOR" = "nvidia" ]; then
+  if ! python3 -c 'import distro' >/dev/null 2>&1; then
+    echo ">>> NVIDIA environment missing python package 'distro'; installing"
+    python3 -m pip install distro --break-system-packages
+  fi
+fi
+
 # ============================== Output dir ==============================
 MODEL_NAME=$(basename "${MODEL_PATH%/}")
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
-[ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}-cascade-profile-${TAG}"
+[ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}-cascade/profile-${TAG}"
 mkdir -p "$OUTPUT_DIR"
 echo ">>> profile output dir: $OUTPUT_DIR"
 
