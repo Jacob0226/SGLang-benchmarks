@@ -7,7 +7,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-ROOT = Path("/home/jacchang/plots/pagesize_pr25556_matrix_20260521_025634")
+ROOT = Path("/home/jacchang/SGLang-benchmarks/PrefillKernel")
+DATA_ROOT = Path("/home/jacchang/plots/pagesize_pr25556_matrix_20260521_025634")
 CONCS = [4, 16, 64, 256]
 CASES = {
     "page1_fp8off": {"page_size": 1, "method": "SGLANG_AITER_FP8_PREFILL_ATTN=0"},
@@ -21,7 +22,7 @@ def load_ttft_data():
     rows = []
     for case, meta in CASES.items():
         for c in CONCS:
-            p = ROOT / case / f"bench_in4096_out1_conc{c}.jsonl"
+            p = DATA_ROOT / case / f"bench_in4096_out1_conc{c}.jsonl"
             with p.open() as f:
                 obj = json.loads(f.readline())
             rows.append(
@@ -103,7 +104,10 @@ def plot_one(page_size, base, pr_vals, ratio_pct):
     ax2.set_ylim(ymin, ymax)
     ax2.set_ylabel("TTFT (ms)")
 
-    ax1.set_title(f"Page Size = {page_size}, InputLength=4096: Ratio + TTFT")
+    ax1.set_title(
+        f"Model: DS-R1-0528 FP8-TP8 | "
+        f"Page Size = {page_size}, InputLength=4096: Ratio + TTFT"
+    )
 
     h1, l1 = ax1.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()

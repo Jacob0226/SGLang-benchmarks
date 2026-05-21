@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-ROOT = Path("/home/jacchang/plots/pagesize_pr25556_matrix_20260521_025634")
+ROOT = Path("/home/jacchang/SGLang-benchmarks/PrefillKernel")
 PIVOT_CSV = ROOT / "input_throughput_comparison_pivot.csv"
 
 
@@ -80,7 +80,10 @@ def plot_one(page_size, concs, base, pr_vals, ratio_pct):
     ax2.set_ylim(0, ymax)
     ax2.set_ylabel("Input token throughput (tok/s)")
 
-    title = f"Page Size = {page_size}, InputLength=4096: Ratio + Throughput"
+    title = (
+        f"Model: DS-R1-0528 FP8-TP8 | "
+        f"Page Size = {page_size}, InputLength=4096: Ratio + Throughput"
+    )
     ax1.set_title(title)
 
     # Joint legend
