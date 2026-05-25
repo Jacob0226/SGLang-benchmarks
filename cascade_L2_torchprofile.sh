@@ -35,7 +35,7 @@ HOST="localhost"
 PORT=30000
 MODEL_PATH=${MODEL_PATH:-/data/huggingface/hub/deepseek-ai/DeepSeek-R1-0528}
 TP_SIZE=8
-DOCKER="untagged-docker"
+DOCKER=${DOCKER:-untagged-docker}
 
 # Cache sizing (per rank, GB). Both required.
 L1_SIZE=""
@@ -70,7 +70,16 @@ while [[ $# -gt 0 ]]; do
     --port)              PORT="$2"; shift 2;;
     --model)             MODEL_PATH="$2"; shift 2;;
     --tp)                TP_SIZE="$2"; shift 2;;
-    --docker)            DOCKER="$2"; shift 2;;
+    --docker)
+      # Support both:
+      #   DOCKER=img ./script ...
+      #   ./script --docker img ...
+      # If users write `DOCKER=img ./script --docker "$DOCKER"`, the shell
+      # expands "$DOCKER" before the temporary env assignment is visible, so
+      # the argument can be empty. In that case keep the environment/default.
+      [ -n "${2:-}" ] && DOCKER="$2"
+      shift 2
+      ;;
     --L1-size)           L1_SIZE="$2"; shift 2;;
     --L2-size)           L2_SIZE="$2"; shift 2;;
     --kv-bytes-per-token) KV_BYTES_PER_TOKEN="$2"; shift 2;;
