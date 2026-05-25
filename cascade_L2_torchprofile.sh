@@ -60,7 +60,7 @@ MAX_PARALLEL=8
 REQUEST_RATE=32
 
 # Profiler knobs.
-NUM_PROFILE_STEPS=5
+NUM_PROFILE_STEPS=20
 TAG=""
 OUTPUT_DIR=""
 
@@ -121,7 +121,7 @@ Common opts:
   --num-rounds N               override auto-derived total rounds
   --num-clients N              (default 300)
   --request-length N           (default 4096)
-  --num-profile-steps K        (default 5) torch.profiler --num-steps
+  --num-profile-steps K        (default 20) torch.profiler --num-steps
   --output-dir DIR             default ~/SGLang-benchmarks/results/<docker>/<model>/profile-<tag>
 EOF
       exit 0
