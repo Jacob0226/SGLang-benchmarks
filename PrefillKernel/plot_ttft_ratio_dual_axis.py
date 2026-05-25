@@ -9,6 +9,7 @@ import numpy as np
 
 ROOT = Path("/home/jacchang/SGLang-benchmarks/PrefillKernel")
 DATA_ROOT = Path("/home/jacchang/plots/pagesize_pr25556_matrix_20260521_025634")
+INPUT_LEN = 4096
 CONCS = [4, 16, 64, 256]
 CASES = {
     "page1_fp8off": {"page_size": 1, "method": "SGLANG_AITER_FP8_PREFILL_ATTN=0"},
@@ -22,7 +23,7 @@ def load_ttft_data():
     rows = []
     for case, meta in CASES.items():
         for c in CONCS:
-            p = DATA_ROOT / case / f"bench_in4096_out1_conc{c}.jsonl"
+            p = DATA_ROOT / case / f"bench_in{INPUT_LEN}_out1_conc{c}.jsonl"
             with p.open() as f:
                 obj = json.loads(f.readline())
             rows.append(
@@ -56,8 +57,7 @@ def build_series(rows, page_size):
     pr = {r["concurrency"]: r["mean_ttft_ms"] for r in rows if r["page_size"] == page_size and r["method"] == "PR25556"}
     base = np.array([fp8[c] for c in CONCS], dtype=float)
     pr_vals = np.array([pr[c] for c in CONCS], dtype=float)
-    # TTFT lower is better, so use fp8off/PR to make >100% mean PR is better.
-    ratio_pct = (base / pr_vals) * 100.0
+    ratio_pct = (pr_vals / base) * 100.0
     return base, pr_vals, ratio_pct
 
 
@@ -71,12 +71,12 @@ def plot_one(page_size, base, pr_vals, ratio_pct):
         width=0.55,
         color="#7DA6FF",
         alpha=0.7,
-        label="fp8off / PR25556 (%)",
+        label="mla_fp8_prefill_attn / flash_attn_varlen_func (%)",
         zorder=2,
     )
     ax1.axhline(100.0, color="gray", linestyle="--", linewidth=1.2, zorder=1)
-    ax1.set_ylabel("fp8off / PR25556 (%)")
-    ax1.set_ylim(0, max(130, float(np.max(ratio_pct) * 1.15)))
+    ax1.set_ylabel("mla_fp8_prefill_attn / flash_attn_varlen_func (%)")
+    ax1.set_ylim(0, max(120, float(np.max(ratio_pct) * 1.15)))
     ax1.set_xticks(x)
     ax1.set_xticklabels([str(c) for c in CONCS])
     ax1.set_xlabel("Concurrency")
@@ -106,12 +106,18 @@ def plot_one(page_size, base, pr_vals, ratio_pct):
 
     ax1.set_title(
         f"Model: DS-R1-0528 FP8-TP8 | "
-        f"Page Size = {page_size}, InputLength=4096: Ratio + TTFT"
+        f"Page Size = {page_size}, InputLength={INPUT_LEN}: Ratio + TTFT"
     )
 
     h1, l1 = ax1.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
-    ax1.legend(h1 + h2, l1 + l2, loc="upper left")
+    ax1.legend(
+        h1 + h2,
+        l1 + l2,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.16),
+        ncol=3,
+    )
 
     for b, r in zip(bars, ratio_pct):
         ax1.text(
@@ -123,7 +129,7 @@ def plot_one(page_size, base, pr_vals, ratio_pct):
             fontsize=9,
         )
 
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.06, 1, 1))
     out = ROOT / f"page{page_size}_ratio_ttft.png"
     fig.savefig(out, dpi=200)
     plt.close(fig)
