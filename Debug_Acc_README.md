@@ -22,6 +22,8 @@ High-level root cause:
 - Shape overlap analysis shows GLM-5.1 BF16 GEMM shapes only overlap `glm5_bf16_tuned_gemm.csv` among the files added/changed by `47b096643`.
 - Reverting all changed model config inputs to the index 39 state restores accuracy.
 - Removing `glm5_bf16_tuned_gemm.csv` does not materially hurt performance on the later 2026-05-24 image.
+- The 2026-05-24 image is also accuracy-healthy with its original baked `glm5_bf16_tuned_gemm.csv`: TP=2 GSM8K accuracy `0.938`, Invalid `0.001`.
+- Important correction: the 2026-05-01 BAD aiter endpoint `a6bb499` already contains PR #2803 / `0dad4342d`, which removed GLM-5 Triton tuned GEMM rows. Therefore the persistent 2026-05-01 accuracy drop is not explained by Triton rows alone; the current leading suspects are the a6bb499-era tuned CSV row choices and/or FlyDSL split-K behavior that was later changed/fixed.
 
 ## Docker Run Template
 
@@ -74,7 +76,7 @@ Conclusion from this matrix:
 
 ## Docker Date Bisect
 
-Daily image bisect narrowed the regression to 2026-04-30 -> 2026-05-01:
+Daily image bisect narrowed the regression onset to 2026-04-30 -> 2026-05-01:
 
 | Image date | TP=2 accuracy | Invalid | Verdict |
 |---:|---:|---:|---|
@@ -83,6 +85,7 @@ Daily image bisect narrowed the regression to 2026-04-30 -> 2026-05-01:
 | 2026-04-28 | 0.932 | 0.002 | GOOD |
 | 2026-04-30 | 0.939 | 0.000 | GOOD |
 | 2026-05-01 | 0.601 | 0.338 | BAD |
+| 2026-05-24 | 0.938 | 0.001 | GOOD with original baked `glm5_bf16_tuned_gemm.csv` |
 
 The 2026-04-30 image contains SGLang `aa74911448`. The 2026-05-01 image contains SGLang `4a50cd781e`.
 
@@ -203,7 +206,7 @@ Interpretation:
 - Single-backend and two-backend subsets tested so far are GOOD, while the full config is BAD. The remaining likely cause is a specific row or combination of rows in `glm5_bf16_tuned_gemm.csv`.
 - On the first-bad-era image, simply moving only `glm5_bf16_tuned_gemm.csv` out was not enough to recover accuracy until all changed model configs were restored to the index 39 state. This suggests cached/merged config state must be cleared carefully (`/tmp/aiter_configs/bf16_tuned_gemm.csv*`) and all model config inputs must be controlled during tests.
 
-## 2026-05-24 Image Performance Check
+## 2026-05-24 Image Accuracy and Performance Check
 
 The later image `rocm/sgl-dev:v0.5.12.post1-rocm720-mi35x-20260524` was tested with `GLM.sh` using:
 
@@ -226,6 +229,15 @@ Result directories:
 /home/jacchang/SGLang-benchmarks/results/rocm_sgl-dev-v0.5.12.post1-rocm720-mi35x-20260524/GLM-5.1-MXFP4-bench-no_glm5_bf16_csv
 ```
 
+Accuracy summary:
+
+| Case | TP=2 GSM8K accuracy | Invalid | Verdict |
+|---|---:|---:|---|
+| Original baked `glm5_bf16_tuned_gemm.csv` | 0.938 | 0.001 | GOOD |
+| No GLM-5 BF16 CSV | 0.937 | 0.000 | GOOD |
+
+This means the 2026-05-24 image does not reproduce the TP=2 accuracy drop even with its original baked GLM-5 BF16 tuned config.
+
 Performance summary:
 
 | Case | Original output tok/s | No GLM-5 BF16 CSV output tok/s | Delta |
@@ -239,9 +251,23 @@ Performance summary:
 
 Conclusion from the 2026-05-24 performance check:
 
+- The original baked `glm5_bf16_tuned_gemm.csv` is accuracy-healthy on this image.
 - Removing `glm5_bf16_tuned_gemm.csv` has no meaningful performance cost in this benchmark sweep.
 - All output-throughput deltas are within about +/-2%.
 - Logs from the no-CSV run confirm fallback behavior: GLM BF16 GEMM shapes print `not found tuned config ... will use default config`.
+
+## Current Fix-Window Hypothesis
+
+Local aiter history shows:
+
+```text
+47b096643  2026-04-15  first-bad config commit; GLM-5 CSV has 88 rows: asm=42, flydsl=30, triton=16
+0dad4342d  2026-04-20  PR #2803 removes GLM-5 Triton tuned GEMM rows; GLM-5 CSV has 72 rows: asm=47, flydsl=25
+a6bb49937  2026-04-29  2026-05-01 image aiter endpoint; still 72 rows: asm=47, flydsl=25; TP=2 BAD
+HEAD/0524 era          GLM-5 CSV has 72 rows: asm=47, flydsl=16, torch=9; TP=2 GOOD on 2026-05-24 image
+```
+
+PR #2803 is already included in the 2026-05-01 BAD endpoint, so the 2026-05-01 failure is not simply "Triton rows were selected." The next tests should determine whether the 2026-05-24/current CSV alone fixes the 2026-05-01 image, or whether a later aiter code fix such as FlyDSL split-K synchronization is required.
 
 ## Rebuild / JIT Methodology
 
