@@ -398,6 +398,10 @@ echo ">>> profiler returned; waiting for cascade to finish remaining rounds"
 wait "$CASCADE_PID" 2>/dev/null || true
 trap - EXIT
 pkill -9 sglang 2>/dev/null && sleep 5 || true
+# Some torch.profiler backends flush traces asynchronously after the profiler
+# command returns. Run normalization again after cascade/server teardown so
+# timestamp dirs recreated during the flush are folded into the workload dir.
+normalize_profiler_artifacts "$(list_profiler_dirs)"
 
 # ============================== Summary ==============================
 echo ""
