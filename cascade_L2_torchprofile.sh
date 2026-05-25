@@ -296,7 +296,7 @@ if curl -s -o /dev/null -w '%{http_code}' "http://${HOST}:${PORT}/health" 2>/dev
 fi
 
 CASCADE_LOG="$OUTPUT_DIR/cascade_dsr1_lite.log"
-echo ">>> launching cascade_dsr1_lite.sh in background; log: $CASCADE_LOG"
+echo ">>> launching cascade_dsr1_lite.sh in background; log: $CASCADE_LOG (also streaming below)"
 "$CASCADE_LITE" \
   --tag "${TAG}_L1${L1_SIZE}_L2${L2_SIZE}" \
   --docker "$DOCKER" \
@@ -312,7 +312,7 @@ echo ">>> launching cascade_dsr1_lite.sh in background; log: $CASCADE_LOG"
   --max-parallel "$MAX_PARALLEL" \
   --request-rate "$REQUEST_RATE" \
   --no-gsm8k-precheck \
-  > "$CASCADE_LOG" 2>&1 &
+  2>&1 | tee "$CASCADE_LOG" &
 CASCADE_PID=$!
 
 # Phase 1: wait for server health.
