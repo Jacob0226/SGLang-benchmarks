@@ -10,6 +10,8 @@ import numpy as np
 ROOT = Path("/home/jacchang/SGLang-benchmarks/PrefillKernel")
 DATA_ROOT = Path("/home/jacchang/plots/pagesize_pr25556_matrix_20260521_025634")
 INPUT_LEN = 4096
+FIGSIZE = (9.5, 6.2)
+SUBPLOTS_ADJUST = {"left": 0.10, "right": 0.90, "top": 0.88, "bottom": 0.20}
 CONCS = [4, 16, 64, 256]
 CASES = {
     "page1_fp8off": {"page_size": 1, "method": "SGLANG_AITER_FP8_PREFILL_ATTN=0"},
@@ -62,7 +64,7 @@ def build_series(rows, page_size):
 
 
 def plot_one(page_size, base, pr_vals, ratio_pct):
-    fig, ax1 = plt.subplots(figsize=(9, 5.5))
+    fig, ax1 = plt.subplots(figsize=FIGSIZE)
     x = np.arange(len(CONCS))
 
     bars = ax1.bar(
@@ -129,7 +131,7 @@ def plot_one(page_size, base, pr_vals, ratio_pct):
             fontsize=9,
         )
 
-    fig.tight_layout(rect=(0, 0.06, 1, 1))
+    fig.subplots_adjust(**SUBPLOTS_ADJUST)
     out = ROOT / f"page{page_size}_ratio_ttft.png"
     fig.savefig(out, dpi=200)
     plt.close(fig)

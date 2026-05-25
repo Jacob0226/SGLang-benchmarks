@@ -8,6 +8,9 @@ import numpy as np
 
 ROOT = Path("/home/jacchang/SGLang-benchmarks/PrefillKernel")
 PIVOT_CSV = ROOT / "input_throughput_comparison_pivot.csv"
+INPUT_LEN = 4096
+FIGSIZE = (9.5, 6.2)
+SUBPLOTS_ADJUST = {"left": 0.10, "right": 0.90, "top": 0.88, "bottom": 0.20}
 
 
 def load_rows():
@@ -37,7 +40,7 @@ def get_series(rows, page_size):
 
 
 def plot_one(page_size, concs, base, pr_vals, ratio_pct):
-    fig, ax1 = plt.subplots(figsize=(9, 5.5))
+    fig, ax1 = plt.subplots(figsize=FIGSIZE)
     x = np.arange(len(concs))
 
     # Left axis: ratio bars
@@ -47,11 +50,11 @@ def plot_one(page_size, concs, base, pr_vals, ratio_pct):
         width=0.55,
         color="#7DA6FF",
         alpha=0.7,
-        label="PR25556 / fp8off (%)",
+        label="mla_fp8_prefill_attn / flash_attn_varlen_func (%)",
         zorder=2,
     )
     ax1.axhline(100.0, color="gray", linestyle="--", linewidth=1.2, zorder=1)
-    ax1.set_ylabel("PR25556 / fp8off (%)")
+    ax1.set_ylabel("mla_fp8_prefill_attn / flash_attn_varlen_func (%)")
     ax1.set_ylim(0, max(120, float(np.max(ratio_pct) * 1.15)))
     ax1.set_xticks(x)
     ax1.set_xticklabels([str(c) for c in concs])
@@ -82,14 +85,19 @@ def plot_one(page_size, concs, base, pr_vals, ratio_pct):
 
     title = (
         f"Model: DS-R1-0528 FP8-TP8 | "
-        f"Page Size = {page_size}, InputLength=4096: Ratio + Throughput"
+        f"Page Size = {page_size}, InputLength={INPUT_LEN}: Ratio + Throughput"
     )
     ax1.set_title(title)
 
-    # Joint legend
     handles1, labels1 = ax1.get_legend_handles_labels()
     handles2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(handles1 + handles2, labels1 + labels2, loc="upper left")
+    ax1.legend(
+        handles1 + handles2,
+        labels1 + labels2,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.16),
+        ncol=3,
+    )
 
     # Annotate ratio on bars
     for b, r in zip(bars, ratio_pct):
@@ -102,7 +110,7 @@ def plot_one(page_size, concs, base, pr_vals, ratio_pct):
             fontsize=9,
         )
 
-    fig.tight_layout()
+    fig.subplots_adjust(**SUBPLOTS_ADJUST)
     out = ROOT / f"page{page_size}_ratio_throughput.png"
     fig.savefig(out, dpi=200)
     plt.close(fig)
