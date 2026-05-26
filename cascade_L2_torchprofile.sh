@@ -61,6 +61,7 @@ REQUEST_RATE=32
 
 # Profiler knobs.
 NUM_PROFILE_STEPS=20
+PROFILE_START_ROUND_1IDX=""
 TAG=""
 OUTPUT_DIR=""
 
@@ -93,6 +94,7 @@ while [[ $# -gt 0 ]]; do
     --max-parallel)      MAX_PARALLEL="$2"; shift 2;;
     --request-rate)      REQUEST_RATE="$2"; shift 2;;
     --num-profile-steps) NUM_PROFILE_STEPS="$2"; shift 2;;
+    --profile-start-round) PROFILE_START_ROUND_1IDX="$2"; shift 2;;
     --tag)               TAG="$2"; shift 2;;
     --output-dir)        OUTPUT_DIR="$2"; shift 2;;
     -h|--help)
@@ -122,6 +124,11 @@ Common opts:
   --num-clients N              (default 300)
   --request-length N           (default 4096)
   --num-profile-steps K        (default 20) torch.profiler --num-steps
+  --profile-start-round N      start profiling at 1-based round N and stop
+                               when that round completes (next round boundary).
+                               Requires total rounds > N so the server stays
+                               alive long enough to flush profile artifacts.
+                               When omitted, use legacy --num-profile-steps.
   --output-dir DIR             default ~/SGLang-benchmarks/results/<docker>/<model>/profile-<tag>
 EOF
       exit 0
@@ -198,6 +205,27 @@ echo "    derived: mem-fraction-static=${MEM_FRACTION_STATIC}  num-rounds=${NUM_
 echo "    profile target: round ${PROFILE_TARGET_ROUND_1IDX} (1-indexed)"
 ROUNDS_WARMUP="$WARMUP_ROUNDS"
 [ -n "$NUM_ROUNDS_OVERRIDE" ] && NUM_ROUNDS="$NUM_ROUNDS_OVERRIDE"
+
+PROFILE_MODE="steps"
+ROUNDS_BEFORE_PROFILE="$ROUNDS_WARMUP"
+PROFILE_ROUND_1IDX="${PROFILE_TARGET_ROUND_1IDX:-$((ROUNDS_WARMUP + 1))}"
+if [ -n "$PROFILE_START_ROUND_1IDX" ]; then
+  if ! [[ "$PROFILE_START_ROUND_1IDX" =~ ^[0-9]+$ ]] || [ "$PROFILE_START_ROUND_1IDX" -lt 1 ]; then
+    echo "ERROR: --profile-start-round must be a positive 1-based round number" >&2
+    exit 1
+  fi
+  PROFILE_MODE="round"
+  PROFILE_ROUND_1IDX="$PROFILE_START_ROUND_1IDX"
+  ROUNDS_BEFORE_PROFILE=$(( PROFILE_ROUND_1IDX - 1 ))
+  if [ -z "$NUM_ROUNDS_OVERRIDE" ] && [ "$NUM_ROUNDS" -lt $(( PROFILE_ROUND_1IDX + 1 )) ]; then
+    NUM_ROUNDS=$(( PROFILE_ROUND_1IDX + 1 ))
+    echo "    adjusted num-rounds=${NUM_ROUNDS} to leave one margin round after profile"
+  elif [ "$NUM_ROUNDS" -le "$PROFILE_ROUND_1IDX" ]; then
+    echo "ERROR: --num-rounds (${NUM_ROUNDS}) must be > --profile-start-round (${PROFILE_ROUND_1IDX})" >&2
+    exit 1
+  fi
+  echo "    round-bounded profile: start round ${PROFILE_ROUND_1IDX}; stop at next round boundary"
+fi
 TOTAL_ROUNDS="$NUM_ROUNDS"
 
 # Save derived params for post-mortem.
@@ -210,6 +238,58 @@ metric_baseline_count() {
         /^sglang:num_requests_total[^_]/        { f += $NF }
         /^sglang:num_aborted_requests_total/    { a += $NF }
         END { printf "%d\n", f + a }'
+}
+
+profile_api() {
+  local action="$1"
+  local profile_dir="${2:-}"
+  local profile_prefix="${3:-}"
+
+  python3 - "$HOST" "$PORT" "$action" "$profile_dir" "$profile_prefix" <<'PY'
+import json
+import pathlib
+import sys
+import urllib.request
+
+host, port, action, profile_dir, profile_prefix = sys.argv[1:6]
+base_url = f"http://{host}:{port}"
+
+def post(path, payload=None):
+    data = b"" if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        base_url + path,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        body = resp.read().decode("utf-8", errors="replace").strip()
+    if body:
+        print(body)
+
+if action == "start":
+    out = pathlib.Path(profile_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    try:
+        with urllib.request.urlopen(base_url + "/server_info", timeout=60) as resp:
+            server_info = resp.read().decode("utf-8", errors="replace")
+        (out / "server_args.json").write_text(server_info)
+    except Exception as exc:
+        print(f"WARN: failed to dump server_args.json: {exc}", file=sys.stderr)
+    post(
+        "/start_profile",
+        {
+            "output_dir": str(out),
+            "activities": ["CPU", "GPU"],
+            "profile_prefix": profile_prefix,
+            "profile_by_stage": False,
+        },
+    )
+elif action == "stop":
+    post("/stop_profile")
+else:
+    raise SystemExit(f"unknown profile action: {action}")
+PY
 }
 
 list_profiler_dirs() {
@@ -357,24 +437,29 @@ while true; do
 done
 echo ">>> bench_multiturn started"
 
-# Phase 3: take baseline NOW so warmup math counts only cascade reqs.
+# Phase 3: take baseline NOW so round math counts only cascade reqs.
 BASELINE_DONE=$(metric_baseline_count)
-TARGET_FOR_PROFILE=$(( BASELINE_DONE + ROUNDS_WARMUP * NUM_CLIENTS ))
+TARGET_FOR_PROFILE=$(( BASELINE_DONE + ROUNDS_BEFORE_PROFILE * NUM_CLIENTS ))
+STOP_FOR_PROFILE=$(( BASELINE_DONE + PROFILE_ROUND_1IDX * NUM_CLIENTS ))
 echo ">>> baseline num_requests_done=${BASELINE_DONE}; trigger profiler at ${TARGET_FOR_PROFILE}"
 
-# ============================== Wait until warmup rounds done ==============================
-echo ">>> waiting for warmup completion (${ROUNDS_WARMUP} rounds × ${NUM_CLIENTS} reqs)"
+# ============================== Wait until pre-profile rounds done ==============================
+if [ "$PROFILE_MODE" = "round" ]; then
+  echo ">>> waiting for round $(( PROFILE_ROUND_1IDX - 1 )) completion (${ROUNDS_BEFORE_PROFILE} rounds × ${NUM_CLIENTS} reqs)"
+else
+  echo ">>> waiting for warmup completion (${ROUNDS_WARMUP} rounds × ${NUM_CLIENTS} reqs)"
+fi
 LAST_LOG=0
 while kill -0 "$CASCADE_PID" 2>/dev/null; do
   done_now=$(metric_baseline_count)
   reqs_done=$(( done_now - BASELINE_DONE ))
   if [ "$done_now" -ge "$TARGET_FOR_PROFILE" ]; then
-    echo ">>> warmup complete: reqs_done=${reqs_done} (${done_now} - ${BASELINE_DONE})"
+    echo ">>> profile start boundary reached: reqs_done=${reqs_done} (${done_now} - ${BASELINE_DONE})"
     break
   fi
   now=$(date +%s)
   if [ $(( now - LAST_LOG )) -ge 5 ]; then
-    echo "    progress: ${reqs_done}/$(( ROUNDS_WARMUP * NUM_CLIENTS )) warmup reqs"
+    echo "    progress: ${reqs_done}/$(( ROUNDS_BEFORE_PROFILE * NUM_CLIENTS )) pre-profile reqs"
     LAST_LOG=$now
   fi
   sleep 1
@@ -386,22 +471,57 @@ if ! kill -0 "$CASCADE_PID" 2>/dev/null; then
 fi
 
 # ============================== Build profiler activities ==============================
-PROFILER_ARGS=(
-  --url "http://${HOST}:${PORT}"
-  --num-steps "$NUM_PROFILE_STEPS"
-  --output-dir "$OUTPUT_DIR"
-  --profile-prefix "${TAG}_${VENDOR}_R${PROFILE_TARGET_ROUND_1IDX:-X}"
-  --profile-by-stage
-  --cpu --gpu
-)
-
 export SGLANG_TORCH_PROFILER_DIR="$OUTPUT_DIR"
 
-echo ">>> calling sglang.profiler (blocks until ${NUM_PROFILE_STEPS} prefill+decode steps captured)"
-echo "    args: ${PROFILER_ARGS[*]}"
-python3 -m sglang.profiler "${PROFILER_ARGS[@]}" 2>&1 | tee "$OUTPUT_DIR/profiler.log"
-PROFILE_DIRS_AFTER=$(list_profiler_dirs)
-normalize_profiler_artifacts "$PROFILE_DIRS_AFTER"
+if [ "$PROFILE_MODE" = "round" ]; then
+  PROFILE_RUN_DIR="$OUTPUT_DIR/$(python3 - <<'PY'
+import time
+print(time.time())
+PY
+)"
+  PROFILE_PREFIX="${TAG}_${VENDOR}_R${PROFILE_ROUND_1IDX}_round"
+  echo ">>> starting round-bounded profiler at round ${PROFILE_ROUND_1IDX}; dir: ${PROFILE_RUN_DIR}"
+  profile_api start "$PROFILE_RUN_DIR" "$PROFILE_PREFIX" 2>&1 | tee "$OUTPUT_DIR/profiler.log"
+
+  echo ">>> waiting to stop profiler at next round boundary (${PROFILE_ROUND_1IDX} rounds × ${NUM_CLIENTS} reqs)"
+  LAST_LOG=0
+  while kill -0 "$CASCADE_PID" 2>/dev/null; do
+    done_now=$(metric_baseline_count)
+    reqs_done=$(( done_now - BASELINE_DONE ))
+    if [ "$done_now" -ge "$STOP_FOR_PROFILE" ]; then
+      echo ">>> profile stop boundary reached: reqs_done=${reqs_done} (${done_now} - ${BASELINE_DONE})"
+      break
+    fi
+    now=$(date +%s)
+    if [ $(( now - LAST_LOG )) -ge 5 ]; then
+      echo "    progress: ${reqs_done}/$(( PROFILE_ROUND_1IDX * NUM_CLIENTS )) profiled-round reqs"
+      LAST_LOG=$now
+    fi
+    sleep 1
+  done
+  if ! kill -0 "$CASCADE_PID" 2>/dev/null; then
+    echo "ERROR: cascade driver died before profile stop boundary" >&2
+    tail -n 40 "$CASCADE_LOG" >&2 || true
+    exit 1
+  fi
+  echo ">>> stopping round-bounded profiler"
+  profile_api stop 2>&1 | tee -a "$OUTPUT_DIR/profiler.log"
+  normalize_profiler_artifacts "$(list_profiler_dirs)"
+else
+  PROFILER_ARGS=(
+    --url "http://${HOST}:${PORT}"
+    --num-steps "$NUM_PROFILE_STEPS"
+    --output-dir "$OUTPUT_DIR"
+    --profile-prefix "${TAG}_${VENDOR}_R${PROFILE_TARGET_ROUND_1IDX:-X}"
+    --profile-by-stage
+    --cpu --gpu
+  )
+  echo ">>> calling sglang.profiler (blocks until ${NUM_PROFILE_STEPS} prefill+decode steps captured)"
+  echo "    args: ${PROFILER_ARGS[*]}"
+  python3 -m sglang.profiler "${PROFILER_ARGS[@]}" 2>&1 | tee "$OUTPUT_DIR/profiler.log"
+  PROFILE_DIRS_AFTER=$(list_profiler_dirs)
+  normalize_profiler_artifacts "$PROFILE_DIRS_AFTER"
+fi
 
 echo ">>> profiler returned; waiting for cascade to finish remaining rounds"
 wait "$CASCADE_PID" 2>/dev/null || true
