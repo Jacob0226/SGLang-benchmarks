@@ -88,7 +88,7 @@ while [[ $# -gt 0 ]]; do
 Usage: $0 --tag TAG --docker DOCKER [--cache-mode MODE | --cache-modes 'MODE1 MODE2 ...']
 Modes: none | L1 | L2 | L3_file
 Output:
-  --output-dir DIR                 override default results/<docker>/<model>-cascade-<tag>
+  --output-dir DIR                 override default results/<docker>/<model>/bench-<tag>
                                    root. Per-mode subdirs are still created
                                    under this directory.
 
@@ -124,7 +124,7 @@ if [ -n "$CACHE_MODES" ]; then
     CHAIN_BASE_LOG_DIR="$OUTPUT_DIR_OVERRIDE"
   else
     CHAIN_DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
-    CHAIN_BASE_LOG_DIR="$HOME/SGLang-benchmarks/results/$CHAIN_DOCKER_FILENAME/${MODEL_NAME}-cascade-${TAG}"
+    CHAIN_BASE_LOG_DIR="$HOME/SGLang-benchmarks/results/$CHAIN_DOCKER_FILENAME/${MODEL_NAME}/bench-${TAG}"
   fi
   mkdir -p "$CHAIN_BASE_LOG_DIR"
   CHAIN_LOG="$CHAIN_BASE_LOG_DIR/chain.log"
@@ -162,7 +162,7 @@ if [ -n "$CACHE_MODES" ]; then
     CHAIN_BASE_LOG_DIR="$OUTPUT_DIR_OVERRIDE"
   else
     CHAIN_DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
-    CHAIN_BASE_LOG_DIR="$HOME/SGLang-benchmarks/results/$CHAIN_DOCKER_FILENAME/${CHAIN_MODEL_NAME}-cascade-${TAG}"
+    CHAIN_BASE_LOG_DIR="$HOME/SGLang-benchmarks/results/$CHAIN_DOCKER_FILENAME/${CHAIN_MODEL_NAME}/bench-${TAG}"
   fi
   CHAIN_SUMMARIZER="$(dirname "$(readlink -f "$0")")/summarize_cascade.py"
   if [ -f "$CHAIN_SUMMARIZER" ] && [ -d "$CHAIN_BASE_LOG_DIR" ]; then
@@ -249,7 +249,7 @@ DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
 if [ -n "$OUTPUT_DIR_OVERRIDE" ]; then
   BASE_LOG_DIR="$OUTPUT_DIR_OVERRIDE"
 else
-  BASE_LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}-cascade-${TAG}"
+  BASE_LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}/bench-${TAG}"
 fi
 case "$CACHE_MODE" in
   none|L1)  LOG_DIR="${BASE_LOG_DIR}/${CACHE_MODE}" ;;
