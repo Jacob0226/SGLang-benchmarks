@@ -104,12 +104,13 @@ PATH_RE = re.compile(
 )
 
 CACHE_MODE_ORDER = [
-    "no_cache", "L1", "L2", "L3_file", "L3_hf3fs", "L3_mooncake",
+    "none", "no_cache", "L1", "L2", "L3_file", "L3_hf3fs", "L3_mooncake",
     # Legacy names from older runs (kept so the parser doesn't drop them):
     "no_radix", "radix", "hicache", "hicache_file",
     "hicache_hf3fs", "hicache_mooncake",
 ]
 CACHE_MODE_LABEL = {
+    "none":             "no cache",
     "no_cache":         "no cache",
     "L1":               "L1",
     "L2":               "L1+L2",
@@ -134,14 +135,15 @@ PLATFORM_PALETTE = {
     "B200": {
         # Hue shift: dark green (L1) -> warm green (L2) -> lime (L3+) so the
         # three tiers stay distinguishable on small thumbnails / projector.
-        "no_cache":         "#0d3311",  # very dark green (rare)
+        "none":             "#041b06",  # nearly black green (no cache baseline)
+        "no_cache":         "#041b06",
         "L1":               "#1b5e20",  # dark green
         "L2":               "#2e7d32",  # forest green (slightly darker than before)
         "L3_file":          "#9ccc65",  # lime green (clear contrast vs L2)
         "L3_hf3fs":         "#c5e1a5",
         "L3_mooncake":      "#dcedc8",
         # Legacy aliases:
-        "no_radix":         "#0d3311",
+        "no_radix":         "#041b06",
         "radix":             "#1b5e20",
         "hicache":           "#2e7d32",
         "hicache_file":      "#9ccc65",
@@ -151,13 +153,14 @@ PLATFORM_PALETTE = {
     "MI355X": {
         # Hue shift: dark red (L1) -> orange (L2) -> amber/yellow (L3+) so
         # the lightest tier doesn't look like a faded version of L2.
-        "no_cache":         "#7f1d00",
+        "none":             "#3b0d00",  # nearly black red-brown (no cache baseline)
+        "no_cache":         "#3b0d00",
         "L1":               "#bf360c",  # dark orange / red-brown
         "L2":               "#ef6c00",  # warm orange (deeper)
         "L3_file":          "#ffd54f",  # amber (yellow-toned, clear gap from L2)
         "L3_hf3fs":         "#ffe082",
         "L3_mooncake":      "#fff59d",
-        "no_radix":         "#7f1d00",
+        "no_radix":         "#3b0d00",
         "radix":             "#bf360c",
         "hicache":           "#ef6c00",
         "hicache_file":      "#ffd54f",
@@ -170,6 +173,7 @@ PLATFORM_PALETTE = {
 # tier across the green and orange lines at a glance, instead of having
 # to read the legend every time).
 MODE_MARKER = {
+    "none":             "x",
     "no_cache":         "x",
     "L1":               "o",  # circle
     "L2":               "s",  # square
