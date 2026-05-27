@@ -37,6 +37,7 @@ CHUNKED_PREFILL_SIZE=32768
 MAX_PREFILL_TOKENS=32768
 DISABLE_RADIX_CACHE=true
 SKIP_WARMUP=false
+GSM8K_PRECHECK=true
 EXTRA_SERVER_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -64,6 +65,7 @@ while [[ $# -gt 0 ]]; do
     --max-prefill-tokens) MAX_PREFILL_TOKENS="$2"; shift 2;;
     --enable-radix-cache) DISABLE_RADIX_CACHE=false; shift 1;;
     --skip-warmup) SKIP_WARMUP=true; shift 1;;
+    --no-gsm8k-precheck) GSM8K_PRECHECK=false; shift 1;;
     --extra-server-arg)
       EXTRA_SERVER_ARGS+=("$2")
       shift 2
@@ -84,6 +86,7 @@ Common opts:
   --mem-fraction-static F        Default: 0.85
   --enable-radix-cache           Keep prefix/radix cache on (default off)
   --skip-warmup                  Skip 2048/256 warmup
+  --no-gsm8k-precheck            Skip GSM8K accuracy check
   --extra-server-arg ARG         Append one raw launch_server arg; repeatable
 EOF
       exit 0
@@ -94,8 +97,7 @@ done
 
 MODEL_NAME=$(basename "${MODEL_PATH%/}")
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
-CACHE_TAG=$([ "$DISABLE_RADIX_CACHE" = true ] && echo "-NoRadix" || echo "-Radix")
-LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}-FP8-dense${CACHE_TAG}${USER_TAG}"
+LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}-bench${USER_TAG}"
 FINISH_LOG="$LOG_DIR/Finish.log"
 mkdir -p "$LOG_DIR"
 touch "$FINISH_LOG"
@@ -211,6 +213,24 @@ warmup() {
   log_command "$logfile" "${cmd[@]}"
 }
 
+accuracy_test() {
+  local gsm8k_logfile="$LOG_DIR/Accuracy_GSM8K.log"
+  if grep -q "$gsm8k_logfile" "$FINISH_LOG"; then
+    echo "Found Accuracy_GSM8K.log in ${FINISH_LOG}. Skipping."
+    return
+  fi
+
+  echo ">>> Running Accuracy check (GSM8K)..."
+  local gsm8k_cmd=(
+    python3 /sgl-workspace/sglang/benchmark/gsm8k/bench_sglang.py
+      --port "$PORT"
+      --num-questions 1200
+      --parallel 1200
+  )
+  log_command "$gsm8k_logfile" "${gsm8k_cmd[@]}"
+  echo "$gsm8k_logfile" >> "$FINISH_LOG"
+}
+
 run_benchmarks() {
   for io_pair in "${IN_OUT_TOKENS[@]}"; do
     IFS=":" read -r input_tokens output_tokens <<< "$io_pair"
@@ -246,6 +266,9 @@ trap cleanup_server EXIT
 start_server
 if [ "$SKIP_WARMUP" != true ]; then
   warmup
+fi
+if [ "$GSM8K_PRECHECK" = true ]; then
+  accuracy_test
 fi
 run_benchmarks
 
