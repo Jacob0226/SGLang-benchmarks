@@ -391,7 +391,6 @@ echo ">>> launching cascade_dsr1_lite.sh in background; log: $CASCADE_LOG (also 
   --request-length "$REQUEST_LENGTH" \
   --max-parallel "$MAX_PARALLEL" \
   --request-rate "$REQUEST_RATE" \
-  --no-gsm8k-precheck \
   2>&1 | tee "$CASCADE_LOG" &
 CASCADE_PID=$!
 
