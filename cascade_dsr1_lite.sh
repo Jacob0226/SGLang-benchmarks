@@ -54,6 +54,7 @@ GSM8K_NUM_QUESTIONS=1200
 GSM8K_PARALLEL=1200
 WAIT_FOR_SERVER_SEC=1500
 ATTENTION_BACKEND=""   # "" = auto-detect by vendor: NV->trtllm_mla, AMD->aiter
+OUTPUT_DIR_OVERRIDE=""
 
 ORIG_ARGS=("$@")
 
@@ -79,12 +80,17 @@ while [[ $# -gt 0 ]]; do
     --hicache-mem-layout)  HICACHE_MEM_LAYOUT="$2"; shift 2;;
     --hicache-io-backend)  HICACHE_IO_BACKEND="$2"; shift 2;;
     --attention-backend)   ATTENTION_BACKEND="$2"; shift 2;;
+    --output-dir)          OUTPUT_DIR_OVERRIDE="$2"; shift 2;;
     --gsm8k-num-questions) GSM8K_NUM_QUESTIONS="$2"; shift 2;;
     --no-gsm8k-precheck)   GSM8K_PRECHECK="false"; shift 1;;
     -h|--help)
       cat <<EOF
 Usage: $0 --tag TAG --docker DOCKER [--cache-mode MODE | --cache-modes 'MODE1 MODE2 ...']
 Modes: none | L1 | L2 | L3_file
+Output:
+  --output-dir DIR                 override default results/<docker>/<model>-cascade-<tag>
+                                   root. Per-mode subdirs are still created
+                                   under this directory.
 
 Memory sizing (pick one):
   --mem-fraction-static F        explicit fraction (default 0.85)
@@ -114,8 +120,12 @@ if [ -n "$CACHE_MODES" ]; then
   # Pre-create base log dir so we can capture chain dispatcher stdout to it.
   # Mirrors the single-mode BASE_LOG_DIR computation below (line 219); kept
   # in sync manually because we need it before any child runs.
-  CHAIN_DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
-  CHAIN_BASE_LOG_DIR="$HOME/SGLang-benchmarks/results/$CHAIN_DOCKER_FILENAME/${MODEL_NAME}-cascade-${TAG}"
+  if [ -n "$OUTPUT_DIR_OVERRIDE" ]; then
+    CHAIN_BASE_LOG_DIR="$OUTPUT_DIR_OVERRIDE"
+  else
+    CHAIN_DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
+    CHAIN_BASE_LOG_DIR="$HOME/SGLang-benchmarks/results/$CHAIN_DOCKER_FILENAME/${MODEL_NAME}-cascade-${TAG}"
+  fi
   mkdir -p "$CHAIN_BASE_LOG_DIR"
   CHAIN_LOG="$CHAIN_BASE_LOG_DIR/chain.log"
   : > "$CHAIN_LOG"
@@ -148,8 +158,12 @@ if [ -n "$CACHE_MODES" ]; then
   # derive BASE_LOG_DIR here because the chain dispatcher exits before
   # the single-mode path computes it.
   CHAIN_MODEL_NAME=$(basename "${MODEL_PATH%/}")
-  CHAIN_DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
-  CHAIN_BASE_LOG_DIR="$HOME/SGLang-benchmarks/results/$CHAIN_DOCKER_FILENAME/${CHAIN_MODEL_NAME}-cascade-${TAG}"
+  if [ -n "$OUTPUT_DIR_OVERRIDE" ]; then
+    CHAIN_BASE_LOG_DIR="$OUTPUT_DIR_OVERRIDE"
+  else
+    CHAIN_DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
+    CHAIN_BASE_LOG_DIR="$HOME/SGLang-benchmarks/results/$CHAIN_DOCKER_FILENAME/${CHAIN_MODEL_NAME}-cascade-${TAG}"
+  fi
   CHAIN_SUMMARIZER="$(dirname "$(readlink -f "$0")")/summarize_cascade.py"
   if [ -f "$CHAIN_SUMMARIZER" ] && [ -d "$CHAIN_BASE_LOG_DIR" ]; then
     python3 "$CHAIN_SUMMARIZER" cross_mode "$CHAIN_BASE_LOG_DIR" || true
@@ -232,7 +246,11 @@ fi
 
 # ============================== Output dir + meta ==============================
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
-BASE_LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}-cascade-${TAG}"
+if [ -n "$OUTPUT_DIR_OVERRIDE" ]; then
+  BASE_LOG_DIR="$OUTPUT_DIR_OVERRIDE"
+else
+  BASE_LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}-cascade-${TAG}"
+fi
 case "$CACHE_MODE" in
   none|L1)  LOG_DIR="${BASE_LOG_DIR}/${CACHE_MODE}" ;;
   L2)       LOG_DIR="${BASE_LOG_DIR}/L2_size_${HICACHE_SIZE}" ;;

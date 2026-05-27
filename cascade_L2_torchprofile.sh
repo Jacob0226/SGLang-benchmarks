@@ -376,6 +376,7 @@ if curl -s -o /dev/null -w '%{http_code}' "http://${HOST}:${PORT}/health" 2>/dev
 fi
 
 CASCADE_LOG="$OUTPUT_DIR/cascade_dsr1_lite.log"
+BENCH_OUTPUT_DIR="$OUTPUT_DIR/bench"
 echo ">>> launching cascade_dsr1_lite.sh in background; log: $CASCADE_LOG (also streaming below)"
 "$CASCADE_LITE" \
   --tag "${TAG}_L1${L1_SIZE}_L2${L2_SIZE}" \
@@ -391,6 +392,7 @@ echo ">>> launching cascade_dsr1_lite.sh in background; log: $CASCADE_LOG (also 
   --request-length "$REQUEST_LENGTH" \
   --max-parallel "$MAX_PARALLEL" \
   --request-rate "$REQUEST_RATE" \
+  --output-dir "$BENCH_OUTPUT_DIR" \
   2>&1 | tee "$CASCADE_LOG" &
 CASCADE_PID=$!
 
