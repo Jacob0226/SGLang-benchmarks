@@ -23,15 +23,31 @@ OUTPUT_LENGTH=1
 MAX_PARALLEL=8
 REQUEST_RATE=32
 CUDA_GRAPH_MAX_BS=0
-CHUNKED_PREFILL_SIZE=32768
-MAX_PREFILL_TOKENS=32768
-MEM_FRACTION_STATIC=0.85
+# Aligned to InferenceX dsr1_fp8_mi355x.sh (validated 2026-05-28):
+#   chunked_prefill_size = max_prefill_tokens = 196608  (was 32768)
+#   mem_fraction_static  = 0.8                          (was 0.85; sglang
+#                                                        internal-scales to ~0.68)
+# Larger prefill window matters most for HiCache cold-start rounds where
+# many requests' 4K prefixes hit the server simultaneously.
+CHUNKED_PREFILL_SIZE=196608
+MAX_PREFILL_TOKENS=196608
+MEM_FRACTION_STATIC=0.8
 MEM_FRACTION_EXPLICIT=false   # flipped true when --mem-fraction-static is passed
 L1_SIZE=""                    # GB/rank; when set, mem-fraction-static is auto-derived
                               # via compute_profile_params.py (mutually exclusive
                               # with --mem-fraction-static)
-PAGE_SIZE=64
-CONTEXT_LENGTH=65536
+# PAGE_SIZE / CONTEXT_LENGTH default to empty: sglang auto-picks page_size=1
+# (aiter MLA legacy path) and context_length=model native (163840 for DSR1).
+# Earlier baseline (PAGE_SIZE=64, CONTEXT_LENGTH=65536) caused 2000ms TTFT in
+# disable-radix-cache runs and reproducible GPU memory access faults at higher
+# concurrency -- root-caused to PR #25556 fix #2 (cuda_graph_kv_indices buffer
+# overrun, see HiCachePatch/pr25556-explained.md). To use page_size>1, pass
+# --page-size N explicitly AND apply local-patches/HiCachePatch/apply-all.sh
+# on the sglang checkout first.
+PAGE_SIZE=""
+PAGE_SIZE_EXPLICIT=false
+CONTEXT_LENGTH=""
+CONTEXT_LENGTH_EXPLICIT=false
 HICACHE_WRITE_POLICY="write_through"
 # Layout × io backend compatibility matrix (server_args.py:3108-3125
 # silently rewrites incompatible pairs, so we pin the recommended one).
@@ -76,7 +92,8 @@ while [[ $# -gt 0 ]]; do
     --request-rate)        REQUEST_RATE="$2"; shift 2;;
     --mem-fraction-static) MEM_FRACTION_STATIC="$2"; MEM_FRACTION_EXPLICIT=true; shift 2;;
     --L1-size)             L1_SIZE="$2"; shift 2;;
-    --page-size)           PAGE_SIZE="$2"; shift 2;;
+    --page-size)           PAGE_SIZE="$2"; PAGE_SIZE_EXPLICIT=true; shift 2;;
+    --context-length)      CONTEXT_LENGTH="$2"; CONTEXT_LENGTH_EXPLICIT=true; shift 2;;
     --hicache-mem-layout)  HICACHE_MEM_LAYOUT="$2"; shift 2;;
     --hicache-io-backend)  HICACHE_IO_BACKEND="$2"; shift 2;;
     --attention-backend)   ATTENTION_BACKEND="$2"; shift 2;;
@@ -269,12 +286,13 @@ mkdir -p "$LOG_DIR"
 } > "$LOG_DIR/cmdline.txt"
 
 META_HICACHE=$([ "$CACHE_MODE" = "none" ] || [ "$CACHE_MODE" = "L1" ] && echo "null" || echo "$HICACHE_SIZE")
+META_PAGE_SIZE=$([ "$PAGE_SIZE_EXPLICIT" = true ] && echo "$PAGE_SIZE" || echo "null")
 cat > "$LOG_DIR/bench_meta.json" <<EOF
 {
   "cache_mode": "$CACHE_MODE",
   "model_path": "$MODEL_PATH",
   "model_name": "$MODEL_NAME",
-  "page_size": $PAGE_SIZE,
+  "page_size": $META_PAGE_SIZE,
   "tp_size": $TP_SIZE,
   "hicache_size_gb": $META_HICACHE,
   "hicache_write_policy": "$HICACHE_WRITE_POLICY",
@@ -345,12 +363,24 @@ fi
 export PYTHONUNBUFFERED=1
 export SAFETENSORS_FAST_GPU=1
 if [ "$VENDOR" = "amd" ]; then
-  # DSR1-0528 + ROCm aiter + page_size=64: must disable PR #18528 FP8
-  # prefill kernel; SGLANG_USE_AITER picks the aiter prefill/decode path;
-  # ROCM_QUICK_REDUCE_QUANTIZATION=NONE keeps allreduce in fp16/bf16.
+  # Aligned to InferenceX dsr1_fp8_mi355x.sh:
+  #   SGLANG_USE_AITER=1                       aiter prefill/decode path
+  #   RCCL_MSCCL_ENABLE=0                      pin RCCL path (no MSCCL)
+  #   ROCM_QUICK_REDUCE_QUANTIZATION=INT4      quick-allreduce quantized to INT4
+  #                                            (was NONE; InferenceX uses INT4
+  #                                            with no accuracy regression)
+  #   SGLANG_AITER_FP8_PREFILL_ATTN=0          bf16 prefill kernel
+  #                                            (gfx95 default is True; InferenceX
+  #                                            relies on it but on this hardware
+  #                                            bf16 and fp8 prefill are within
+  #                                            noise -- see 8combinations sweep)
   export SGLANG_USE_AITER=1
-  export ROCM_QUICK_REDUCE_QUANTIZATION=NONE
-  export SGLANG_AITER_FP8_PREFILL_ATTN=0
+  export RCCL_MSCCL_ENABLE=0
+  export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
+  # Honor caller-set value so sweeps can flip fp8 prefill on/off without
+  # editing the script. Default off matches InferenceX behavior on this
+  # hardware (bf16 prefill within noise of fp8 prefill per 8combinations).
+  export SGLANG_AITER_FP8_PREFILL_ATTN=${SGLANG_AITER_FP8_PREFILL_ATTN:-0}
 fi
 
 SERVER_CMD=(
@@ -359,17 +389,18 @@ SERVER_CMD=(
     --tp "$TP_SIZE"
     --host "$HOST" --port "$PORT"
     --mem-fraction-static "$MEM_FRACTION_STATIC"
-    --watchdog-timeout 2400
     --enable-metrics
-    --enable-cache-report
     --trust-remote-code
     --kv-cache-dtype fp8_e4m3
-    --page-size "$PAGE_SIZE"
-    --context-length "$CONTEXT_LENGTH"
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
     --max-prefill-tokens "$MAX_PREFILL_TOKENS"
     --attention-backend "$ATTENTION_BACKEND"
 )
+# Only opt-in --page-size / --context-length when explicitly overridden. The
+# defaults let sglang auto-pick page_size=1 (aiter MLA legacy) and
+# context_length=163840 (model native), matching InferenceX.
+[ "$PAGE_SIZE_EXPLICIT" = true ] && SERVER_CMD+=(--page-size "$PAGE_SIZE")
+[ "$CONTEXT_LENGTH_EXPLICIT" = true ] && SERVER_CMD+=(--context-length "$CONTEXT_LENGTH")
 if [ "$VENDOR" = "nvidia" ]; then
   # Matches the previously-validated B200 cascade (May-12 run): use
   # FlashInfer's TRT-LLM kernels for MoE + fused allreduce.
@@ -444,10 +475,13 @@ echo ">>> server ready (pid=$SERVER_BG_PID)"
 
 # ============================== Warmup ==============================
 echo ">>> warmup"
+# random-range-ratio 0.8 matches InferenceX (input lengths uniform in
+# [0.8*N, N]); previous 1.0 was a fixed length that didn't reflect the
+# distribution InferenceX uses.
 python3 -m sglang.bench_serving \
   --backend sglang --host "$HOST" --port "$PORT" \
   --model "$MODEL_PATH" --dataset-name random \
-  --random-input 1024 --random-output 128 --random-range-ratio 1.0 \
+  --random-input 1024 --random-output 128 --random-range-ratio 0.8 \
   --max-concurrency 4 --num-prompt 8 --output-file /dev/null \
   2>&1 | tee "$LOG_DIR/warmup.log"
 
