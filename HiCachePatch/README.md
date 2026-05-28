@@ -19,6 +19,7 @@ your branches originate; the patches must not pollute pushes.
 | `apply-all.sh` | Apply all patches below |
 | `no-aiter-mem-fraction.sh` | Remove the AMD aiter long-context `mem_fraction_static *= 0.85` silent adjustment in `server_args.py`. Without this, MI355X and B200 use different KV pools for the same `--mem-fraction-static` flag value. |
 | `pr25556-aiter-mla-page-size.sh` | Apply both fixes from sglang PR #25556 (fix #1 from upstream + fix #2 manually re-applied with gemini-bot's `use_mla` suggestion). Required to use `--page-size > 1` with AITER MLA backend without crashing. |
+| `pr25556-explained.md` | Concrete walkthrough (4096-token example) of how `page_size` flows through allocator → metadata → kernel, why the kernel is page-agnostic, and where the buggy buffer makes the framework disagree with the kernel. |
 
 ## PR #25556 patch details
 
