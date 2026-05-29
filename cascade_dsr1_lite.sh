@@ -63,6 +63,12 @@ CONTEXT_LENGTH_EXPLICIT=false
 #   "1"   -> force ON  (fp8 prefill, matches InferenceX default for gfx95).
 # CLI: --aiter-fp8-prefill-attn N  (N in 0|1)
 AITER_FP8_PREFILL_ATTN=""
+# L3 prefetch threshold (tokens). After local L1+L2 match, sglang queries L3
+# for the next continuous matching span; a prefetch is only triggered if the
+# L3-hit length >= this threshold. Default empty = use sglang code default
+# (256). Configured via --hicache-storage-backend-extra-config JSON, only
+# meaningful for cache_mode in {L3_file}.
+PREFETCH_THRESHOLD=""
 HICACHE_WRITE_POLICY="write_through"
 # Layout × io backend compatibility matrix (server_args.py:3108-3125
 # silently rewrites incompatible pairs, so we pin the recommended one).
@@ -113,6 +119,10 @@ while [[ $# -gt 0 ]]; do
     --hicache-io-backend)  HICACHE_IO_BACKEND="$2"; shift 2;;
     --aiter-fp8-prefill-attn)
                            AITER_FP8_PREFILL_ATTN="$2"; shift 2;;
+    --chunked-prefill-size)
+                           CHUNKED_PREFILL_SIZE="$2"; shift 2;;
+    --max-prefill-tokens)  MAX_PREFILL_TOKENS="$2"; shift 2;;
+    --prefetch-threshold)  PREFETCH_THRESHOLD="$2"; shift 2;;
     --attention-backend)   ATTENTION_BACKEND="$2"; shift 2;;
     --output-dir)          OUTPUT_DIR_OVERRIDE="$2"; shift 2;;
     --gsm8k-num-questions) GSM8K_NUM_QUESTIONS="$2"; shift 2;;
@@ -319,6 +329,9 @@ cat > "$LOG_DIR/bench_meta.json" <<EOF
   "hicache_mem_layout": "$HICACHE_MEM_LAYOUT",
   "hicache_io_backend": "$HICACHE_IO_BACKEND",
   "aiter_fp8_prefill_attn": $META_FP8_PREFILL,
+  "chunked_prefill_size": $CHUNKED_PREFILL_SIZE,
+  "max_prefill_tokens": $MAX_PREFILL_TOKENS,
+  "prefetch_threshold": $([ -n "$PREFETCH_THRESHOLD" ] && echo "$PREFETCH_THRESHOLD" || echo "null"),
   "mem_fraction_static": $MEM_FRACTION_STATIC,
   "num_clients": $NUM_CLIENTS,
   "num_rounds": $NUM_ROUNDS,
@@ -464,7 +477,15 @@ case "$CACHE_MODE" in
       --hicache-write-policy "$HICACHE_WRITE_POLICY"
       --hicache-storage-backend file
       --hicache-storage-prefetch-policy best_effort
-    );;
+    )
+    # Override the L3 prefetch trigger threshold (sglang code default 256
+    # tokens). Empty = leave default. Translated to the JSON extra-config
+    # the storage backend pops in hiradix_cache.py:587.
+    if [ -n "$PREFETCH_THRESHOLD" ]; then
+      SERVER_CMD+=(--hicache-storage-backend-extra-config \
+        "{\"prefetch_threshold\":$PREFETCH_THRESHOLD}")
+    fi
+    ;;
 esac
 
 # ============================== Launch + pre-check + health ==============================
