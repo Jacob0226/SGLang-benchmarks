@@ -158,6 +158,14 @@ fix2_applied_marker = "HiCachePatch (PR #25556 fix #2"
 fix2_code_signature = (
     "if not self.use_triton_unified_attention or self.use_mla:"
 )
+# Upstream alternative fix that landed in some images instead of the PR
+# #25556 form: instead of branching on use_mla / use_triton_unified, they
+# multiply the block-granularity allocation by page_size to recover
+# token-granularity. Functionally equivalent for our purposes, so we
+# treat it as "already applied" rather than overwriting it.
+fix2_upstream_signature = (
+    "max_bs * max_num_blocks_per_seq * self.page_size"
+)
 fix2_old_signature = (
     "(max_bs * max_num_blocks_per_seq),\n"
     "                dtype=torch.int32"
@@ -165,6 +173,8 @@ fix2_old_signature = (
 
 if fix2_applied_marker in src or fix2_code_signature in src:
     fix2_status = "already applied"
+elif fix2_upstream_signature in src:
+    fix2_status = "already applied (upstream alternative)"
 elif fix2_old in src:
     src = src.replace(fix2_old, fix2_new, 1)
     fix2_status = "applied"
