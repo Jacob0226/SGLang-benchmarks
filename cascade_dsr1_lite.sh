@@ -56,6 +56,13 @@ L1_SIZE=""                    # GB/rank; when set, mem-fraction-static is auto-d
 PAGE_SIZE=64
 CONTEXT_LENGTH=""
 CONTEXT_LENGTH_EXPLICIT=false
+# AITER fp8 prefill attention toggle (AMD only, gated by gfx95). Tristate:
+#   ""    -> let the existing env var win, falling back to 0 (script-historical
+#            default, OFF / bf16 prefill).
+#   "0"   -> force OFF (bf16 prefill).
+#   "1"   -> force ON  (fp8 prefill, matches InferenceX default for gfx95).
+# CLI: --aiter-fp8-prefill-attn N  (N in 0|1)
+AITER_FP8_PREFILL_ATTN=""
 HICACHE_WRITE_POLICY="write_through"
 # Layout × io backend compatibility matrix (server_args.py:3108-3125
 # silently rewrites incompatible pairs, so we pin the recommended one).
@@ -104,6 +111,8 @@ while [[ $# -gt 0 ]]; do
     --context-length)      CONTEXT_LENGTH="$2"; CONTEXT_LENGTH_EXPLICIT=true; shift 2;;
     --hicache-mem-layout)  HICACHE_MEM_LAYOUT="$2"; shift 2;;
     --hicache-io-backend)  HICACHE_IO_BACKEND="$2"; shift 2;;
+    --aiter-fp8-prefill-attn)
+                           AITER_FP8_PREFILL_ATTN="$2"; shift 2;;
     --attention-backend)   ATTENTION_BACKEND="$2"; shift 2;;
     --output-dir)          OUTPUT_DIR_OVERRIDE="$2"; shift 2;;
     --gsm8k-num-questions) GSM8K_NUM_QUESTIONS="$2"; shift 2;;
@@ -294,6 +303,10 @@ mkdir -p "$LOG_DIR"
 } > "$LOG_DIR/cmdline.txt"
 
 META_HICACHE=$([ "$CACHE_MODE" = "none" ] || [ "$CACHE_MODE" = "L1" ] && echo "null" || echo "$HICACHE_SIZE")
+# Record the fp8-prefill resolution: explicit CLI flag wins, then env var,
+# then script default 0. Captured before the AMD env block runs (so this
+# only reflects intent; the actual exported value is decided there).
+META_FP8_PREFILL=$([ -n "$AITER_FP8_PREFILL_ATTN" ] && echo "$AITER_FP8_PREFILL_ATTN" || echo "${SGLANG_AITER_FP8_PREFILL_ATTN:-0}")
 cat > "$LOG_DIR/bench_meta.json" <<EOF
 {
   "cache_mode": "$CACHE_MODE",
@@ -305,6 +318,7 @@ cat > "$LOG_DIR/bench_meta.json" <<EOF
   "hicache_write_policy": "$HICACHE_WRITE_POLICY",
   "hicache_mem_layout": "$HICACHE_MEM_LAYOUT",
   "hicache_io_backend": "$HICACHE_IO_BACKEND",
+  "aiter_fp8_prefill_attn": $META_FP8_PREFILL,
   "mem_fraction_static": $MEM_FRACTION_STATIC,
   "num_clients": $NUM_CLIENTS,
   "num_rounds": $NUM_ROUNDS,
@@ -384,10 +398,19 @@ if [ "$VENDOR" = "amd" ]; then
   export SGLANG_USE_AITER=1
   export RCCL_MSCCL_ENABLE=0
   export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
-  # Honor caller-set value so sweeps can flip fp8 prefill on/off without
-  # editing the script. Default off matches InferenceX behavior on this
-  # hardware (bf16 prefill within noise of fp8 prefill per 8combinations).
-  export SGLANG_AITER_FP8_PREFILL_ATTN=${SGLANG_AITER_FP8_PREFILL_ATTN:-0}
+  # fp8 prefill toggle, in priority order:
+  #   1. --aiter-fp8-prefill-attn N      (CLI flag, highest)
+  #   2. caller-exported SGLANG_AITER_FP8_PREFILL_ATTN
+  #   3. fall back to "0" (OFF, bf16 prefill — script-historical default
+  #      that matches the OLD 0527 reference baseline)
+  # NOTE: sglang's own code-default for this env var is "True" (fp8 ON).
+  # Because we always export here, that code-default never kicks in unless
+  # the caller deliberately unsets the env var AND removes this export.
+  if [ -n "$AITER_FP8_PREFILL_ATTN" ]; then
+    export SGLANG_AITER_FP8_PREFILL_ATTN="$AITER_FP8_PREFILL_ATTN"
+  else
+    export SGLANG_AITER_FP8_PREFILL_ATTN=${SGLANG_AITER_FP8_PREFILL_ATTN:-0}
+  fi
 fi
 
 SERVER_CMD=(
