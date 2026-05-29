@@ -36,16 +36,24 @@ MEM_FRACTION_EXPLICIT=false   # flipped true when --mem-fraction-static is passe
 L1_SIZE=""                    # GB/rank; when set, mem-fraction-static is auto-derived
                               # via compute_profile_params.py (mutually exclusive
                               # with --mem-fraction-static)
-# PAGE_SIZE / CONTEXT_LENGTH default to empty: sglang auto-picks page_size=1
-# (aiter MLA legacy path) and context_length=model native (163840 for DSR1).
-# Earlier baseline (PAGE_SIZE=64, CONTEXT_LENGTH=65536) caused 2000ms TTFT in
-# disable-radix-cache runs and reproducible GPU memory access faults at higher
-# concurrency -- root-caused to PR #25556 fix #2 (cuda_graph_kv_indices buffer
-# overrun, see HiCachePatch/pr25556-explained.md). To use page_size>1, pass
-# --page-size N explicitly AND apply local-patches/HiCachePatch/apply-all.sh
-# on the sglang checkout first.
-PAGE_SIZE=""
-PAGE_SIZE_EXPLICIT=false
+# PAGE_SIZE default = 64 to match the L3_file prefetch granularity that the
+# file backend was tuned for. ps=1 (sglang auto for aiter MLA legacy) is
+# correct/safe but cripples L3 prefetch efficiency: in our 30-client / 8-round
+# / L1=10 / L2=20 cascade, ps=1 capped round-8 hit rate at 20% with 261k
+# prefetched tokens, vs ps=64 reaching 50% hit / 1.37M tokens prefetched
+# (round 8 TTFT 7.44s -> 4.60s).
+#
+# IMPORTANT: ps=64 requires HiCachePatch fix #2 applied to the sglang
+# checkout, otherwise cuda_graph_kv_indices is undersized by 64x and the
+# server gets a "Memory access fault by GPU node-N" the moment any
+# longer-context decode hits the cuda graph (PR sgl-project/sglang#25556
+# fix #2 was force-pushed away during review; see HiCachePatch/README.md
+# and pr25556-explained.md).
+#
+# To force the safe-without-patch ps=1 path, pass --page-size 1.
+# CONTEXT_LENGTH default stays empty: sglang uses model native (163840 for
+# DSR1).
+PAGE_SIZE=64
 CONTEXT_LENGTH=""
 CONTEXT_LENGTH_EXPLICIT=false
 HICACHE_WRITE_POLICY="write_through"
@@ -92,7 +100,7 @@ while [[ $# -gt 0 ]]; do
     --request-rate)        REQUEST_RATE="$2"; shift 2;;
     --mem-fraction-static) MEM_FRACTION_STATIC="$2"; MEM_FRACTION_EXPLICIT=true; shift 2;;
     --L1-size)             L1_SIZE="$2"; shift 2;;
-    --page-size)           PAGE_SIZE="$2"; PAGE_SIZE_EXPLICIT=true; shift 2;;
+    --page-size)           PAGE_SIZE="$2"; shift 2;;
     --context-length)      CONTEXT_LENGTH="$2"; CONTEXT_LENGTH_EXPLICIT=true; shift 2;;
     --hicache-mem-layout)  HICACHE_MEM_LAYOUT="$2"; shift 2;;
     --hicache-io-backend)  HICACHE_IO_BACKEND="$2"; shift 2;;
@@ -286,13 +294,12 @@ mkdir -p "$LOG_DIR"
 } > "$LOG_DIR/cmdline.txt"
 
 META_HICACHE=$([ "$CACHE_MODE" = "none" ] || [ "$CACHE_MODE" = "L1" ] && echo "null" || echo "$HICACHE_SIZE")
-META_PAGE_SIZE=$([ "$PAGE_SIZE_EXPLICIT" = true ] && echo "$PAGE_SIZE" || echo "null")
 cat > "$LOG_DIR/bench_meta.json" <<EOF
 {
   "cache_mode": "$CACHE_MODE",
   "model_path": "$MODEL_PATH",
   "model_name": "$MODEL_NAME",
-  "page_size": $META_PAGE_SIZE,
+  "page_size": $PAGE_SIZE,
   "tp_size": $TP_SIZE,
   "hicache_size_gb": $META_HICACHE,
   "hicache_write_policy": "$HICACHE_WRITE_POLICY",
@@ -392,14 +399,12 @@ SERVER_CMD=(
     --enable-metrics
     --trust-remote-code
     --kv-cache-dtype fp8_e4m3
+    --page-size "$PAGE_SIZE"
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
     --max-prefill-tokens "$MAX_PREFILL_TOKENS"
     --attention-backend "$ATTENTION_BACKEND"
 )
-# Only opt-in --page-size / --context-length when explicitly overridden. The
-# defaults let sglang auto-pick page_size=1 (aiter MLA legacy) and
-# context_length=163840 (model native), matching InferenceX.
-[ "$PAGE_SIZE_EXPLICIT" = true ] && SERVER_CMD+=(--page-size "$PAGE_SIZE")
+# --context-length is opt-in (sglang uses model native by default).
 [ "$CONTEXT_LENGTH_EXPLICIT" = true ] && SERVER_CMD+=(--context-length "$CONTEXT_LENGTH")
 if [ "$VENDOR" = "nvidia" ]; then
   # Matches the previously-validated B200 cascade (May-12 run): use
