@@ -153,14 +153,14 @@ PLATFORM_PALETTE = {
     "MI355X": {
         # Hue shift: dark red (L1) -> orange (L2) -> amber/yellow (L3+) so
         # the lightest tier doesn't look like a faded version of L2.
-        "none":             "#3b0d00",  # nearly black red-brown (no cache baseline)
-        "no_cache":         "#3b0d00",
+        "none":             "#8B4513",  # brown no-cache baseline
+        "no_cache":         "#8B4513",
         "L1":               "#bf360c",  # dark orange / red-brown
         "L2":               "#ef6c00",  # warm orange (deeper)
         "L3_file":          "#ffd54f",  # amber (yellow-toned, clear gap from L2)
         "L3_hf3fs":         "#ffe082",
         "L3_mooncake":      "#fff59d",
-        "no_radix":         "#3b0d00",
+        "no_radix":         "#8B4513",
         "radix":             "#bf360c",
         "hicache":           "#ef6c00",
         "hicache_file":      "#ffd54f",

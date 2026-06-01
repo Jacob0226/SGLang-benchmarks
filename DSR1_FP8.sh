@@ -25,16 +25,21 @@ PORT=8552
 
 # InferenceX-like random dense workloads.
 IN_OUT_TOKENS=("1024:1024" "8192:1024" "16384:1024")
-CONCURRENCIES=(4) #  8 16 32 64
-PROMPT_MULTIPLIER=5
-RANDOM_RANGE_RATIO=1.0
+CONCURRENCIES=(4 32) #  8 16 32 64
+PROMPT_MULTIPLIER=10
+RANDOM_RANGE_RATIO=0.8
 DATASET="random"
 
-MEM_FRACTION_STATIC=0.85
-PAGE_SIZE=64
-CONTEXT_LENGTH=65536
-CHUNKED_PREFILL_SIZE=32768
-MAX_PREFILL_TOKENS=32768
+MEM_FRACTION_STATIC=""
+MEM_FRACTION_EXPLICIT=false
+PAGE_SIZE=""
+PAGE_SIZE_EXPLICIT=false
+CONTEXT_LENGTH=""
+CONTEXT_LENGTH_EXPLICIT=false
+CHUNKED_PREFILL_SIZE=""
+CHUNKED_PREFILL_EXPLICIT=false
+MAX_PREFILL_TOKENS=""
+MAX_PREFILL_EXPLICIT=false
 DISABLE_RADIX_CACHE=true
 SKIP_WARMUP=false
 GSM8K_PRECHECK=true
@@ -44,7 +49,12 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --model) MODEL_PATH="$2"; shift 2;;
     --tp) TP_SIZE="$2"; shift 2;;
-    --docker) DOCKER="$2"; shift 2;;
+    --docker)
+      # Support `DOCKER=img ./DSR1_FP8.sh --docker "$DOCKER"` where "$DOCKER"
+      # is expanded by the parent shell before the inline env assignment.
+      [ -n "${2:-}" ] && DOCKER="$2"
+      shift 2
+      ;;
     --tag) USER_TAG="-$2"; shift 2;;
     --host) HOST="$2"; shift 2;;
     --port) PORT="$2"; shift 2;;
@@ -58,11 +68,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     --prompt-multiplier) PROMPT_MULTIPLIER="$2"; shift 2;;
     --random-range-ratio) RANDOM_RANGE_RATIO="$2"; shift 2;;
-    --mem-fraction-static) MEM_FRACTION_STATIC="$2"; shift 2;;
-    --page-size) PAGE_SIZE="$2"; shift 2;;
-    --context-length) CONTEXT_LENGTH="$2"; shift 2;;
-    --chunked-prefill-size) CHUNKED_PREFILL_SIZE="$2"; shift 2;;
-    --max-prefill-tokens) MAX_PREFILL_TOKENS="$2"; shift 2;;
+    --mem-fraction-static) MEM_FRACTION_STATIC="$2"; MEM_FRACTION_EXPLICIT=true; shift 2;;
+    --page-size) PAGE_SIZE="$2"; PAGE_SIZE_EXPLICIT=true; shift 2;;
+    --context-length) CONTEXT_LENGTH="$2"; CONTEXT_LENGTH_EXPLICIT=true; shift 2;;
+    --chunked-prefill-size) CHUNKED_PREFILL_SIZE="$2"; CHUNKED_PREFILL_EXPLICIT=true; shift 2;;
+    --max-prefill-tokens) MAX_PREFILL_TOKENS="$2"; MAX_PREFILL_EXPLICIT=true; shift 2;;
     --enable-radix-cache) DISABLE_RADIX_CACHE=false; shift 1;;
     --skip-warmup) SKIP_WARMUP=true; shift 1;;
     --no-gsm8k-precheck) GSM8K_PRECHECK=false; shift 1;;
@@ -81,9 +91,9 @@ Common opts:
   --tp N                         Default: $TP_SIZE
   --in-out "I:O ..."             Default: "1024:1024 8192:1024"
   --concurrencies "N ..."        Default: "4 8 16 32 64"
-  --prompt-multiplier N          num_prompts = concurrency * N (default 5)
+  --prompt-multiplier N          num_prompts = concurrency * N (default 10)
   --random-range-ratio R         Default: 1.0
-  --mem-fraction-static F        Default: 0.85
+  --mem-fraction-static F        Override InferenceX platform default
   --enable-radix-cache           Keep prefix/radix cache on (default off)
   --skip-warmup                  Skip 2048/256 warmup
   --no-gsm8k-precheck            Skip GSM8K accuracy check
@@ -128,6 +138,77 @@ start_server() {
   export PYTHONUNBUFFERED=1
   export SAFETENSORS_FAST_GPU=1
 
+  local max_conc=0
+  for c in "${CONCURRENCIES[@]}"; do
+    if [ "$c" -gt "$max_conc" ]; then
+      max_conc="$c"
+    fi
+  done
+
+  local cuda_graph_max_bs=""
+  local max_running_requests=""
+  local scheduler_recv_interval=""
+  if is_rocm_gpu_env; then
+    if [ "$MEM_FRACTION_EXPLICIT" = false ]; then
+      MEM_FRACTION_STATIC=0.8
+    fi
+    if [ "$CHUNKED_PREFILL_EXPLICIT" = false ]; then
+      CHUNKED_PREFILL_SIZE=196608
+    fi
+    if [ "$MAX_PREFILL_EXPLICIT" = false ]; then
+      MAX_PREFILL_TOKENS=196608
+    fi
+    cuda_graph_max_bs="$max_conc"
+    # Match InferenceX benchmarks/single_node/dsr1_fp8_mi355x.sh exactly:
+    # they hard-export INT4 to override the rocm700-mi35x image's baked-in INT8.
+    export SGLANG_USE_AITER=1
+    export RCCL_MSCCL_ENABLE=0
+    export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
+    export SGLANG_AITER_FP8_PREFILL_ATTN=${SGLANG_AITER_FP8_PREFILL_ATTN:-0}
+  else
+    if [ "$TP_SIZE" -eq 8 ]; then
+      if [ "$MEM_FRACTION_EXPLICIT" = false ]; then
+        MEM_FRACTION_STATIC=0.82
+      fi
+      if [ "$CHUNKED_PREFILL_EXPLICIT" = false ]; then
+        CHUNKED_PREFILL_SIZE=32768
+      fi
+      if [ "$MAX_PREFILL_EXPLICIT" = false ]; then
+        MAX_PREFILL_TOKENS=32768
+      fi
+      max_running_requests=128
+      cuda_graph_max_bs=128
+      if [ "$max_conc" -ge 16 ]; then
+        scheduler_recv_interval=30
+      else
+        scheduler_recv_interval=10
+      fi
+    elif [ "$TP_SIZE" -eq 4 ]; then
+      if [ "$MEM_FRACTION_EXPLICIT" = false ]; then
+        MEM_FRACTION_STATIC=0.95
+      fi
+      if [ "$CHUNKED_PREFILL_EXPLICIT" = false ]; then
+        CHUNKED_PREFILL_SIZE=8192
+      fi
+      if [ "$MAX_PREFILL_EXPLICIT" = false ]; then
+        MAX_PREFILL_TOKENS=8192
+      fi
+      max_running_requests=32
+      cuda_graph_max_bs=32
+      scheduler_recv_interval=10
+    else
+      echo "ERROR: InferenceX B200 recipe only handles TP=4 or TP=8, got TP=${TP_SIZE}" >&2
+      exit 1
+    fi
+    export SGL_ENABLE_JIT_DEEPGEMM=false
+    export SGLANG_ENABLE_FLASHINFER_GEMM=true
+  fi
+
+  # Mirror InferenceX benchmarks/single_node/dsr1_fp8_mi355x.sh EXACTLY:
+  #   - no --page-size  (let sglang auto-pick page_size=1 for aiter legacy MQA path)
+  #   - no --context-length (let it default to model's 163840)
+  #   - no --enable-metrics, --enable-cache-report
+  #   - default --watchdog-timeout (300)
   local cmd=(
     python3 -u -m sglang.launch_server
       --model-path "$MODEL_PATH"
@@ -135,16 +216,20 @@ start_server() {
       --host "$HOST"
       --port "$PORT"
       --mem-fraction-static "$MEM_FRACTION_STATIC"
-      --watchdog-timeout 2400
-      --enable-metrics
-      --enable-cache-report
       --trust-remote-code
       --kv-cache-dtype fp8_e4m3
-      --page-size "$PAGE_SIZE"
-      --context-length "$CONTEXT_LENGTH"
       --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
       --max-prefill-tokens "$MAX_PREFILL_TOKENS"
+      --cuda-graph-max-bs "$cuda_graph_max_bs"
   )
+
+  # Honor explicit --page-size / --context-length overrides if the user set them.
+  if [ "$PAGE_SIZE_EXPLICIT" = true ]; then
+    cmd+=(--page-size "$PAGE_SIZE")
+  fi
+  if [ "$CONTEXT_LENGTH_EXPLICIT" = true ]; then
+    cmd+=(--context-length "$CONTEXT_LENGTH")
+  fi
 
   if [ "$DISABLE_RADIX_CACHE" = true ]; then
     cmd+=(--disable-radix-cache)
@@ -153,18 +238,19 @@ start_server() {
   if is_rocm_gpu_env; then
     cmd+=(
       --attention-backend aiter
+      --num-continuous-decode-steps 8
     )
-    export SGLANG_USE_AITER=1
-    export ROCM_QUICK_REDUCE_QUANTIZATION=NONE
-    export SGLANG_AITER_FP8_PREFILL_ATTN=0
   else
     cmd+=(
+      --max-running-requests "$max_running_requests"
+      --scheduler-recv-interval "$scheduler_recv_interval"
       --attention-backend trtllm_mla
+      --stream-interval 30
+      --ep-size 1
       --moe-runner-backend flashinfer_trtllm
       --enable-flashinfer-allreduce-fusion
       --quantization fp8
     )
-    export SGL_ENABLE_JIT_DEEPGEMM=1
   fi
 
   if [ "${#EXTRA_SERVER_ARGS[@]}" -gt 0 ]; then
@@ -236,12 +322,15 @@ run_benchmarks() {
     IFS=":" read -r input_tokens output_tokens <<< "$io_pair"
     for c in "${CONCURRENCIES[@]}"; do
       local num_prompts=$(( c * PROMPT_MULTIPLIER ))
+      local warmup_requests=$(( c * 2 ))
       local logfile="$LOG_DIR/bench_in${input_tokens}_out${output_tokens}_conc${c}.log"
       if grep -q "$logfile" "$FINISH_LOG"; then
         echo "Found $logfile in ${FINISH_LOG}. Skipping."
         continue
       fi
 
+      # Match InferenceX bench client: --num-warmups 2*conc (sglang default = 1).
+      # Cold-start would otherwise pollute the first few requests' TTFT.
       local cmd=(
         python3 -m sglang.bench_serving
           --backend sglang
@@ -254,6 +343,7 @@ run_benchmarks() {
           --random-range-ratio "$RANDOM_RANGE_RATIO"
           --max-concurrency "$c"
           --num-prompt "$num_prompts"
+          --warmup-requests "$warmup_requests"
           --output-file /dev/null
       )
       log_command "$logfile" "${cmd[@]}"
