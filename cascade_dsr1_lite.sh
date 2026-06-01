@@ -288,6 +288,275 @@ elif [ "$HICACHE_SIZE" = "auto" ]; then
   echo ">>> auto hicache-size: ${HICACHE_SIZE} GB/rank (total $(( HICACHE_SIZE * TP_SIZE )) GB)"
 fi
 
+# ============================== Host snapshot helpers ==============================
+# One-shot CPU / DRAM / NVMe / GPU snapshot, ported verbatim from
+# cascade_dsr1.sh. Captured per cache-mode into $LOG_DIR/host_info.log so
+# every lite run records the box's CPU model/speed, DRAM speed, and the
+# NVMe (L3 backing disk) PCIe bandwidth ceiling alongside its results.
+#
+# PCIe link speed string → GB/s per lane (single direction, post-encoding):
+# Gen1 0.25, Gen2 0.5, Gen3 0.985, Gen4 1.969, Gen5 3.938, Gen6 7.877.
+# Returns 0 for unknown speeds.
+pcie_lane_gbps() {
+  case "$1" in
+    "2.5 GT/s PCIe"|"2.5 GT/s")   echo "0.250" ;;
+    "5.0 GT/s PCIe"|"5.0 GT/s")   echo "0.500" ;;
+    "8.0 GT/s PCIe"|"8.0 GT/s")   echo "0.985" ;;
+    "16.0 GT/s PCIe"|"16.0 GT/s") echo "1.969" ;;
+    "32.0 GT/s PCIe"|"32.0 GT/s") echo "3.938" ;;
+    "64.0 GT/s PCIe"|"64.0 GT/s") echo "7.877" ;;
+    *)                            echo "0"     ;;
+  esac
+}
+
+# collect_host_info prints a one-shot CPU / DRAM / NVMe / GPU snapshot of
+# the box to stdout. Caller decides whether to tee it to a log file. Uses
+# TAG and HICACHE_SIZE (with sensible fallbacks) only for the predicted
+# L3 file-backend path string.
+collect_host_info() {
+  local tag_for_path="${TAG:-host_info_only}"
+  local size_for_path="${HICACHE_SIZE:-N}"
+  echo "=== cascade_dsr1_lite.sh host snapshot @ $(date '+%F %T %Z') ==="
+  echo "--- lscpu ---"
+  lscpu | grep -E "Architecture|Vendor|Model name|CPU\(s\)|Socket|Core|Thread|NUMA|^CPU max MHz|^CPU min MHz"
+  echo "--- /proc/meminfo ---"
+  grep -E "^MemTotal:|^MemAvailable:|^MemFree:|^Cached:" /proc/meminfo
+  echo "--- NUMA per-node DRAM ---"
+  for n in /sys/devices/system/node/node[0-9]*; do
+    [ -d "$n" ] || continue
+    local nid mem cpus
+    nid=$(basename "$n" | sed 's/node//')
+    mem=$(awk '/MemTotal/{print int($4/1024/1024)" GB"}' "$n/meminfo")
+    cpus=$(cat "$n/cpulist" 2>/dev/null)
+    printf "  node %s: DRAM=%s, CPUs=%s\n" "$nid" "$mem" "$cpus"
+  done
+
+  # DIMM-level detail (model, rated + configured speed, manufacturer). Needs
+  # dmidecode + /sys/firmware/dmi/tables (root in container is typical).
+  # Auto-install dmidecode on debian/ubuntu bases since the binary is tiny
+  # and the bench image rarely ships with it; silently no-op if apt fails.
+  echo "--- DRAM DIMMs (dmidecode -t memory) ---"
+  if ! command -v dmidecode >/dev/null 2>&1 \
+       && command -v apt-get >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+    echo "  (auto-installing dmidecode...)"
+    apt-get -qq update >/dev/null 2>&1 || true
+    apt-get -qq install -y dmidecode >/dev/null 2>&1 || true
+  fi
+  if command -v dmidecode >/dev/null 2>&1 && [ -r /sys/firmware/dmi/tables/DMI ]; then
+    dmidecode -t memory 2>/dev/null | awk '
+      # stem_of strips the trailing-digit suffix from a Locator string.
+      # Useful for Intel-style "CPU0_DIMM_A0" / "CPU0_DIMM_A1" where the
+      # trailing digit is the slot index WITHIN a channel — stripping
+      # collapses 2DPC slot pairs back to the channel. AMD-style "A1",
+      # "A2", ..., "A12" packs the channel ID into that trailing digit
+      # instead, so this same stripping over-collapses; we disambiguate
+      # in END by checking the populated/stem ratio.
+      function stem_of(s,   c) { c = s; sub(/[0-9]+$/, "", c); return c }
+      # parse_mts pulls the numeric MT/s value out of "5600 MT/s" /
+      # "4400 MT/s" strings; returns 0 for "Unknown" / empty.
+      function parse_mts(s,   v) {
+        v = s
+        if (v !~ /MT\/s/) return 0
+        sub(/[[:space:]]*MT\/s.*/, "", v)
+        gsub(/[^0-9.]/, "", v)
+        return v + 0
+      }
+      BEGIN { populated=0; total_gb=0 }
+      /^Physical Memory Array$/ { in_arr=1; max_cap=""; num_dev=""; next }
+      in_arr && /^[[:space:]]*Maximum Capacity:/   { sub(/^[[:space:]]*Maximum Capacity: /,""); max_cap=$0 }
+      in_arr && /^[[:space:]]*Number Of Devices:/  { sub(/^[[:space:]]*Number Of Devices: /,""); num_dev=$0 }
+      in_arr && /^$/ {
+        if (max_cap!="") printf "  array max=%s, slots=%s\n", max_cap, num_dev
+        in_arr=0
+      }
+      /^Memory Device$/ {
+        in_md=1; size=""; type=""; speed=""; cfg=""; mfr=""; part=""; loc=""; next
+      }
+      in_md && /^[[:space:]]*Size:/                       { sub(/^[[:space:]]*Size: /,""); size=$0 }
+      in_md && /^[[:space:]]*Type: /                      { sub(/^[[:space:]]*Type: /,""); type=$0 }
+      in_md && /^[[:space:]]*Speed:/ && !/Configured/      { sub(/^[[:space:]]*Speed: /,""); speed=$0 }
+      in_md && /^[[:space:]]*Configured Memory Speed:/     { sub(/^[[:space:]]*Configured Memory Speed: /,""); cfg=$0 }
+      in_md && /^[[:space:]]*Manufacturer:/                { sub(/^[[:space:]]*Manufacturer: /,""); mfr=$0 }
+      in_md && /^[[:space:]]*Part Number:/                 { sub(/^[[:space:]]*Part Number: /,""); gsub(/[[:space:]]+$/,"",$0); part=$0 }
+      in_md && /^[[:space:]]*Locator:/ && !/Bank Locator/  { sub(/^[[:space:]]*Locator: /,""); loc=$0 }
+      in_md && /^$/ {
+        if (size != "" && size !~ /No Module/) {
+          printf "  %-14s %-9s %-5s rated=%-10s cfg=%-10s %s %s\n",
+                 loc, size, type, speed, cfg, mfr, part
+          populated += 1
+          if (size ~ /GB$/)      { gb=size; sub(/[[:space:]]*GB.*/,"",gb); total_gb += gb + 0 }
+          else if (size ~ /MB$/) { mb=size; sub(/[[:space:]]*MB.*/,"",mb); total_gb += (mb+0)/1024 }
+          # Record BOTH the full locator and the trailing-digit-stripped
+          # stem; END uses populated/n_stem ratio to pick between Intel
+          # 2DPC (stem count = channels) and AMD 1DPC (full count =
+          # channels). Also stash the most recent configured / rated
+          # MT/s values for the bandwidth calc.
+          full_locs[loc] = 1
+          stem_locs[stem_of(loc)] = 1
+          cmts = parse_mts(cfg);   if (cmts > 0) last_cmts = cmts
+          rmts = parse_mts(speed); if (rmts > 0) last_rmts = rmts
+        }
+        in_md=0
+      }
+      END {
+        if (!populated) exit
+        printf "  populated DIMMs: %d, total %d GB\n", populated, total_gb
+        # DRAM peak BW = MT/s x 8 bytes/transfer x num_channels.
+        # MT/s is megatransfers/sec (DDR transfers twice per clock, so e.g.
+        # 4400 MT/s -> 2200 MHz). DDR5 channel width is 64-bit = 8 bytes,
+        # giving 35.2 GB/s/ch at 4400 MT/s or 48.0 GB/s/ch at 6000 MT/s.
+        # We prefer "Configured Memory Speed" (the actual running speed
+        # set by BIOS; can be downclocked vs the DIMM SPD) and fall back
+        # to "Speed" (the rated max) only when cfg is Unknown.
+        n_full = 0; for (k in full_locs) n_full++
+        n_stem = 0; for (k in stem_locs) n_stem++
+        # Pick channel count based on locator format. Intel boards label
+        # slots "CPU0_DIMM_A0" / "CPU0_DIMM_A1" — trailing digit is the
+        # SLOT index, so stripping it collapses 2DPC pairs to one channel
+        # per stem (n_ch = n_stem). AMD EPYC boards label slots "A1",
+        # "A2", ..., "A12", "B1", ..., "B12" — trailing digit is the
+        # CHANNEL ID, so each populated locator is already one channel
+        # (n_ch = n_full). Disambiguate by populated/n_stem ratio: 1 or
+        # 2 = plausible Intel 1DPC/2DPC; anything larger means stem
+        # stripping over-collapsed (e.g. AMD A1..A12 -> stem "A") and we
+        # use the full count instead.
+        ratio = (n_stem > 0 ? int((populated / n_stem) + 0.5) : 0)
+        if (ratio == 1 || ratio == 2) {
+          n_ch = n_stem
+        } else {
+          n_ch = n_full
+        }
+        dpc = (n_ch > 0 ? int((populated / n_ch) + 0.5) : 1)
+        use_mts = (last_cmts > 0 ? last_cmts : last_rmts)
+        src     = (last_cmts > 0 ? "configured" : "rated (cfg unavailable)")
+        if (n_ch == 0 || use_mts == 0) exit
+        per_ch_gbs = use_mts * 8 / 1000
+        agg_gbs    = per_ch_gbs * n_ch
+        printf "  channels populated: %d (DPC=%d) @ %s %d MT/s\n",
+               n_ch, dpc, src, use_mts
+        printf "  -> DRAM peak BW: %.1f GB/s/ch x %d ch = %.0f GB/s aggregate (this node)\n",
+               per_ch_gbs, n_ch, agg_gbs
+        if (last_cmts > 0 && last_rmts > 0 && last_cmts < last_rmts) {
+          rated_per_ch = last_rmts * 8 / 1000
+          rated_agg    = rated_per_ch * n_ch
+          dpc_note = (dpc == 2 ? " -- typical for 2DPC" : "")
+          printf "    (rated %d MT/s would be %.0f GB/s; cfg downclocked %.0f%%%s)\n",
+                 last_rmts, rated_agg, 100*(last_rmts-last_cmts)/last_rmts, dpc_note
+        }
+      }'
+  else
+    echo "  (dmidecode unavailable -- install with: apt-get update && apt-get install -y dmidecode)"
+  fi
+
+  # NVMe drives via sysfs (works without the `nvme` userspace tool). We list
+  # every controller, its model, firmware, total size, current PCIe link
+  # speed × width, and the resulting theoretical max bandwidth. The host
+  # may have multiple drives on different PCIe generations (e.g. Samsung
+  # negotiated at Gen3 next to KIOXIA at Gen5 in this lab), and the L3 file
+  # backend's actual disk throughput is capped by whichever drive backs the
+  # docker overlay / mount it lands on — see the L3-path section below.
+  echo "--- NVMe drives (/sys/class/nvme) ---"
+  printf "  %-7s %-34s %-10s %-7s %-28s %s\n" "name" "model" "firmware" "size" "PCIe cur / max" "~GB/s cur/max"
+  local c name model fw size cls clw mls mlw cur_lane max_lane bw_cur bw_max
+  for c in /sys/class/nvme/nvme*; do
+    [ -d "$c" ] || continue
+    name=$(basename "$c")
+    model=$(cat "$c/model" 2>/dev/null | xargs)
+    fw=$(cat "$c/firmware_rev" 2>/dev/null | xargs)
+    size=$(lsblk -dn -o SIZE "/dev/${name}n1" 2>/dev/null | head -1 | xargs)
+    cls=$(cat "$c/device/current_link_speed" 2>/dev/null)
+    clw=$(cat "$c/device/current_link_width" 2>/dev/null)
+    mls=$(cat "$c/device/max_link_speed"     2>/dev/null)
+    mlw=$(cat "$c/device/max_link_width"     2>/dev/null)
+    cur_lane=$(pcie_lane_gbps "$cls")
+    max_lane=$(pcie_lane_gbps "$mls")
+    bw_cur=$(awk -v l="$cur_lane" -v w="${clw:-0}" 'BEGIN{printf "%.1f", l*w}')
+    bw_max=$(awk -v l="$max_lane" -v w="${mlw:-0}" 'BEGIN{printf "%.1f", l*w}')
+    printf "  %-7s %-34s %-10s %-7s %-28s %s / %s\n" \
+           "$name" "$model" "$fw" "$size" "${cls:-?} x${clw:-?} / ${mls:-?} x${mlw:-?}" \
+           "$bw_cur" "$bw_max"
+  done
+
+  # L3 file backend lands at /tmp inside the container per the script's
+  # HICACHE_FILE_STORE_DIR formula. Inside docker /tmp is on the overlay,
+  # so df shows "overlay" rather than the underlying NVMe — readers should
+  # cross-reference the drives listed above to figure out which physical
+  # disk the host's /var/lib/docker actually sits on.
+  echo "--- L3 file backend path & backing fs ---"
+  local l3_pred detect
+  l3_pred="/tmp/cascade_dsr1_l3_${tag_for_path}_${size_for_path}"
+  detect="$l3_pred"; [ ! -e "$detect" ] && detect="/tmp"
+  echo "  expected L3 dir: $l3_pred"
+  df -h "$detect" 2>/dev/null | tail -1 \
+    | awk '{printf "  mount=%-12s fs=%-10s size=%s used=%s avail=%s\n", $6, $1, $2, $3, $4}'
+  echo "  note: container /tmp is on the docker overlay; the backing NVMe is whichever"
+  echo "        drive holds /var/lib/docker on the host (correlate with the NVMe list)."
+
+  echo "--- GPU info ---"
+  if command -v rocm-smi >/dev/null 2>&1; then
+    rocm-smi --showid 2>&1 | grep "Device Name" | head -1
+  elif command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=name --format=csv,noheader | head -1
+  fi
+
+  # Per-GPU PCIe link spec — the HiCache L2 / L3 -> GPU upload ceiling.
+  # Each rank pulls its KV-cache shard via its own PCIe link, so aggregate
+  # upload BW is sum(per-link cur BW) across all 3D controllers. We walk
+  # /sys/bus/pci by class 0x030200 (3D controller) which catches both
+  # NVIDIA and AMD compute GPUs and skips the management VGA at 0x030000.
+  # GPU friendly name is best-effort: nvidia-smi first, fall back to a
+  # short lspci description, else vendor:device IDs.
+  echo "--- GPU PCIe links (/sys/bus/pci, class 0x030200) ---"
+  printf "  %-13s %-15s %-30s %s\n" "bus_id" "name" "PCIe cur / max" "~GB/s cur/max"
+  local gpu_name_map
+  gpu_name_map=$(mktemp 2>/dev/null || echo "/tmp/gpu_name_map.$$")
+  : > "$gpu_name_map"
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    # nvidia-smi BDF is "00000000:1B:00.0"; normalize to sysfs format
+    # "0000:1b:00.0" (lowercase, 4-char domain).
+    nvidia-smi --query-gpu=pci.bus_id,name --format=csv,noheader 2>/dev/null \
+      | awk -F, '{
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+          bdf = tolower($1); sub(/^[0-9a-f]{4}/, "", bdf)
+          printf "%s\t%s\n", bdf, $2
+        }' > "$gpu_name_map"
+  fi
+  local n_gpu=0 total_bw_cur=0 total_bw_max=0
+  local dev bdf name cls_str cw mls_str mw cur_lane max_lane bw_cur bw_max
+  for dev in /sys/bus/pci/devices/*; do
+    [ -d "$dev" ] || continue
+    [ "$(cat "$dev/class" 2>/dev/null)" = "0x030200" ] || continue
+    bdf=$(basename "$dev")
+    name=$(awk -F'\t' -v b="$bdf" '$1 == b {print $2; exit}' "$gpu_name_map")
+    if [ -z "$name" ] && command -v lspci >/dev/null 2>&1; then
+      name=$(lspci -s "$bdf" 2>/dev/null | sed 's/.*: //; s/ (rev.*//' | head -c 30)
+    fi
+    [ -z "$name" ] && name="(unknown)"
+    cls_str=$(cat "$dev/current_link_speed" 2>/dev/null)
+    cw=$(cat "$dev/current_link_width"      2>/dev/null)
+    mls_str=$(cat "$dev/max_link_speed"     2>/dev/null)
+    mw=$(cat "$dev/max_link_width"          2>/dev/null)
+    cur_lane=$(pcie_lane_gbps "$cls_str")
+    max_lane=$(pcie_lane_gbps "$mls_str")
+    bw_cur=$(awk -v l="$cur_lane" -v w="${cw:-0}" 'BEGIN{printf "%.1f", l*w}')
+    bw_max=$(awk -v l="$max_lane" -v w="${mw:-0}" 'BEGIN{printf "%.1f", l*w}')
+    printf "  %-13s %-15s %-30s %s / %s\n" \
+           "$bdf" "$name" \
+           "${cls_str:-?} x${cw:-?} / ${mls_str:-?} x${mw:-?}" \
+           "$bw_cur" "$bw_max"
+    total_bw_cur=$(awk -v t="$total_bw_cur" -v b="$bw_cur" 'BEGIN{printf "%.1f", t+b}')
+    total_bw_max=$(awk -v t="$total_bw_max" -v b="$bw_max" 'BEGIN{printf "%.1f", t+b}')
+    n_gpu=$((n_gpu+1))
+  done
+  rm -f "$gpu_name_map"
+  if [ "$n_gpu" -gt 0 ]; then
+    printf "  -> aggregate GPU PCIe upload BW: %.0f GB/s cur / %.0f GB/s max across %d GPUs\n" \
+           "$total_bw_cur" "$total_bw_max" "$n_gpu"
+    echo "     (HiCache L2 / L3 -> GPU upload ceiling; one PCIe link per TP rank)"
+  fi
+}
+
 # ============================== Output dir + meta ==============================
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
 if [ -n "$OUTPUT_DIR_OVERRIDE" ]; then
@@ -343,6 +612,10 @@ cat > "$LOG_DIR/bench_meta.json" <<EOF
   "gsm8k_precheck_accuracy": null
 }
 EOF
+
+# Host hardware snapshot (CPU model/speed, DRAM speed, NVMe/L3-disk PCIe BW
+# ceiling, GPU PCIe links). One per cache-mode subdir, mirroring bench_meta.json.
+collect_host_info | tee "$LOG_DIR/host_info.log" >/dev/null
 
 # ============================== L3 file store + disk check ==============================
 HICACHE_FILE_STORE_DIR=""
