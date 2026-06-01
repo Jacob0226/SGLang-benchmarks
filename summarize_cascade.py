@@ -59,6 +59,11 @@ def load_bench_rounds(log_dir):
             continue
         out[idx] = {
             "avg_ttft": v.get("average_ttft"),
+            # Per-round median/p99 TTFT are only present when the
+            # bench-multiturn-round-percentiles HiCachePatch is applied;
+            # older bench_multiturn.jsonl only has average_ttft.
+            "median_ttft": v.get("median_ttft"),
+            "p99_ttft": v.get("p99_ttft"),
             "hit_rate": v.get("cache_hit_rate"),
         }
     return out
@@ -133,7 +138,13 @@ def write_per_mode(log_dir, out_path):
         return False
 
     n_rounds = max(rounds) + 1
-    fields = ["#Round", "avg_ttft_sec", "hit_rate"] + list(CACHE_TIER_COLS)
+    fields = [
+        "#Round",
+        "avg_ttft_sec",
+        "median_ttft_sec",
+        "p99_ttft_sec",
+        "hit_rate",
+    ] + list(CACHE_TIER_COLS)
     with open(out_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(fields)
@@ -143,6 +154,8 @@ def write_per_mode(log_dir, out_path):
             row = [
                 r + 1,
                 fmt_ttft(br.get("avg_ttft")),
+                fmt_ttft(br.get("median_ttft")),
+                fmt_ttft(br.get("p99_ttft")),
                 fmt_rate(br.get("hit_rate")),
             ]
             for col in CACHE_TIER_COLS:
@@ -247,7 +260,11 @@ def write_cross_mode(base_dir, out_path):
     # duplicate per-mode).
     header = ["#Round"]
     for mode in modes:
-        header += [f"{mode}_avg_TTFT_sec", f"{mode}_hit_rate"]
+        header += [
+            f"{mode}_avg_TTFT_sec",
+            f"{mode}_median_TTFT_sec",
+            f"{mode}_hit_rate",
+        ]
     header += [
         "L3_file_prefetch_bw_avg_gbps",
         "L3_file_prefetch_bw_p50_gbps",
@@ -265,6 +282,7 @@ def write_cross_mode(base_dir, out_path):
                 rounds_d, _ = per_mode_data[mode]
                 d = rounds_d.get(r, {})
                 row.append(fmt_ttft(d.get("avg_ttft")))
+                row.append(fmt_ttft(d.get("median_ttft")))
                 row.append(fmt_rate(d.get("hit_rate")))
             _, l3_tiers = per_mode_data["L3_file"]
             tr = l3_tiers.get(r, {})
