@@ -46,6 +46,12 @@ CACHE_MODE="L2"        # script name says "L2" — keep server hierarchy =
                        # L1+L2 by default so L3 file backend doesn't kick
                        # in mid-run. Pass --cache-mode L3_file to opt in
                        # to the 3-tier run.
+# --cache-modes "none L3_file": profile several modes sequentially. Each
+# mode gets its own server + its own profile-<tag>_<mode> output dir
+# (the single-mode profiler flow below is run once per mode via re-exec).
+# Mutually-exclusive-ish with --cache-mode: when set, --cache-mode is
+# ignored and each listed mode is run in turn.
+CACHE_MODES=""
 WAIT_FOR_HEALTH_SEC=1500
 
 # Knobs the helper derives but the user can still override.
@@ -64,6 +70,8 @@ NUM_PROFILE_STEPS=20
 PROFILE_START_ROUND_1IDX=""
 TAG=""
 OUTPUT_DIR=""
+
+ORIG_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -86,6 +94,7 @@ while [[ $# -gt 0 ]]; do
     --kv-bytes-per-token) KV_BYTES_PER_TOKEN="$2"; shift 2;;
     --buffer-gb)         BUFFER_GB="$2"; shift 2;;
     --cache-mode)        CACHE_MODE="$2"; shift 2;;
+    --cache-modes)       CACHE_MODES="$2"; shift 2;;
     --rounds-profile)    ROUNDS_PROFILE="$2"; shift 2;;
     --num-rounds)        NUM_ROUNDS_OVERRIDE="$2"; shift 2;;
     --num-clients)       NUM_CLIENTS="$2"; shift 2;;
@@ -119,6 +128,9 @@ Common opts:
   --kv-bytes-per-token N       (default 34*1024 for DSR1-0528 MLA fp8)
   --buffer-gb N                (default 12) per-rank HBM headroom
   --cache-mode MODE            (default L2; one of none|L1|L2|L3_file)
+  --cache-modes 'M1 M2 ...'    profile several modes in turn; each runs its
+                               own server and writes to profile-<tag>_<mode>.
+                               When set, --cache-mode is ignored.
   --rounds-profile M           (default 1) rounds the profiler covers
   --num-rounds N               override auto-derived total rounds
   --num-clients N              (default 300)
@@ -141,6 +153,43 @@ done
 if [ -z "$L1_SIZE" ] || [ -z "$L2_SIZE" ]; then
   echo "ERROR: both --L1-size and --L2-size are required" >&2
   exit 1
+fi
+
+# ============================== Multi-mode chain dispatcher ==============================
+# --cache-modes "none L3_file" → re-exec self once per mode. Each child is a
+# full single-mode profiling run (its own server + profiler capture) writing
+# to profile-<tag>_<mode>. The profiler flow below is single-mode by design,
+# so multi-mode is handled purely by looping here. Mirrors the chain pattern
+# in cascade_dsr1_lite.sh.
+if [ -n "$CACHE_MODES" ]; then
+  # Forward every original arg except the ones we re-derive per mode
+  # (--cache-modes, --cache-mode, --tag); each take a value, so skip 2.
+  FORWARD_ARGS=()
+  i=0
+  while [ "$i" -lt "${#ORIG_ARGS[@]}" ]; do
+    case "${ORIG_ARGS[$i]}" in
+      --cache-modes|--cache-mode|--tag) i=$((i + 2)) ;;
+      *) FORWARD_ARGS+=("${ORIG_ARGS[$i]}"); i=$((i + 1)) ;;
+    esac
+  done
+  for MODE in $CACHE_MODES; do
+    case "$MODE" in
+      none|L1|L2|L3_file) ;;
+      *) echo "ERROR: bad mode in --cache-modes: '$MODE' (none|L1|L2|L3_file)" >&2; exit 1;;
+    esac
+    echo ""
+    echo ">>> ============================================================"
+    echo ">>> profile chain: cache_mode=${MODE}  tag=${TAG}_${MODE}  (t=$(date +%H:%M:%S))"
+    echo ">>> ============================================================"
+    if ! "$0" --cache-mode "$MODE" --tag "${TAG}_${MODE}" "${FORWARD_ARGS[@]}"; then
+      rc=$?
+      echo ">>> profile chain: cache_mode=${MODE} FAILED (exit ${rc}); continuing to next mode" >&2
+    fi
+    pkill -9 sglang 2>/dev/null || true
+    sleep 10
+  done
+  echo ">>> profile chain done (${CACHE_MODES})  (t=$(date +%H:%M:%S))"
+  exit 0
 fi
 
 # ============================== Detect platform ==============================
