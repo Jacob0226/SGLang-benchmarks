@@ -53,6 +53,10 @@ CACHE_MODE="L2"        # script name says "L2" — keep server hierarchy =
 # ignored and each listed mode is run in turn.
 CACHE_MODES=""
 WAIT_FOR_HEALTH_SEC=1500
+# Longer scheduler watchdog (sec) than sglang's 300 default: torch.profiler
+# capturing a large prefill at the profile round can stall a forward pass
+# >300s and crash the server. Forwarded to cascade_dsr1_lite.sh.
+WATCHDOG_TIMEOUT=1800
 
 # Knobs the helper derives but the user can still override.
 ROUNDS_PROFILE=1
@@ -103,6 +107,7 @@ while [[ $# -gt 0 ]]; do
     --max-parallel)      MAX_PARALLEL="$2"; shift 2;;
     --request-rate)      REQUEST_RATE="$2"; shift 2;;
     --num-profile-steps) NUM_PROFILE_STEPS="$2"; shift 2;;
+    --watchdog-timeout)  WATCHDOG_TIMEOUT="$2"; shift 2;;
     --profile-start-round) PROFILE_START_ROUND_1IDX="$2"; shift 2;;
     --tag)               TAG="$2"; shift 2;;
     --output-dir)        OUTPUT_DIR="$2"; shift 2;;
@@ -441,6 +446,7 @@ echo ">>> launching cascade_dsr1_lite.sh in background; log: $CASCADE_LOG (also 
   --request-length "$REQUEST_LENGTH" \
   --max-parallel "$MAX_PARALLEL" \
   --request-rate "$REQUEST_RATE" \
+  --watchdog-timeout "$WATCHDOG_TIMEOUT" \
   --output-dir "$BENCH_OUTPUT_DIR" \
   2>&1 | tee "$CASCADE_LOG" &
 CASCADE_PID=$!

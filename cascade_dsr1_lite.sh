@@ -90,6 +90,10 @@ GSM8K_PRECHECK="true"
 GSM8K_NUM_QUESTIONS=1200
 GSM8K_PARALLEL=1200
 WAIT_FOR_SERVER_SEC=1500
+# Scheduler watchdog timeout (sec). Empty = sglang default (300). Bump this
+# for profiling runs: torch.profiler capturing a large prefill can stall a
+# forward pass past 300s and crash the server (SIGQUIT). CLI: --watchdog-timeout
+WATCHDOG_TIMEOUT=""
 ATTENTION_BACKEND=""   # "" = auto-detect by vendor: NV->trtllm_mla, AMD->aiter
 OUTPUT_DIR_OVERRIDE=""
 
@@ -124,6 +128,7 @@ while [[ $# -gt 0 ]]; do
     --max-prefill-tokens)  MAX_PREFILL_TOKENS="$2"; shift 2;;
     --prefetch-threshold)  PREFETCH_THRESHOLD="$2"; shift 2;;
     --attention-backend)   ATTENTION_BACKEND="$2"; shift 2;;
+    --watchdog-timeout)    WATCHDOG_TIMEOUT="$2"; shift 2;;
     --output-dir)          OUTPUT_DIR_OVERRIDE="$2"; shift 2;;
     --gsm8k-num-questions) GSM8K_NUM_QUESTIONS="$2"; shift 2;;
     --no-gsm8k-precheck)   GSM8K_PRECHECK="false"; shift 1;;
@@ -715,6 +720,8 @@ SERVER_CMD=(
 )
 # --context-length is opt-in (sglang uses model native by default).
 [ "$CONTEXT_LENGTH_EXPLICIT" = true ] && SERVER_CMD+=(--context-length "$CONTEXT_LENGTH")
+# Opt-in longer scheduler watchdog (sglang default 300s). Needed for profiling.
+[ -n "$WATCHDOG_TIMEOUT" ] && SERVER_CMD+=(--watchdog-timeout "$WATCHDOG_TIMEOUT")
 if [ "$VENDOR" = "nvidia" ]; then
   # Matches the previously-validated B200 cascade (May-12 run): use
   # FlashInfer's TRT-LLM kernels for MoE + fused allreduce.
