@@ -23,14 +23,23 @@ OUTPUT_LENGTH=1
 MAX_PARALLEL=8
 REQUEST_RATE=32
 CUDA_GRAPH_MAX_BS=0
-# Aligned to InferenceX dsr1_fp8_mi355x.sh (validated 2026-05-28):
-#   chunked_prefill_size = max_prefill_tokens = 196608  (was 32768)
-#   mem_fraction_static  = 0.8                          (was 0.85; sglang
-#                                                        internal-scales to ~0.68)
-# Larger prefill window matters most for HiCache cold-start rounds where
-# many requests' 4K prefixes hit the server simultaneously.
-CHUNKED_PREFILL_SIZE=196608
-MAX_PREFILL_TOKENS=196608
+# chunked_prefill_size = max_prefill_tokens = 32768 (DSR1 known-good for the
+# HiCache cascade; matches cascade_dsr1.sh). Larger windows (the old
+# "InferenceX-aligned" 131072/196608) cause two problems with page_size=64 +
+# cache reuse:
+#   (1) GSM8K accuracy collapse on ROCm 7.2 images (rocm720): 0.94 -> ~0.25
+#       when combined with cache reuse (L1/L2/L3). ROCm 7.0 (rocm700) is NOT
+#       affected. Bug needs: rocm720 + ps64 + cache + large chunked/context.
+#   (2) activation OOM at high client counts (HSA_STATUS_ERROR_OUT_OF_RESOURCES).
+# With prefix cache, per-round extend is only ~request_length (~4096), so a
+# 32768 window still batches ~8 requests/forward — no throughput loss for the
+# cascade. Override with --chunked-prefill-size / --max-prefill-tokens for
+# cold-start throughput experiments.
+# NOTE: context_length stays at model native (163840) by default. If you hit
+# the ps64+cache accuracy bug on a rocm720 image, also pass --context-length
+# 65536 (the cascade workload maxes ~40-60K anyway), or use a rocm700 image.
+CHUNKED_PREFILL_SIZE=32768
+MAX_PREFILL_TOKENS=32768
 MEM_FRACTION_STATIC=0.8
 MEM_FRACTION_EXPLICIT=false   # flipped true when --mem-fraction-static is passed
 L1_SIZE=""                    # GB/rank; when set, mem-fraction-static is auto-derived
