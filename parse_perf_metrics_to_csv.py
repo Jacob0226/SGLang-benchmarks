@@ -21,6 +21,26 @@ INTERACTIVITY_COL = "Interactivity (tok/s/user)"
 PER_GPU_COL = "Token Throughput per GPU (token/s/gpu)"
 DERIVED_COLUMNS = [INTERACTIVITY_COL, PER_GPU_COL]
 
+# 最前面的 summary table 欄位。
+# 定義 (與 InferenceX utils/process_result.py 一致):
+#   Interactivity (tok/s/user)            = 1000 / Median TPOT (ms)
+#   Token Throughput per GPU (tok/s/gpu)  = Total token throughput (tok/s) / TP
+#   TTFT / TPOT                           = median 值 (ms)
+# 左右兩個 table 中間空白欄數
+GAP_COLS = 5
+
+INTERACTIVITY_HDR = "Interactivity \n(tok/s/user) "
+TPUT_PER_GPU_HDR = "Token TPUT per GPU"
+SUMMARY_COLUMNS = [
+    "input_len",
+    "output_len",
+    "concurrency",
+    INTERACTIVITY_HDR,
+    TPUT_PER_GPU_HDR,
+    "TTFT",
+    "TPOT",
+]
+
 # 第二份 table 的欄位順序，刻意與
 # Analysis/B200_GLM5_FP8_inferenceX/B200_GLM5_all_variants.csv 完全一致，
 # 方便直接 concat / pivot。run_url 一律填 "Local run"。
@@ -132,6 +152,25 @@ def detect_spec_method_from_path(input_dir: Path):
     return "none"
 
 
+def detect_accuracy_from_dir(input_dir: Path):
+    """從 input_dir 內的 Accuracy*.log 抓 'Accuracy: 0.943' 數值。
+    找不到 (沒檔案 / 沒這行) 則回傳 None。"""
+    acc_re = re.compile(r"Accuracy:\s*([0-9.]+)")
+    for log in sorted(input_dir.glob("Accuracy*.log")):
+        try:
+            with open(log, "r", encoding="utf-8") as f:
+                last = None
+                for line in f:
+                    m = acc_re.search(line)
+                    if m:
+                        last = m.group(1)
+                if last is not None:
+                    return last
+        except Exception:
+            continue
+    return None
+
+
 def _safe_float(value):
     """轉 float; 任何 TypeError/ValueError 都回 None。"""
     try:
@@ -233,10 +272,65 @@ def build_local_row(
     }
 
 
-def write_csv(records, column_order, output_csv, *, local_table_kwargs):
-    """寫出兩份 table 到同一份 CSV：
-    1) 完整原始欄位 (front + log columns + DERIVED_COLUMNS)
-    2) 一行空白後，附上 InferenceX 格式的 local-run table
+def build_summary_row(record: dict, tp: int):
+    """組出最前面 summary table 的一列。
+    TTFT / TPOT 一律取 median (ms)。"""
+    median_tpot_ms = _safe_float(record.get("Median TPOT (ms)"))
+    median_ttft_ms = _safe_float(record.get("Median TTFT (ms)"))
+    total_tps = _safe_float(record.get("Total token throughput (tok/s)"))
+
+    # Interactivity 顯示到小數第 1 位；Token TPUT per GPU 只取整數部分
+    interactivity = round(1000.0 / median_tpot_ms, 1) if median_tpot_ms else ""
+    tput_per_gpu = (
+        int(total_tps / tp)
+        if (total_tps is not None and tp)
+        else ""
+    )
+
+    return {
+        "input_len": record.get("input_len", ""),
+        "output_len": record.get("output_len", ""),
+        "concurrency": record.get("concurrency", ""),
+        INTERACTIVITY_HDR: interactivity,
+        TPUT_PER_GPU_HDR: tput_per_gpu,
+        "TTFT": median_ttft_ms if median_ttft_ms is not None else "",
+        "TPOT": median_tpot_ms if median_tpot_ms is not None else "",
+    }
+
+
+def _build_side_by_side(records, ordered_columns, tp):
+    """組出左右並排所需的資料：
+    左 = summary table，右 = 完整 metrics table。
+    回傳 (summary_header, summary_rows, full_header, full_rows, row_keys)。
+    row_keys[i] = (input_len, output_len)，用來在不同 i?k 群組間切開成多個 table。"""
+    summary_header = SUMMARY_COLUMNS
+    full_header = ordered_columns
+    summary_rows, full_rows, row_keys = [], [], []
+    for r in records:
+        srow = build_summary_row(r, tp)
+        summary_rows.append([srow[c] for c in summary_header])
+        full_rows.append([r.get(c, "") for c in full_header])
+        row_keys.append((r.get("input_len"), r.get("output_len")))
+    return summary_header, summary_rows, full_header, full_rows, row_keys
+
+
+def build_meta_row(*, accuracy=None, tp=None):
+    """組第一列的 Accuracy / TP 資訊；兩者皆無則回傳 None。"""
+    meta = []
+    if accuracy is not None:
+        meta += ["Accuracy", accuracy]
+    if tp:
+        meta += [f"TP{tp}"]
+    return meta or None
+
+
+def write_csv(records, column_order, output_csv, *, tp, accuracy=None):
+    """左右並排輸出：
+      (可選) 第一列顯示 Accuracy / TP
+      左表 = summary (input_len/output_len/concurrency/Interactivity/
+             Token Throughput per GPU/TTFT/TPOT，TTFT、TPOT 取 median)
+      中間空一欄
+      右表 = 其他 parse 來的完整 metrics
     """
     if not records:
         print("No records found to write.")
@@ -249,21 +343,26 @@ def write_csv(records, column_order, output_csv, *, local_table_kwargs):
     ]
     ordered_columns = front_columns + middle_columns + DERIVED_COLUMNS
 
+    (summary_header, summary_rows,
+     full_header, full_rows, row_keys) = _build_side_by_side(
+        records, ordered_columns, tp)
+
+    meta_row = build_meta_row(accuracy=accuracy, tp=tp)
+    gap = [""] * GAP_COLS  # 左右兩表中間空白欄
+
+    # CSV：左右並排，中間留 GAP_COLS 個空白欄；
+    #      不同 input/output 長度群組 (i1k、i8k...) 之間插入空白列切成兩個 table。
     with open(output_csv, "w", newline="", encoding="utf-8") as f:
-        # Table 1 — 原始完整 metrics
-        writer = csv.DictWriter(f, fieldnames=ordered_columns, extrasaction="ignore")
-        writer.writeheader()
-        for r in records:
-            writer.writerow(r)
-
-        # 一行空白當分隔，Excel/pandas 都能辨識成兩個區塊
-        f.write("\n")
-
-        # Table 2 — InferenceX 格式 (run_url = "Local run")
-        local_writer = csv.DictWriter(f, fieldnames=LOCAL_TABLE_COLUMNS)
-        local_writer.writeheader()
-        for r in records:
-            local_writer.writerow(build_local_row(r, **local_table_kwargs))
+        writer = csv.writer(f)
+        if meta_row:
+            writer.writerow(meta_row)
+        writer.writerow(summary_header + gap + full_header)
+        prev_key = None
+        for s_row, f_row, key in zip(summary_rows, full_rows, row_keys):
+            if prev_key is not None and key != prev_key:
+                writer.writerow([])  # 群組間空白列
+            writer.writerow(s_row + gap + f_row)
+            prev_key = key
 
 
 def main():
@@ -399,11 +498,15 @@ def main():
             if col not in master_column_order:
                 master_column_order.append(col)
 
+    accuracy = detect_accuracy_from_dir(input_path)
+    print(f"Accuracy                 : {accuracy if accuracy is not None else '(not found)'}")
+
     write_csv(
         all_records,
         master_column_order,
         args.output,
-        local_table_kwargs=local_table_kwargs,
+        tp=tp_size,
+        accuracy=accuracy,
     )
 
     print("-" * 30)
