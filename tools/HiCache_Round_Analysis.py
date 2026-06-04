@@ -47,8 +47,16 @@ import gzip
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
+
+_T0 = time.time()
+
+
+def _log(msg: str) -> None:
+    """Progress line to stderr (so a long trace load doesn't look hung)."""
+    print(f"[+{time.time() - _T0:6.1f}s] {msg}", file=sys.stderr, flush=True)
 
 # Reuse analyze_trace.py (same tools/ dir) for the per-layer kernel-sequence +
 # python call-site mapping (External-id linking). Optional: if unavailable, the
@@ -76,12 +84,40 @@ class Event:
 
 
 def load_events(path: Path) -> list[Event]:
-    opener = gzip.open if str(path).endswith(".gz") else open
-    with opener(path, "rt", encoding="utf-8") as f:
-        data = json.load(f)
+    # Decompress in chunks with a live byte counter, then parse — a big trace's
+    # gzip+JSON step gives no feedback otherwise and looks like it hung.
+    if str(path).endswith(".gz"):
+        _log(f"  decompressing {Path(path).name} ...")
+        chunks = []
+        total = 0
+        last_logged = 0
+        with gzip.open(path, "rb") as gf:
+            while True:
+                c = gf.read(64 * 1024 * 1024)
+                if not c:
+                    break
+                chunks.append(c)
+                total += len(c)
+                if total - last_logged >= 512 * 1024 * 1024:  # log every ~512 MB
+                    last_logged = total
+                    _log(f"    decompressed {total / 1e6:7.0f} MB")
+        blob = b"".join(chunks)
+        del chunks
+    else:
+        with open(path, "rb") as f:
+            blob = f.read()
+    _log(f"  parsing JSON ({len(blob) / 1e6:.0f} MB) ...")
+    data = json.loads(blob)
+    del blob
     raw = data.get("traceEvents", []) if isinstance(data, dict) else data
+
+    _log(f"  building event list from {len(raw):,} records ...")
     evs: list[Event] = []
-    for e in raw:
+    n = len(raw) or 1
+    step = max(1, n // 10)
+    for i, e in enumerate(raw):
+        if (i + 1) % step == 0:
+            _log(f"    scanned {100 * (i + 1) // n:3d}%  ({len(evs):,} kept)")
         if not isinstance(e, dict) or e.get("ph") != "X":
             continue
         try:
@@ -94,6 +130,7 @@ def load_events(path: Path) -> list[Event]:
         evs.append(
             Event(str(e.get("name", "")), str(e.get("cat", "")), ts, dur, e.get("args") or {})
         )
+    _log(f"  sorting {len(evs):,} events ...")
     evs.sort(key=lambda e: e.ts)
     return evs, raw
 
@@ -247,9 +284,12 @@ def busy_union_us(events: list[Event]) -> float:
 
 
 def analyze(label: str, path: Path, min_gap_us: float) -> dict:
+    _log(f"[{label}] loading trace ...")
     events, raw = load_events(path)
+    _log(f"[{label}] detecting round (largest GPU idle gap) ...")
     r0, r1, gap = detect_round(events, min_gap_us)
     in_round = [e for e in events if e.ts >= r0 and e.ts <= r1]
+    _log(f"[{label}] aggregating {len(in_round):,} in-round events ...")
 
     # Total prefill tokens in the round (sum of EXTEND step toks annotations),
     # plus the distribution of EXTEND steps by (batch size, tokens) — different
@@ -290,6 +330,7 @@ def analyze(label: str, path: Path, min_gap_us: float) -> dict:
     # Per-stream-class wall-busy (union within that class' events).
     class_busy = {k: busy_union_us(v) for k, v in class_wall.items()}
 
+    _log(f"[{label}] done ({n_extend} EXTEND steps, {toks:,} tokens)")
     return {
         "label": label,
         "path": str(path),

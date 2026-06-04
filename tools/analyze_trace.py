@@ -32,8 +32,16 @@ import json
 import re
 import statistics
 import sys
+import time
 from collections import Counter, OrderedDict, defaultdict
 from pathlib import Path
+
+_T0 = time.time()
+
+
+def _log(msg: str) -> None:
+    """Progress line to stderr (so a long trace load doesn't look hung)."""
+    print(f"[+{time.time() - _T0:6.1f}s] {msg}", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -44,9 +52,32 @@ def load_trace(path: str) -> dict | list:
     p = Path(path)
     if not p.exists():
         sys.exit(f"[ERROR] File not found: {path}")
-    opener = gzip.open if path.endswith(".gz") else open
-    with opener(path, "rt", encoding="utf-8") as f:
-        return json.load(f)
+    # Chunked decompress with a live byte counter, then parse — a big trace's
+    # gzip+JSON step gives no feedback otherwise and looks like it hung.
+    if path.endswith(".gz"):
+        _log(f"decompressing {p.name} ...")
+        chunks = []
+        total = 0
+        last_logged = 0
+        with gzip.open(path, "rb") as gf:
+            while True:
+                c = gf.read(64 * 1024 * 1024)
+                if not c:
+                    break
+                chunks.append(c)
+                total += len(c)
+                if total - last_logged >= 512 * 1024 * 1024:  # every ~512 MB
+                    last_logged = total
+                    _log(f"  decompressed {total / 1e6:7.0f} MB")
+        blob = b"".join(chunks)
+        del chunks
+    else:
+        with open(path, "rb") as f:
+            blob = f.read()
+    _log(f"parsing JSON ({len(blob) / 1e6:.0f} MB; please wait) ...")
+    data = json.loads(blob)
+    _log("parsed trace.")
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -1054,7 +1085,12 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
                 for j in range(len(layer_data))}
 
     tn_durs: dict = defaultdict(list)  # (layer_type, kernel_name) -> [dur...]
+    n_dl = len(all_dl) or 1
+    dl_step = max(1, n_dl // 10)
+    _log(f"computing robust per-kernel medians over {n_dl:,} layer instances ...")
     for gi, lev in enumerate(all_dl):
+        if (gi + 1) % dl_step == 0:
+            _log(f"  robust durations {100 * (gi + 1) // n_dl:3d}%")
         if not (r0 <= lev["ts"] <= r1):
             continue
         T = idx_type.get(gi % n_layers) if n_layers else None
