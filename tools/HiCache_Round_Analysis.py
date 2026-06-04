@@ -50,6 +50,15 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+# Reuse analyze_trace.py (same tools/ dir) for the per-layer kernel-sequence +
+# python call-site mapping (External-id linking). Optional: if unavailable, the
+# layer breakdown section is skipped.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import analyze_trace as AT
+except Exception:
+    AT = None
+
 STEP_RE = re.compile(r"step\[(?P<mode>\w+) bs=(?P<bs>\d+)(?: toks=(?P<toks>\d+))?\]")
 
 
@@ -86,7 +95,7 @@ def load_events(path: Path) -> list[Event]:
             Event(str(e.get("name", "")), str(e.get("cat", "")), ts, dur, e.get("args") or {})
         )
     evs.sort(key=lambda e: e.ts)
-    return evs
+    return evs, raw
 
 
 def category_for(ev: Event) -> str:
@@ -127,24 +136,76 @@ def stream_class(cat: str) -> str:
     return "compute"
 
 
-def clean_kernel_name(ev: Event) -> str:
-    """Short, comparable kernel name. Preserves the HiCache transfer direction
-    (load pf->lf vs backup lf->pf) and trims C++ template/arg noise."""
-    n = ev.name or str(ev.args.get("kernel", ""))
+def clean_name_str(n: str) -> str:
+    """Short, comparable kernel name from a raw name string."""
+    n = n or ""
     if "transfer_kernel_impl" in n:
-        ipf = n.find("get_global_offset_pf")
-        ilf = n.find("get_global_offset_lf")
-        if ipf != -1 and (ilf == -1 or ipf < ilf):
-            return "transfer_kv(load pf->lf)"
-        return "transfer_kv(backup lf->pf)"
-    # Strip mangled prefix like "_Z20"
-    n = re.sub(r"^_Z\d+", "", n)
-    # Cut at first template/arg paren to collapse variants.
+        # Direction is encoded by the two template offset-functions, in order:
+        #   1st = SOURCE layout, 2nd = DEST layout.  Verified identical on both
+        #   ROCm (mangled) and CUDA/B200 (demangled) traces:
+        #     load   : get_global_offset_pf      -> get_global_offset_lf   (pf->lf)
+        #     backup : get_global_offset_lf_tbl  -> get_global_offset_pf   (lf->pf)
+        # pf = page-first host pool, lf = layer-first device buffer.
+        toks = re.findall(r"get_global_offset_(pf|lf_tbl|lf)", n)
+        src = toks[0] if toks else "?"
+        # Append the FULL raw kernel name (mangled on ROCm, demangled on CUDA).
+        if src == "pf":
+            return f"transfer_kv(load pf->lf): {n}"
+        return f"transfer_kv(backup lf->pf): {n}"
+    n = re.sub(r"^_Z\d+", "", n)  # strip mangled length prefix
     for sep in ("<", "("):
         i = n.find(sep)
         if i > 0:
             n = n[:i]
     return n.strip()[:80]
+
+
+def clean_kernel_name(ev: Event) -> str:
+    return clean_name_str(ev.name or str(ev.args.get("kernel", "")))
+
+
+def _shorten_src(src: str) -> str:
+    if not src:
+        return ""
+    # keep the path relative to sglang + the func name
+    if "/sglang/" in src:
+        src = src.split("/sglang/", 1)[1]
+    return src[:90]
+
+
+def layer_breakdown(raw: list, name_avg: dict) -> tuple:
+    """Extract ONE representative decoder layer's GPU kernels in order, with a
+    ROBUST per-kernel duration and the python source call-site.
+
+    Delegates to analyze_trace.analyze_layer_structure so this matches the
+    comparison_combined breakdown exactly: the duration is the median across
+    all instances of the layer type at that position (artifact-resistant),
+    NOT a single noisy instance.  Returns (layer_class, rows) where
+    rows = [(order, kernel, avg_us, this_us, python_src)].
+    """
+    if AT is None:
+        return None, []
+    try:
+        stream = AT.auto_detect_stream(raw)
+        kernels_raw = AT.extract_gpu_kernels(raw, stream)
+        cls, layer_types, callsites, robust = AT.analyze_layer_structure(
+            raw, kernels_raw)
+        if not cls or not layer_types:
+            return cls, []
+        # Show the layer type that covers the most layers (the dominant body).
+        lt = max(layer_types, key=lambda t: t["count"])
+        rows = []
+        for order, (kidx, _section, _leaf) in enumerate(lt["kernel_breakdown"]):
+            k = kernels_raw[kidx]
+            nm = clean_name_str(k.get("name", ""))
+            this_us = float(k.get("dur", 0.0))
+            avg = robust.get(kidx, this_us)  # robust per-position median
+            rows.append((order, nm, round(avg, 3), round(this_us, 3),
+                         _shorten_src(callsites.get(kidx, ""))))
+        return cls, rows
+    except Exception as exc:  # best-effort; layer breakdown is optional
+        print(f"[WARN] layer breakdown failed: {exc}", file=sys.stderr)
+        return None, []
 
 
 def detect_round(events: list[Event], min_gap_us: float):
@@ -186,20 +247,27 @@ def busy_union_us(events: list[Event]) -> float:
 
 
 def analyze(label: str, path: Path, min_gap_us: float) -> dict:
-    events = load_events(path)
+    events, raw = load_events(path)
     r0, r1, gap = detect_round(events, min_gap_us)
     in_round = [e for e in events if e.ts >= r0 and e.ts <= r1]
 
-    # Total prefill tokens in the round (sum of EXTEND step toks annotations).
+    # Total prefill tokens in the round (sum of EXTEND step toks annotations),
+    # plus the distribution of EXTEND steps by (batch size, tokens) — different
+    # steps use different batch sizes, so the data volume per kernel differs;
+    # this context matters when comparing per-kernel costs across platforms.
+    from collections import Counter
     toks = 0
     n_extend = 0
+    extend_dist: Counter = Counter()
     for e in in_round:
         if e.cat != "user_annotation":
             continue
         m = STEP_RE.search(e.name)
         if m and m.group("mode") == "EXTEND":
-            toks += int(m.group("toks") or 0)
+            tk = m.group("toks") or "0"
+            toks += int(tk)
             n_extend += 1
+            extend_dist[f"EXTEND bs={m.group('bs')} toks={tk}"] += 1
 
     # GPU-busy per category (sum of durations) + GPU wall-busy (union).
     cats: dict[str, dict] = {}
@@ -213,9 +281,10 @@ def analyze(label: str, path: Path, min_gap_us: float) -> dict:
         s["sum_us"] += e.dur
         klass = stream_class(c)
         kn = clean_kernel_name(e)
-        ks = kernels.setdefault((klass, kn), {"count": 0, "sum_us": 0.0})
+        ks = kernels.setdefault((klass, kn), {"count": 0, "sum_us": 0.0, "durs": []})
         ks["count"] += 1
         ks["sum_us"] += e.dur
+        ks["durs"].append(e.dur)
         class_wall.setdefault(klass, []).append(e)
     gpu_wall = busy_union_us(gpu_events)
     # Per-stream-class wall-busy (union within that class' events).
@@ -235,66 +304,31 @@ def analyze(label: str, path: Path, min_gap_us: float) -> dict:
         "cats": cats,
         "kernels": kernels,
         "class_busy_ms": {k: v / 1000.0 for k, v in class_busy.items()},
+        "extend_dist": dict(extend_dist),
     }
 
 
-def write_kernels_report(results: list[dict], path: Path) -> None:
-    """Per-kernel report. Layout (matches the requested format):
+_SP = [""]  # spacer column between platforms in side-by-side blocks
 
-      <plat1> uncached tokens: N1            <plat2> uncached tokens: N2
-      === COMPUTE (incl. comm) ===
-      <plat1 compute+comm kernels>   |   <plat2 compute+comm kernels>
-      === CACHE ===
-      <plat1 cache kernels>          |   <plat2 cache kernels>
 
-    Compute(+comm) and cache are in separate blocks (viewed independently), and
-    the platforms sit side by side. per_token_us uses each platform's uncached
-    (prefill) token count as the denominator (shown at the top).
-    """
+def _sidebyside(w, results, block_name, columns, rows_per_platform):
+    """Write a side-by-side block: each platform's rows aligned in parallel cols."""
     from itertools import zip_longest
-
-    COLS = ["platform", "stream_class", "kernel", "count", "total_ms", "avg_us", "per_token_us"]
-    SP = [""]  # spacer column between platforms
-
-    def rows_for(r: dict, classes: set) -> list[list]:
-        tk = r["prefill_tokens"] or 1
-        ks = [(k, kn, s) for (k, kn), s in r["kernels"].items() if k in classes]
-        ks.sort(key=lambda x: -x[2]["sum_us"])
-        return [
-            [r["label"], k, kn, s["count"], round(s["sum_us"] / 1000.0, 3),
-             round(s["sum_us"] / s["count"], 3), round(s["sum_us"] / tk, 4)]
-            for k, kn, s in ks
-        ]
-
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        # Top: uncached (prefill) token counts = the per_token_us denominator.
-        hdr = []
-        for i, r in enumerate(results):
+    w.writerow([block_name])
+    chrow = []
+    for i, _ in enumerate(results):
+        if i:
+            chrow += _SP
+        chrow += columns
+    w.writerow(chrow)
+    for tup in zip_longest(*rows_per_platform):
+        row = []
+        for i, cells in enumerate(tup):
             if i:
-                hdr += SP
-            hdr += [f"{r['label']} uncached tokens:", r["prefill_tokens"], "", "", "", "", ""]
-        w.writerow(hdr)
-        w.writerow([])
-
-        for block_name, classes in (("=== COMPUTE (incl. comm) ===", {"compute", "comm"}),
-                                    ("=== CACHE ===", {"cache"})):
-            w.writerow([block_name])
-            chrow = []
-            for i, _ in enumerate(results):
-                if i:
-                    chrow += SP
-                chrow += COLS
-            w.writerow(chrow)
-            per = [rows_for(r, classes) for r in results]
-            for tup in zip_longest(*per):
-                row = []
-                for i, cells in enumerate(tup):
-                    if i:
-                        row += SP
-                    row += list(cells) if cells else [""] * len(COLS)
-                w.writerow(row)
-            w.writerow([])
+                row += _SP
+            row += list(cells) if cells else [""] * len(columns)
+        w.writerow(row)
+    w.writerow([])
 
 
 def main() -> None:
@@ -312,29 +346,84 @@ def main() -> None:
         print(f"[INFO] analyzing {label}: {path}", file=sys.stderr)
         results.append(analyze(label, Path(path), args.min_gap_ms * 1000.0))
 
-    # summary.csv
+    # ---- ONE merged summary.csv: round summary + comparison + kernels + layer ----
+    def per_tok(r, ms):
+        return ms * 1000.0 / (r["prefill_tokens"] or 1)
+
+    def cls_ms(r, c):
+        return r["gpu_wall_busy_ms"] if c == "total_gpu" else r["class_busy_ms"].get(c, 0.0)
+
+    def kernel_rows(r, classes):
+        tk = r["prefill_tokens"] or 1
+        ks = [(kn, s) for (k, kn), s in r["kernels"].items() if k in classes]
+        ks.sort(key=lambda x: -x[1]["sum_us"])
+        # Per-call cost uses the MEDIAN (robust to profiler-artifact outliers
+        # and to varying prefill-chunk sizes), matching the layer-breakdown's
+        # robust per-kernel duration.  total_ms / per_token_us stay as the real
+        # round-wide sum (true total contribution, used for ranking).
+        import statistics as _st
+        return [[r["label"], kn, s["count"], round(s["sum_us"] / 1000.0, 3),
+                 round(_st.median(s["durs"]), 3), round(s["sum_us"] / tk, 4)]
+                for kn, s in ks]
+
+    KCOLS = ["platform", "kernel", "count", "total_ms", "median_us", "per_token_us"]
+    labels = [r["label"] for r in results]
+    two = len(results) >= 2
+
     with open(out / "summary.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["platform", "round_wall_ms", "skipped_gap_ms", "extend_steps",
-                    "prefill_tokens", "gpu_wall_busy_ms", "gpu_busy_util_pct"])
-        for r in results:
-            w.writerow([r["label"], round(r["round_wall_ms"], 1), round(r["skipped_gap_ms"], 1),
-                        r["extend_steps"], r["prefill_tokens"], round(r["gpu_wall_busy_ms"], 1),
-                        round(r["gpu_busy_util_pct"], 1)])
+        # Section 1: round summary + us/tok comparison (ratio when 2 platforms)
+        w.writerow(["=== ROUND SUMMARY ==="])
+        w.writerow(["metric"] + labels + ([f"ratio_{labels[0]}/{labels[1]}"] if two else []))
 
-    # categories.csv (per-category, per prefill token)
-    with open(out / "categories.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["platform", "category", "count", "sum_ms", "per_token_us"])
-        for r in results:
-            tk = r["prefill_tokens"] or 1
-            for c, s in sorted(r["cats"].items(), key=lambda kv: -kv[1]["sum_us"]):
-                w.writerow([r["label"], c, s["count"], round(s["sum_us"] / 1000.0, 3),
-                            round(s["sum_us"] / tk, 4)])
+        def srow(name, vals, ratio=None):
+            w.writerow([name] + vals + ([ratio] if two and ratio is not None else ([""] if two else [])))
 
-    # kernels.csv — per-kernel report: compute(+comm) block over cache block,
-    # platforms side by side, uncached-token counts at the top.
-    write_kernels_report(results, out / "kernels.csv")
+        srow("uncached_tokens", [r["prefill_tokens"] for r in results])
+        srow("round_wall_ms", [round(r["round_wall_ms"], 1) for r in results])
+        srow("skipped_gap_ms", [round(r["skipped_gap_ms"], 1) for r in results])
+        srow("gpu_busy_util_pct", [round(r["gpu_busy_util_pct"], 1) for r in results])
+        srow("extend_steps", [r["extend_steps"] for r in results])
+        for c in ("total_gpu", "compute", "cache", "comm"):
+            vals = [round(per_tok(r, cls_ms(r, c)), 2) for r in results]
+            ratio = round(vals[0] / vals[1], 2) if two and vals[1] else None
+            srow(f"{c}_us_per_tok", vals, ratio)
+        w.writerow([])
+
+        # EXTEND-step distribution: how many steps of each (batch size, tokens).
+        # Different steps process different amounts of data, so the same kernel
+        # is run on different sizes -> essential context for kernel comparison.
+        from itertools import zip_longest as _zl
+        w.writerow(["=== EXTEND STEP DISTRIBUTION (bs/toks -> #steps; data volume varies per step) ==="])
+        ehdr = []
+        for i, r in enumerate(results):
+            if i:
+                ehdr += _SP
+            ehdr += [f"step ({r['label']})", "#steps"]
+        w.writerow(ehdr)
+        ext_lists = [sorted(r["extend_dist"].items(), key=lambda x: (-x[1], x[0]))
+                     for r in results]
+        for tup in _zl(*ext_lists):
+            row = []
+            for i, cell in enumerate(tup):
+                if i:
+                    row += _SP
+                row += [cell[0], cell[1]] if cell else ["", ""]
+            w.writerow(row)
+        total_row = []
+        for i, r in enumerate(results):
+            if i:
+                total_row += _SP
+            total_row += (["Total", r["extend_steps"]] if i == 0
+                          else ["", r["extend_steps"]])
+        w.writerow(total_row)
+        w.writerow([])
+
+        # Section 2 & 3: kernels (compute+comm, then cache), side by side
+        _sidebyside(w, results, "=== KERNELS: COMPUTE (incl. comm) ===", KCOLS,
+                    [kernel_rows(r, {"compute", "comm"}) for r in results])
+        _sidebyside(w, results, "=== KERNELS: CACHE ===", KCOLS,
+                    [kernel_rows(r, {"cache"}) for r in results])
 
     # Console report
     print("\n==== PER-STREAM-CLASS wall-busy (compute vs cache vs comm) ====")
@@ -342,7 +431,8 @@ def main() -> None:
         cb = r["class_busy_ms"]
         print(f"[{r['label']}] " + " | ".join(f"{k}={cb.get(k,0):.0f}ms" for k in ("compute", "cache", "comm")))
 
-    print("\n==== TOP KERNELS by stream class (total_ms, avg_us) ====")
+    print("\n==== TOP KERNELS by stream class (total_ms, median_us) ====")
+    import statistics as _st
     for r in results:
         print(f"\n[{r['label']}]  (prefill tokens={r['prefill_tokens']})")
         for klass in ("compute", "cache", "comm"):
@@ -350,7 +440,7 @@ def main() -> None:
             ks.sort(key=lambda x: -x[1]["sum_us"])
             print(f"  -- {klass} --")
             for kn, s in ks[:8]:
-                print(f"     {s['sum_us']/1000.0:>8.1f}ms  avg={s['sum_us']/s['count']:>8.2f}us  n={s['count']:<6} {kn}")
+                print(f"     {s['sum_us']/1000.0:>8.1f}ms  med={_st.median(s['durs']):>8.2f}us  n={s['count']:<6} {kn}")
 
     print("\n==== ROUND SUMMARY (red-box noise + idle gap auto-skipped) ====")
     for r in results:
@@ -358,37 +448,18 @@ def main() -> None:
         print(f"  round wall: {r['round_wall_ms']:.0f} ms | prefill tokens: {r['prefill_tokens']} "
               f"| EXTEND steps: {r['extend_steps']}")
         print(f"  GPU wall-busy: {r['gpu_wall_busy_ms']:.0f} ms ({r['gpu_busy_util_pct']:.0f}% of round)")
+        for lbl, cnt in sorted(r["extend_dist"].items(), key=lambda x: (-x[1], x[0])):
+            print(f"    -- {lbl}: {cnt}")
         tk = r["prefill_tokens"] or 1
         for c, s in sorted(r["cats"].items(), key=lambda kv: -kv[1]["sum_us"])[:8]:
             print(f"    {c:<24}{s['sum_us']/1000.0:>9.1f} ms{s['sum_us']/tk:>9.3f} us/tok  (n={s['count']})")
-    # Cross-platform comparison (only when >=2 traces given). Compares the
-    # first two by us/tok for total GPU + each stream class, with ratio.
-    if len(results) >= 2:
-        a, b = results[0], results[1]
+    if two:
+        print(f"\n==== COMPARISON us/tok ({labels[0]} vs {labels[1]}) ====")
+        for c in ("total_gpu", "compute", "cache", "comm"):
+            va, vb = per_tok(results[0], cls_ms(results[0], c)), per_tok(results[1], cls_ms(results[1], c))
+            print(f"  {c:<12}{va:>9.2f}{vb:>9.2f}  ratio={va/vb:.2f}" if vb else f"  {c:<12}{va:>9.2f}")
 
-        def per_tok(r, ms):
-            return ms * 1000.0 / (r["prefill_tokens"] or 1)
-
-        metrics = [("total_gpu", lambda r: r["gpu_wall_busy_ms"])]
-        for cls in ("compute", "cache", "comm"):
-            metrics.append((cls, lambda r, c=cls: r["class_busy_ms"].get(c, 0.0)))
-
-        print(f"\n==== COMPARISON  us/tok  ({a['label']} vs {b['label']}) ====")
-        print(f"{'metric':<12}{a['label']:>12}{b['label']:>12}{'ratio':>9}")
-        with open(out / "comparison.csv", "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["metric", f"{a['label']}_us_per_tok", f"{b['label']}_us_per_tok",
-                        f"ratio_{a['label']}_over_{b['label']}"])
-            for name, fn in metrics:
-                va, vb = per_tok(a, fn(a)), per_tok(b, fn(b))
-                ratio = va / vb if vb else 0.0
-                print(f"{name:<12}{va:>12.2f}{vb:>12.2f}{ratio:>9.2f}")
-                w.writerow([name, round(va, 3), round(vb, 3), round(ratio, 3)])
-        if len(results) > 2:
-            print("[note] comparison shown for the first two traces only.")
-
-    print(f"\n[INFO] wrote summary.csv / categories.csv / kernels.csv"
-          + (" / comparison.csv" if len(results) >= 2 else "") + f" under {out}")
+    print(f"\n[INFO] wrote single summary.csv (round + comparison + kernels + layer) under {out}")
 
 
 if __name__ == "__main__":

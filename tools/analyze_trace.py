@@ -30,8 +30,9 @@ import csv
 import gzip
 import json
 import re
+import statistics
 import sys
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, defaultdict
 from pathlib import Path
 
 
@@ -233,7 +234,8 @@ def _lookup_stat(name: str,
 
 def write_step3(layer_types: list[dict], kernels_off: list[dict],
                 kernel_stats: list[dict] | None, path: str,
-                callsite_map: dict | None = None) -> None:
+                callsite_map: dict | None = None,
+                robust_dur: dict | None = None) -> None:
     """Export step 3 breakdown to Excel.
 
     Structure comes from graph-OFF trace (layer types, kernel order, sections,
@@ -241,6 +243,11 @@ def write_step3(layer_types: list[dict], kernels_off: list[dict],
     can be matched (exact or hash-stripped), the graph-ON kernel name and
     avg_dur are used as primary values; the graph-OFF name and single-pass
     duration are kept as reference columns.
+
+    Without graph-ON stats, AvgDuration_us is the ROBUST per-position median
+    across all instances of the layer type (``robust_dur``), which removes
+    profiler artifacts (rare 100-1000x outliers) while keeping genuine large
+    prefill kernels; GraphOFF_Duration_us keeps the raw single-instance dur.
 
     Output columns:
       LayerType, LayerCount, Index, Section, LeafModule,
@@ -293,7 +300,7 @@ def write_step3(layer_types: list[dict], kernels_off: list[dict],
                 pct = round(s["pct"], 2)
             else:
                 kernel_name = off_name
-                avg_dur = off_dur
+                avg_dur = round((robust_dur or {}).get(kidx, k["dur"]), 3)
                 count = ""
                 sum_dur = ""
                 pct = ""
@@ -368,24 +375,30 @@ def get_one_forward_pass(trace: dict | list, cls_name: str) -> list[dict]:
     return all_events[pass_idx * n_layers: (pass_idx + 1) * n_layers]
 
 
-def find_direct_children(trace: dict | list, parent_ev: dict,
+def find_direct_children(module_events: list[dict], module_ts: list[float],
+                          parent_ev: dict,
                           target_classes: set[str] | None = None) -> list[dict]:
-    """Find direct nn.Module children of a parent module event."""
-    events = trace if isinstance(trace, list) else trace.get("traceEvents", [])
-    pts, pend = parent_ev["ts"], parent_ev["ts"] + parent_ev.get("dur", 0)
+    """Find direct nn.Module children of a parent module event.
 
-    # Get all nn.Module events within parent's time range (excluding parent)
+    ``module_events`` must be the full list of ``nn.Module:`` events sorted by
+    ``ts``, and ``module_ts`` the matching list of timestamps (for bisect).
+    Only the slice of events within the parent's time window is scanned, so
+    this is O(log n + window) instead of O(total_events) per call.
+    """
+    pts, pend = parent_ev["ts"], parent_ev["ts"] + parent_ev.get("dur", 0)
+    pname = parent_ev["name"]
+
+    # Candidate children all start at ts >= pts; scan forward until ts > pend.
     children = []
-    for ev in events:
-        if not isinstance(ev, dict) or ev.get("ph") != "X":
+    n = len(module_events)
+    j = bisect.bisect_left(module_ts, pts)
+    while j < n and module_events[j]["ts"] <= pend:
+        ev = module_events[j]
+        j += 1
+        if ev is parent_ev or ev["name"] == pname:
             continue
-        if not ev.get("name", "").startswith("nn.Module: "):
-            continue
-        if ev is parent_ev or ev["name"] == parent_ev["name"]:
-            continue
-        ets = ev.get("ts", 0)
-        eend = ets + ev.get("dur", 0)
-        if ets >= pts and eend <= pend + 1:
+        eend = ev["ts"] + ev.get("dur", 0)
+        if eend <= pend + 1:
             cls = re.sub(r'_\d+$', '', ev["name"].replace("nn.Module: ", ""))
             if target_classes is None or cls in target_classes:
                 children.append(ev)
@@ -567,21 +580,45 @@ def find_layer_sections(pf_events: list[dict], layer_ev: dict) -> list[dict]:
 
     fts = fwd["ts"]
     fend = fts + fwd.get("dur", 0)
+    fwd_tid = fwd.get("tid")
 
-    # Collect events contained in forward
+    # Collect events contained in forward, but ONLY from the same thread as the
+    # forward's call stack.  Background threads (e.g. the HiCache L3 store
+    # thread running hicache_storage.py: set) overlap the forward in time and
+    # would otherwise be mistaken for layer "sections", mislabelling kernels
+    # (e.g. a bogus "set" section swallowing prepare_mlp / DeepseekV2MoE).
     children = [ev for ev in pf_events
                 if ev is not fwd
+                and ev.get("tid") == fwd_tid
                 and ev["ts"] >= fts
                 and ev["ts"] + ev.get("dur", 0) <= fend + 1]
 
-    # Keep only direct children (not nested inside another child)
+    # Keep only direct children (not nested inside another child).
+    # A child c is nested iff some other child o has o.ts < c.ts and
+    # o.end > c.end.  Computed in O(n log n) via a left-to-right sweep that
+    # tracks the max end seen among events with a *strictly* smaller ts,
+    # instead of the original O(n^2) all-pairs check (which blew up on
+    # large prefill windows with many python_function events).
     children.sort(key=lambda e: e["ts"])
     direct = []
-    for c in children:
-        cts, cend = c["ts"], c["ts"] + c.get("dur", 0)
-        if not any(o["ts"] < cts and o["ts"] + o.get("dur", 0) > cend
-                   for o in children if o is not c):
-            direct.append(c)
+    n = len(children)
+    max_end_strict = float("-inf")  # max end over events with ts < current ts
+    idx = 0
+    while idx < n:
+        j = idx
+        cur_ts = children[idx]["ts"]
+        while j < n and children[j]["ts"] == cur_ts:
+            j += 1
+        group = children[idx:j]
+        for c in group:
+            cend = c["ts"] + c.get("dur", 0)
+            if not (max_end_strict > cend):
+                direct.append(c)
+        for c in group:
+            cend = c["ts"] + c.get("dur", 0)
+            if cend > max_end_strict:
+                max_end_strict = cend
+        idx = j
 
     # Filter to significant functions and extract clean names
     sections = []
@@ -689,10 +726,14 @@ def get_kernels_for_module(module_ev: dict, ext_to_kidx: dict,
     return sorted(kidxs)
 
 
-def find_deep_kernel_labels(module_events: list[dict], layer_ev: dict,
+def find_deep_kernel_labels(module_events: list[dict], module_ts: list[float],
+                             layer_ev: dict,
                              kidxs: list[int], kernels: list[dict],
                              ext_to_rt: dict, corr_to_rt: dict) -> dict:
     """Find deepest nn.Module path for each kernel within a layer.
+
+    ``module_events`` must be sorted by ``ts`` with matching ``module_ts``;
+    only the layer's time window is scanned (bisect) instead of all events.
 
     Returns {kernel_idx: "ParentModule > LeafModule"}.
     """
@@ -701,12 +742,16 @@ def find_deep_kernel_labels(module_events: list[dict], layer_ev: dict,
 
     # Collect all nn.Module descendants within layer's time range
     descendants = []
-    for ev in module_events:
+    n = len(module_events)
+    j = bisect.bisect_left(module_ts, pts)
+    while j < n and module_events[j]["ts"] <= pend:
+        ev = module_events[j]
+        j += 1
         if ev is layer_ev:
             continue
-        ets = ev.get("ts", 0)
+        ets = ev["ts"]
         eend = ets + ev.get("dur", 0)
-        if ets >= pts and eend <= pend + 1:
+        if eend <= pend + 1:
             cls = re.sub(r'_\d+$', '', ev["name"].replace("nn.Module: ", ""))
             descendants.append({
                 "cls": cls, "ts": ets, "end": eend, "dur": ev.get("dur", 0),
@@ -766,11 +811,11 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
     """
     cls_name = find_decoder_layer_class(trace)
     if cls_name is None:
-        return None, [], {}
+        return None, [], {}, {}
 
     forward_pass = get_one_forward_pass(trace, cls_name)
     if not forward_pass:
-        return cls_name, [], {}
+        return cls_name, [], {}, {}
 
     ext_to_kidx, corr_to_kidx, runtime, rt_ts = build_ext_id_map(trace, kernels)
 
@@ -782,6 +827,7 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
         and ev.get("name", "").startswith("nn.Module: ")
     ]
     module_events.sort(key=lambda e: e["ts"])
+    module_ts = [e["ts"] for e in module_events]
 
     ext_to_rt = {}
     corr_to_rt = {}
@@ -803,7 +849,7 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
         sample_indices.add(min(idx, len(forward_pass) - 1))
     for idx in sample_indices:
         sample = forward_pass[idx]
-        all_children = find_direct_children(trace, sample)
+        all_children = find_direct_children(module_events, module_ts, sample)
         for c in all_children:
             cls = re.sub(r'_\d+$', '', c["name"].replace("nn.Module: ", ""))
             avg_dur = c.get("dur", 0)
@@ -828,7 +874,8 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
     layer_data = []
     for layer_ev in forward_pass:
         layer_name = layer_ev["name"].replace("nn.Module: ", "")
-        children = find_direct_children(trace, layer_ev, significant_classes)
+        children = find_direct_children(module_events, module_ts, layer_ev,
+                                        significant_classes)
         sub_mods = [re.sub(r'_\d+$', '', c["name"].replace("nn.Module: ", ""))
                     for c in children]
 
@@ -843,7 +890,7 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
         all_kidxs = get_kernels_for_module(layer_ev, ext_to_kidx,
                                             corr_to_kidx, runtime, rt_ts)
         kernel_labels = find_deep_kernel_labels(
-            module_events, layer_ev, all_kidxs, kernels,
+            module_events, module_ts, layer_ev, all_kidxs, kernels,
             ext_to_rt, corr_to_rt)
 
         breakdown = []
@@ -947,16 +994,84 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
     for i, ld in enumerate(layer_data):
         key = ld["sub_modules"]
         if key not in groups:
-            groups[key] = {"layers": [], "indices": [], "example_breakdown": None}
+            groups[key] = {"layers": [], "indices": [],
+                           "example_breakdown": None, "example_idx": None}
         groups[key]["layers"].append(ld["name"])
         groups[key]["indices"].append(i)
         if groups[key]["example_breakdown"] is None and i >= 1:
             groups[key]["example_breakdown"] = ld["kernel_breakdown"]
+            groups[key]["example_idx"] = i
     # Fallback: use first if no 2nd instance
     for key, g in groups.items():
         if g["example_breakdown"] is None:
             idx = g["indices"][0]
             g["example_breakdown"] = layer_data[idx]["kernel_breakdown"]
+            g["example_idx"] = idx
+
+    # --- Robust per-position duration (median across all instances of the
+    #     same layer type, aligned by kernel order) ---
+    # A single representative layer instance can contain profiler artifacts
+    # (e.g. a kernel whose recorded dur is 100-1000x its real value, well
+    # beyond p99).  Taking the median over the SAME position across all
+    # instances of that layer type removes those outliers while preserving the
+    # genuine large prefill-chunk kernels (fmha/gemm), which are large in
+    # *every* instance.  Maps example-instance kernel-idx -> robust dur (us).
+    # --- Robust, ROUND-SCOPED per-kernel duration ---
+    # The displayed AvgDuration_us is the MEDIAN duration of each kernel,
+    # grouped by (layer type, kernel name), over ALL decoder-layer instances
+    # that fall inside the profiled round (the GPU-active span after the
+    # largest idle gap).  This:
+    #   * removes profiler-artifact outliers (rare 100-1000x durations) and
+    #     the step-start bubble that inflates the first few layers,
+    #   * keeps genuine large prefill kernels (fmha/gemm), and
+    #   * is scoped to the same round as HiCache_Round_Analysis's kernel
+    #     ranking, so the two tables agree (median, not a single instance).
+    ks_sorted = sorted(kernels, key=lambda k: k["ts"])
+    if ks_sorted:
+        r0 = ks_sorted[0]["ts"]
+        r1 = max(k["ts_end"] for k in ks_sorted)
+        best_gap = 0.0
+        prev_end = ks_sorted[0]["ts_end"]
+        split = 0
+        for ii in range(1, len(ks_sorted)):
+            gap = ks_sorted[ii]["ts"] - prev_end
+            if gap > best_gap:
+                best_gap = gap
+                split = ii
+            if ks_sorted[ii]["ts_end"] > prev_end:
+                prev_end = ks_sorted[ii]["ts_end"]
+        if best_gap > 200_000:  # 200 ms idle gap → start of the round
+            r0 = ks_sorted[split]["ts"]
+    else:
+        r0, r1 = 0.0, float("inf")
+
+    all_dl = sorted(
+        [ev for ev in module_events
+         if re.sub(r'_\d+$', '', ev["name"].replace("nn.Module: ", "")) == cls_name],
+        key=lambda e: e["ts"])
+    n_layers = len(forward_pass)
+    idx_type = {j: tuple(layer_data[j]["sub_modules"])
+                for j in range(len(layer_data))}
+
+    tn_durs: dict = defaultdict(list)  # (layer_type, kernel_name) -> [dur...]
+    for gi, lev in enumerate(all_dl):
+        if not (r0 <= lev["ts"] <= r1):
+            continue
+        T = idx_type.get(gi % n_layers) if n_layers else None
+        if T is None:
+            continue
+        for ki in get_kernels_for_module(lev, ext_to_kidx, corr_to_kidx,
+                                         runtime, rt_ts):
+            tn_durs[(T, kernels[ki]["name"])].append(kernels[ki]["dur"])
+    tn_med = {k: statistics.median(v) for k, v in tn_durs.items() if v}
+
+    robust_dur_by_kidx: dict[int, float] = {}
+    for key, g in groups.items():
+        T = tuple(key)
+        for item in g["example_breakdown"]:
+            kidx = item[0]
+            nm = kernels[kidx]["name"]
+            robust_dur_by_kidx[kidx] = tn_med.get((T, nm), kernels[kidx]["dur"])
 
     layer_types = []
     for sub_mods, g in groups.items():
@@ -978,7 +1093,7 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
     callsite_map = build_callsite_map(trace, kernels, ext_to_kidx, runtime,
                                       target_kidxs)
 
-    return cls_name, layer_types, callsite_map
+    return cls_name, layer_types, callsite_map, robust_dur_by_kidx
 
 
 def print_step2(cls_name: str, layer_types: list[dict]) -> None:
@@ -1011,12 +1126,15 @@ def print_step2(cls_name: str, layer_types: list[dict]) -> None:
 
 def print_step3(cls_name: str, layer_types: list[dict],
                 kernels: list[dict], kernel_stats: list[dict] | None,
-                callsite_map: dict | None = None) -> None:
+                callsite_map: dict | None = None,
+                robust_dur: dict | None = None) -> None:
     """
     Print kernel breakdown for each layer type.
     Uses graph-OFF kernel data with sub-module labels.
     If kernel_stats (from graph-ON step 1) is provided, also shows
     the graph-ON avg duration for cross-reference.
+    Durations use the robust per-position median (``robust_dur``) when
+    available, to avoid profiler-artifact outliers.
     """
     # Build name->avg lookup from step 1
     stat_lookup = {}
@@ -1050,7 +1168,7 @@ def print_step3(cls_name: str, layer_types: list[dict],
 
         for pos, (kidx, top_mod, leaf) in enumerate(breakdown):
             k = kernels[kidx]
-            dur = k["dur"]
+            dur = (robust_dur or {}).get(kidx, k["dur"])
             total_dur += dur
 
             if top_mod != current_top:
@@ -1152,7 +1270,7 @@ def main() -> None:
         print(f"[INFO] Found {len(kernels_off)} kernels on {stream_desc}",
               file=sys.stderr)
 
-        cls_name, layer_types, callsite_map = analyze_layer_structure(
+        cls_name, layer_types, callsite_map, robust_dur = analyze_layer_structure(
             trace_off, kernels_off)
         if cls_name:
             print_step2(cls_name, layer_types)
@@ -1160,11 +1278,11 @@ def main() -> None:
             # --- Step 3: Combined breakdown ---
             if layer_types:
                 print_step3(cls_name, layer_types, kernels_off, kernel_stats,
-                            callsite_map)
+                            callsite_map, robust_dur)
                 if out_dir:
                     write_step3(layer_types, kernels_off, kernel_stats,
                                 str(out_dir / f"step3_layer_breakdown{args.tag}.xlsx"),
-                                callsite_map)
+                                callsite_map, robust_dur)
         else:
             print("[WARN] No nn.Module DecoderLayer events found.", file=sys.stderr)
 

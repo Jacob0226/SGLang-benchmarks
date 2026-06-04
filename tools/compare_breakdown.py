@@ -38,6 +38,18 @@ def load_breakdown(path: str) -> list[dict]:
     return rows
 
 
+def load_left_csv(path: str) -> list[list[str]]:
+    """Load a CSV verbatim as a list of row lists (for the left-side block).
+
+    Blank lines are preserved as empty rows so section spacing carries over.
+    """
+    rows: list[list[str]] = []
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.reader(f):
+            rows.append(row)
+    return rows
+
+
 # LeafModule aliases: different names that should match during alignment
 LEAF_ALIASES = {
     "FlashInferFusedMoE": "FusedMoE/FlashInferFusedMoE",
@@ -327,11 +339,42 @@ def build_comparison(rows_a, rows_b, label_a, label_b):
     return header, output_rows, section_meta
 
 
-def write_xlsx(header, rows, section_meta, label_a, label_b, path):
-    """Write comparison to Excel with formulas, subtotals, and summary."""
+def write_xlsx(header, rows, section_meta, label_a, label_b, path,
+               left_rows=None):
+    """Write comparison to Excel with formulas, subtotals, and summary.
+
+    If ``left_rows`` (a list of CSV row lists, e.g. from summary.csv) is given,
+    it is written verbatim into the left-most columns and the whole comparison
+    block is shifted right by ``col_offset`` columns (one-column gap in
+    between).  All formulas are emitted with the offset applied so they stay
+    live and reference the correct cells.
+    """
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side, numbers
     from openpyxl.utils import get_column_letter
+
+    # Column offset: comparison block starts after the left CSV block + 1 gap.
+    if left_rows:
+        left_width = max((len(r) for r in left_rows), default=0)
+        col_offset = left_width + 1
+    else:
+        col_offset = 0
+
+    def C(n: int) -> str:
+        """Column letter for comparison-block column n (1-indexed) with offset."""
+        return get_column_letter(n + col_offset)
+
+    def _num(v):
+        """Coerce a numeric-looking string to int/float so Excel SUM works
+        (otherwise integer-valued cells get stored as text)."""
+        if isinstance(v, (int, float)):
+            return v
+        if isinstance(v, str):
+            t = v.strip().replace(",", "")
+            if t and t.lstrip("-").replace(".", "", 1).isdigit() and t not in (
+                    "-", ".", "-."):
+                return float(t) if "." in t else int(t)
+        return v
 
     wb = Workbook()
     ws = wb.active
@@ -366,11 +409,30 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
     for meta in section_meta:
         _get_subtotal_fill(meta["layer_type"])
 
-    COL_A_US = 7   # column G
-    COL_B_US = 8   # column H
+    COL_A_US = 7   # column G (within comparison block, before offset)
+    COL_B_US = 8   # column H (within comparison block, before offset)
 
-    # --- Write header ---
-    for c, val in enumerate(header, 1):
+    # --- Write left CSV block (e.g. summary.csv) verbatim ---
+    if left_rows:
+        for ri, row_vals in enumerate(left_rows, 1):
+            for ci, val in enumerate(row_vals, 1):
+                if val is None or val == "":
+                    continue
+                s = str(val)
+                t = s.replace(",", "")
+                cell = ws.cell(row=ri, column=ci)
+                if t and t.lstrip("-").replace(".", "", 1).isdigit():
+                    cell.value = float(t) if "." in t else int(t)
+                else:
+                    cell.value = s
+                    # Strings starting with "=" (e.g. "=== ROUND SUMMARY ===")
+                    # must NOT be treated as Excel formulas.
+                    if s.startswith("="):
+                        cell.data_type = "s"
+                cell.font = arial
+
+    # --- Write header (comparison block, shifted by col_offset) ---
+    for c, val in enumerate(header, 1 + col_offset):
         cell = ws.cell(row=1, column=c, value=val)
         cell.font = arial_bold
         cell.fill = header_fill
@@ -389,24 +451,21 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
         is_subtotal = any(v in ("__SUM_A__", "__SUM_B__", "__RATIO__")
                           for v in row_data if isinstance(v, str))
         row_fill = _get_subtotal_fill(subtotal_layer_type.get(r, "")) if is_subtotal else None
-        for c, val in enumerate(row_data, 1):
+        for c, val in enumerate(row_data, 1 + col_offset):
             if val in ("__SUM_A__", "__SUM_B__", "__RATIO__"):
                 continue  # filled later with formulas
-            try:
-                val = float(val) if val and isinstance(val, str) and "." in val and val.replace(".", "").replace("-", "").isdigit() else val
-            except (ValueError, TypeError):
-                pass
+            val = _num(val)  # int OR float -> real number (so SUM works)
             cell = ws.cell(row=r, column=c, value=val if val != "" else None)
             cell.font = arial_bold if is_subtotal else arial
             if is_subtotal and row_fill:
                 cell.fill = row_fill
         if is_separator:
-            for c in range(1, len(header) + 1):
+            for c in range(1 + col_offset, len(header) + 1 + col_offset):
                 ws.cell(row=r, column=c).border = thin_border
 
-    # --- Write subtotal formulas ---
-    ca = get_column_letter(COL_A_US)
-    cb = get_column_letter(COL_B_US)
+    # --- Write subtotal formulas (offset-aware) ---
+    ca = C(COL_A_US)
+    cb = C(COL_B_US)
 
     for meta in section_meta:
         xl_row = meta["subtotal_idx"] + 2  # +2: 1-indexed + header
@@ -414,20 +473,20 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
         data_end_xl = xl_row - 1  # row before subtotal
         sfill = _get_subtotal_fill(meta["layer_type"])
 
-        cell_a = ws.cell(row=xl_row, column=COL_A_US)
+        cell_a = ws.cell(row=xl_row, column=COL_A_US + col_offset)
         cell_a.value = f"=SUM({ca}{data_start_xl}:{ca}{data_end_xl})"
         cell_a.font = arial_bold
         cell_a.fill = sfill
         cell_a.number_format = "0.000"
 
-        cell_b = ws.cell(row=xl_row, column=COL_B_US)
+        cell_b = ws.cell(row=xl_row, column=COL_B_US + col_offset)
         cell_b.value = f"=SUM({cb}{data_start_xl}:{cb}{data_end_xl})"
         cell_b.font = arial_bold
         cell_b.fill = sfill
         cell_b.number_format = "0.000"
 
         # Ratio in column J (10)
-        cell_r = ws.cell(row=xl_row, column=10)
+        cell_r = ws.cell(row=xl_row, column=10 + col_offset)
         cell_r.value = f"=IF({ca}{xl_row}>0,{cb}{xl_row}/{ca}{xl_row},\"\")"
         cell_r.font = arial_bold
         cell_r.fill = sfill
@@ -449,30 +508,30 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
     NUM_COLS = 13  # A..M
 
     # Summary header row 1
-    ws.cell(row=r, column=1, value="Summary").font = arial_bold
-    ws.cell(row=r, column=1).fill = summary_fill
+    ws.cell(row=r, column=1 + col_offset, value="Summary").font = arial_bold
+    ws.cell(row=r, column=1 + col_offset).fill = summary_fill
     for c in range(2, NUM_COLS + 1):
-        ws.cell(row=r, column=c).fill = summary_fill
-    ws.merge_cells(start_row=r, start_column=6, end_row=r, end_column=7)
-    cell = ws.cell(row=r, column=6, value="Dur-1Layer")
+        ws.cell(row=r, column=c + col_offset).fill = summary_fill
+    ws.merge_cells(start_row=r, start_column=6 + col_offset, end_row=r, end_column=7 + col_offset)
+    cell = ws.cell(row=r, column=6 + col_offset, value="Dur-1Layer")
     cell.font = arial_bold
     cell.fill = summary_fill
     cell.alignment = Alignment(horizontal="center")
-    ws.merge_cells(start_row=r, start_column=8, end_row=r, end_column=9)
-    cell = ws.cell(row=r, column=8, value="Dur-1Forward")
+    ws.merge_cells(start_row=r, start_column=8 + col_offset, end_row=r, end_column=9 + col_offset)
+    cell = ws.cell(row=r, column=8 + col_offset, value="Dur-1Forward")
     cell.font = arial_bold
     cell.fill = summary_fill
     cell.alignment = Alignment(horizontal="center")
     # Optimization header (green)
-    ws.merge_cells(start_row=r, start_column=11, end_row=r, end_column=13)
-    cell = ws.cell(row=r, column=11, value="Optimization and Projection")
+    ws.merge_cells(start_row=r, start_column=11 + col_offset, end_row=r, end_column=13 + col_offset)
+    cell = ws.cell(row=r, column=11 + col_offset, value="Optimization and Projection")
     cell.font = arial_bold
     cell.fill = opt_fill
     cell.alignment = Alignment(horizontal="center")
     for c in range(12, 14):
-        ws.cell(row=r, column=c).fill = opt_fill
+        ws.cell(row=r, column=c + col_offset).fill = opt_fill
     for c in range(1, NUM_COLS + 1):
-        ws.cell(row=r, column=c).border = all_border
+        ws.cell(row=r, column=c + col_offset).border = all_border
     r += 1
 
     # Summary header row 2
@@ -480,7 +539,7 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
                     label_a, label_b, label_a, label_b, f"{label_b}/{label_a}",
                     "Section Speedup", "Overall Speedup", "Optimized Perf (Accum)"]
     for c, val in enumerate(sum_headers2, 1):
-        cell = ws.cell(row=r, column=c, value=val if val else None)
+        cell = ws.cell(row=r, column=c + col_offset, value=val if val else None)
         cell.font = arial_bold
         cell.fill = opt_fill if c >= 11 else summary_fill
         cell.alignment = Alignment(horizontal="center")
@@ -489,11 +548,11 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
 
     # Baseline row (optimization columns only)
     baseline_r = r
-    ws.cell(row=r, column=11, value="0 (Baseline)").font = arial
-    ws.cell(row=r, column=12, value="0 (Baseline)").font = arial
+    ws.cell(row=r, column=11 + col_offset, value="0 (Baseline)").font = arial
+    ws.cell(row=r, column=12 + col_offset, value="0 (Baseline)").font = arial
     # M13 baseline filled later (needs total_row reference)
     for c in range(1, NUM_COLS + 1):
-        ws.cell(row=r, column=c).border = all_border
+        ws.cell(row=r, column=c + col_offset).border = all_border
     r += 1
 
     # Summary data rows
@@ -508,83 +567,109 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
         st_row = meta["subtotal_idx"] + 2
         data_start_xl = meta["data_start"] + 2
 
-        ws.cell(row=r, column=1,
-                value=f"=A{data_start_xl}").font = arial
-        ws.cell(row=r, column=2,
-                value=f"=B{data_start_xl}").font = arial
-        ws.cell(row=r, column=4,
-                value=f"=D{data_start_xl}").font = arial
+        ws.cell(row=r, column=1 + col_offset,
+                value=f"={C(1)}{data_start_xl}").font = arial
+        ws.cell(row=r, column=2 + col_offset,
+                value=f"={C(2)}{data_start_xl}").font = arial
+        ws.cell(row=r, column=4 + col_offset,
+                value=f"={C(4)}{data_start_xl}").font = arial
 
-        ws.cell(row=r, column=6,
+        ws.cell(row=r, column=6 + col_offset,
                 value=f"={ca}{st_row}").font = arial
-        ws.cell(row=r, column=6).number_format = "0.000"
-        ws.cell(row=r, column=7,
+        ws.cell(row=r, column=6 + col_offset).number_format = "0.000"
+        ws.cell(row=r, column=7 + col_offset,
                 value=f"={cb}{st_row}").font = arial
-        ws.cell(row=r, column=7).number_format = "0.000"
+        ws.cell(row=r, column=7 + col_offset).number_format = "0.000"
 
-        ws.cell(row=r, column=8,
-                value=f"=F{r}*D{r}").font = arial
-        ws.cell(row=r, column=8).number_format = "0.0"
-        ws.cell(row=r, column=9,
-                value=f"=G{r}*D{r}").font = arial
-        ws.cell(row=r, column=9).number_format = "0.0"
+        ws.cell(row=r, column=8 + col_offset,
+                value=f"={C(6)}{r}*{C(4)}{r}").font = arial
+        ws.cell(row=r, column=8 + col_offset).number_format = "0.0"
+        ws.cell(row=r, column=9 + col_offset,
+                value=f"={C(7)}{r}*{C(4)}{r}").font = arial
+        ws.cell(row=r, column=9 + col_offset).number_format = "0.0"
 
-        ws.cell(row=r, column=10,
-                value=f"=IF(H{r}>0,I{r}/H{r},\"\")").font = arial
-        ws.cell(row=r, column=10).number_format = "0%"
+        ws.cell(row=r, column=10 + col_offset,
+                value=f"=IF({C(8)}{r}>0,{C(9)}{r}/{C(8)}{r},\"\")").font = arial
+        ws.cell(row=r, column=10 + col_offset).number_format = "0%"
 
         for c in range(1, NUM_COLS + 1):
-            ws.cell(row=r, column=c).border = all_border
+            ws.cell(row=r, column=c + col_offset).border = all_border
         r += 1
 
     # Total row (no borders)
     total_end = r - 1
     total_row = r
-    ws.cell(row=r, column=2, value="Total").font = arial_bold
+    ws.cell(row=r, column=2 + col_offset, value="Total").font = arial_bold
     for col in (8, 9):
-        cl = get_column_letter(col)
-        ws.cell(row=r, column=col,
+        cl = C(col)
+        ws.cell(row=r, column=col + col_offset,
                 value=f"=SUM({cl}{data_first}:{cl}{total_end})").font = arial_bold
-        ws.cell(row=r, column=col).number_format = "0.0"
-    ws.cell(row=r, column=10,
-            value=f"=IF(H{r}>0,I{r}/H{r},\"\")").font = arial_bold
-    ws.cell(row=r, column=10).number_format = "0%"
+        ws.cell(row=r, column=col + col_offset).number_format = "0.0"
+    ws.cell(row=r, column=10 + col_offset,
+            value=f"=IF({C(8)}{r}>0,{C(9)}{r}/{C(8)}{r},\"\")").font = arial_bold
+    ws.cell(row=r, column=10 + col_offset).number_format = "0%"
 
     # --- Fill optimization formulas (need total_row) ---
     # Baseline Optimized Perf = B200_Total / MI355X_Total
-    c13 = ws.cell(row=baseline_r, column=13)
-    c13.value = f"=IF($H${total_row}>0,$I${total_row}/$H${total_row},\"\")"
+    h_tot = f"${C(8)}${total_row}"
+    i_tot = f"${C(9)}${total_row}"
+    c13 = ws.cell(row=baseline_r, column=13 + col_offset)
+    c13.value = f"=IF({h_tot}>0,{i_tot}/{h_tot},\"\")"
     c13.font = arial
     c13.number_format = "0%"
 
     for i, meta in enumerate(section_meta):
         dr = data_first + i
+        hd, idd = f"{C(8)}{dr}", f"{C(9)}{dr}"
 
         # Section Speedup = MI355X_section / B200_section (if MI355X slower)
-        ws.cell(row=dr, column=11,
-                value=f"=IF(H{dr}>I{dr},H{dr}/I{dr},0)").font = arial
-        ws.cell(row=dr, column=11).number_format = "0.0"
+        ws.cell(row=dr, column=11 + col_offset,
+                value=f"=IF({hd}>{idd},{hd}/{idd},0)").font = arial
+        ws.cell(row=dr, column=11 + col_offset).number_format = "0.0"
 
         # Overall Speedup = ReduceTime / MI355X_Total
         # ReduceTime = IF(H > I, H - I, 0)
-        ws.cell(row=dr, column=12,
-                value=f"=IF(H{dr}>I{dr},(H{dr}-I{dr})/$H${total_row},0)").font = arial
-        ws.cell(row=dr, column=12).number_format = "0.0%"
+        ws.cell(row=dr, column=12 + col_offset,
+                value=f"=IF({hd}>{idd},({hd}-{idd})/{h_tot},0)").font = arial
+        ws.cell(row=dr, column=12 + col_offset).number_format = "0.0%"
 
         # Optimized Perf (Accum) = previous row M + current L
         prev_r = baseline_r if i == 0 else (dr - 1)
-        ws.cell(row=dr, column=13,
-                value=f"=M{prev_r}+L{dr}").font = arial
-        ws.cell(row=dr, column=13).number_format = "0%"
+        ws.cell(row=dr, column=13 + col_offset,
+                value=f"={C(13)}{prev_r}+{C(12)}{dr}").font = arial
+        ws.cell(row=dr, column=13 + col_offset).number_format = "0%"
 
     # --- Auto-fit column widths ---
+    # Left CSV block widths
+    if left_rows:
+        for c in range(1, col_offset):  # exclude the 1-col gap (col_offset)
+            max_len = 8
+            for row in range(1, min(len(left_rows) + 1, 80)):
+                val = ws.cell(row=row, column=c).value
+                if val is not None and not str(val).startswith("="):
+                    max_len = max(max_len, min(len(str(val)), 60))
+            ws.column_dimensions[get_column_letter(c)].width = max_len + 2
+    # Comparison block widths
     for c in range(1, len(header) + 1):
         max_len = len(str(header[c - 1]))
         for row in range(2, min(len(rows) + 2, 50)):
-            val = ws.cell(row=row, column=c).value
+            val = ws.cell(row=row, column=c + col_offset).value
             if val and not str(val).startswith("="):
                 max_len = max(max_len, min(len(str(val)), 60))
-        ws.column_dimensions[get_column_letter(c)].width = max_len + 2
+        ws.column_dimensions[get_column_letter(c + col_offset)].width = max_len + 2
+
+    # --- Alignment: everything left-aligned, EXCEPT the bottom Summary
+    #     projection table (rows summary_start..total_row, comparison cols),
+    #     which is right-aligned. ---
+    left = Alignment(horizontal="left")
+    right = Alignment(horizontal="right")
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is None:
+                continue
+            in_summary = (summary_start <= cell.row <= total_row
+                          and cell.column > col_offset)
+            cell.alignment = right if in_summary else left
 
     wb.save(path)
 
@@ -601,6 +686,10 @@ def main():
                    help="Labels for the two platforms (default: A B)")
     p.add_argument("--out", required=True, metavar="XLSX",
                    help="Output Excel path (e.g. comparison.xlsx)")
+    p.add_argument("--left-csv", metavar="CSV", default=None,
+                   help="Optional CSV (e.g. summary.csv) placed verbatim in "
+                        "the left columns; the comparison block is shifted "
+                        "right so both are visible side by side.")
     args = p.parse_args()
 
     rows_a = load_breakdown(args.file_a)
@@ -611,18 +700,23 @@ def main():
     if not rows_b:
         sys.exit(f"[ERROR] No data in {args.file_b}")
 
+    left_rows = load_left_csv(args.left_csv) if args.left_csv else None
+
     blocks_a = build_blocks(rows_a)
     blocks_b = build_blocks(rows_b)
     print(f"[INFO] {args.labels[0]}: {len(rows_a)} kernels, "
           f"{len(blocks_a)} blocks", file=sys.stderr)
     print(f"[INFO] {args.labels[1]}: {len(rows_b)} kernels, "
           f"{len(blocks_b)} blocks", file=sys.stderr)
+    if left_rows is not None:
+        print(f"[INFO] left CSV: {len(left_rows)} rows from {args.left_csv}",
+              file=sys.stderr)
 
     header, output, section_meta = build_comparison(
         rows_a, rows_b, args.labels[0], args.labels[1])
 
     write_xlsx(header, output, section_meta,
-               args.labels[0], args.labels[1], args.out)
+               args.labels[0], args.labels[1], args.out, left_rows)
     print(f"[INFO] Written to {args.out}", file=sys.stderr)
 
 

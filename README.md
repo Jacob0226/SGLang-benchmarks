@@ -43,8 +43,9 @@ See `bash HiCache.sh --help` for the full flag list.
 | `parse_perf_metrics_to_csv.py` | `sglang.bench_serving` log → CSV (E2E / TTFT / ITL) |
 | `parse_bench.py` | Parse benchmark logs → summary CSV |
 | `parse_torch_profiler.py` | Streaming parse of large `.trace.json.gz` → kernel CSV |
-| `analyze_trace.py` | 3-step trace analysis (kernel stats → layer structure → per-layer breakdown) |
-| `compare_breakdown.py` | Compare two breakdown CSVs side-by-side (e.g. MI355X vs B200) |
+| `tools/analyze_trace.py` | 3-step trace analysis (kernel stats → layer structure → per-layer breakdown) |
+| `tools/compare_breakdown.py` | Compare two breakdown CSVs side-by-side (e.g. MI355X vs B200) |
+| `tools/HiCache_Round_Analysis.py` | Round-bounded MI355X vs B200 comparison (round summary + EXTEND dist + kernels) |
 | `fetch_kernels_from_torch_profiler.py` | Fetch kernels by timestamp range from a trace |
 
 See `tools/README.md` for CI-reproduction and environment-setup helpers.
