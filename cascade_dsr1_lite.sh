@@ -229,6 +229,27 @@ if [ -n "$CACHE_MODES" ]; then
   exit 0
 fi
 
+apply_no_aiter_mem_fraction_patch() {
+  local script_dir patch repo candidate
+  script_dir="$(dirname "$(readlink -f "$0")")"
+  patch="$script_dir/HiCachePatch/no-aiter-mem-fraction.sh"
+  [ -f "$patch" ] || { echo "ERROR: $patch not found" >&2; exit 1; }
+
+  repo=""
+  for candidate in /sgl-workspace/sglang "$HOME/work-space/sglang"; do
+    if [ -f "$candidate/python/sglang/srt/server_args.py" ]; then
+      repo="$candidate"
+      break
+    fi
+  done
+  [ -n "$repo" ] || { echo "ERROR: cannot find sglang checkout to patch" >&2; exit 1; }
+
+  echo ">>> applying HiCachePatch/no-aiter-mem-fraction.sh to $repo"
+  bash "$patch" "$repo"
+}
+
+apply_no_aiter_mem_fraction_patch
+
 # ============================== Auto-derive mem-fraction-static ==============================
 # When --L1-size is given, run compute_profile_params.py to get the
 # mem-fraction-static that exactly fits weights/rank + L1 + buffer on

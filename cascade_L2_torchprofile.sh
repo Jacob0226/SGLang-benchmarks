@@ -233,6 +233,26 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 CASCADE_PID=""
 CASCADE_LOG=""
 
+apply_no_aiter_mem_fraction_patch() {
+  local patch repo candidate
+  patch="$SCRIPT_DIR/HiCachePatch/no-aiter-mem-fraction.sh"
+  [ -f "$patch" ] || { echo "ERROR: $patch not found" >&2; exit 1; }
+
+  repo=""
+  for candidate in /sgl-workspace/sglang "$HOME/work-space/sglang"; do
+    if [ -f "$candidate/python/sglang/srt/server_args.py" ]; then
+      repo="$candidate"
+      break
+    fi
+  done
+  [ -n "$repo" ] || { echo "ERROR: cannot find sglang checkout to patch" >&2; exit 1; }
+
+  echo ">>> applying HiCachePatch/no-aiter-mem-fraction.sh to $repo"
+  bash "$patch" "$repo"
+}
+
+apply_no_aiter_mem_fraction_patch
+
 HELPER="$SCRIPT_DIR/compute_profile_params.py"
 [ -f "$HELPER" ] || { echo "ERROR: $HELPER not found" >&2; exit 1; }
 
