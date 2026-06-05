@@ -24,7 +24,60 @@ import argparse
 import os
 import time
 
+import numpy as np
 import torch
+
+O_DIRECT = getattr(os, "O_DIRECT", 0)
+ALIGN = 4096  # O_DIRECT buffer/offset/length alignment
+
+
+def aligned_buf(nbytes, align=ALIGN):
+    """Page-aligned uint8 numpy buffer (required for O_DIRECT)."""
+    raw = np.empty(nbytes + align, dtype=np.uint8)
+    off = (-raw.ctypes.data) % align
+    return raw[off:off + nbytes]
+
+
+def drop_file_cache(path):
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        os.close(fd)
+    except (AttributeError, OSError):
+        pass
+
+
+def write_buffered(path, mv, fsync):
+    with open(path, "wb") as f:
+        f.write(mv)
+        f.flush()
+        if fsync:
+            os.fsync(f.fileno())
+
+
+def write_odirect(path, mv):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_DIRECT, 0o644)
+    try:
+        n = 0
+        while n < len(mv):
+            n += os.write(fd, mv[n:])
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def read_into(path, mv, odirect):
+    flags = os.O_RDONLY | (O_DIRECT if odirect else 0)
+    fd = os.open(path, flags)
+    try:
+        off = 0
+        while off < len(mv):
+            n = os.preadv(fd, [mv[off:]], off)
+            if n == 0:
+                break
+            off += n
+    finally:
+        os.close(fd)
 
 
 def cuda_time(fn, iters, warmup=5):
@@ -61,7 +114,6 @@ def bench_hops(args):
           f"x {args.blobs}pages = {nbytes/1e6:.1f} MB/transfer")
     dgpu = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
     hpin = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
-    hpin2 = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
     path = os.path.join(args.nvme_dir, f"_kvhop_{os.getpid()}.bin")
 
     t = cuda_time(lambda: hpin.copy_(dgpu, non_blocking=True), args.iters)
@@ -69,28 +121,36 @@ def bench_hops(args):
     t = cuda_time(lambda: dgpu.copy_(hpin, non_blocking=True), args.iters)
     print(f"  L2->L1  host -> HBM       : {gbps(nbytes,t):7.2f} GB/s  ({t*1e3:7.2f} ms)")
 
-    np_view = hpin.numpy()
+    # L2<->L3 file I/O. Use pre-allocated, page-aligned host buffers and low-level
+    # os.write/os.preadv so the timed region is pure file I/O (no tobytes()/bytearray
+    # copies). write/fsync are measured separately, and an O_DIRECT variant gives the
+    # true drive bandwidth (bypasses the page cache, the only honest read/write number).
+    nb_a = (nbytes // ALIGN) * ALIGN  # align length for O_DIRECT
+    src = aligned_buf(nb_a)
+    dst = aligned_buf(nb_a)
+    src[:] = 0
+    mv_src, mv_dst = memoryview(src), memoryview(dst)
+    n4 = max(3, args.iters // 4)
+    print(f"  --- L2->L3  host -> NVMe (host buffer already in RAM, single stream) ---")
 
-    def wr():
-        with open(path, "wb", buffering=0) as f:
-            f.write(np_view.tobytes())
-            f.flush()
-            os.fsync(f.fileno())
-    t = wall_time(wr, max(3, args.iters // 4))
-    print(f"  L2->L3  host -> NVMe file : {gbps(nbytes,t):7.2f} GB/s  ({t*1e3:7.2f} ms) fsync")
-    try:
-        fd = os.open(path, os.O_RDONLY)
-        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-        os.close(fd)
-    except Exception:
-        pass
+    t = wall_time(lambda: write_buffered(path, mv_src, fsync=False), n4)
+    print(f"  write buffered, no fsync  : {gbps(nb_a,t):7.2f} GB/s  ({t*1e3:7.2f} ms)  [page cache only]")
+    t = wall_time(lambda: write_buffered(path, mv_src, fsync=True), n4)
+    print(f"  write buffered + fsync    : {gbps(nb_a,t):7.2f} GB/s  ({t*1e3:7.2f} ms)  [HiCache-like path]")
+    if O_DIRECT:
+        t = wall_time(lambda: write_odirect(path, mv_src), n4)
+        print(f"  write O_DIRECT + fsync    : {gbps(nb_a,t):7.2f} GB/s  ({t*1e3:7.2f} ms)  [TRUE drive write]")
 
-    def rd():
-        with open(path, "rb", buffering=0) as f:
-            data = f.read()
-        hpin2.numpy()[:len(data)] = torch.frombuffer(bytearray(data), dtype=torch.uint8).numpy()
-    t = wall_time(rd, max(3, args.iters // 4))
-    print(f"  L3->L2  NVMe -> host(pin) : {gbps(nbytes,t):7.2f} GB/s  ({t*1e3:7.2f} ms)")
+    print(f"  --- L3->L2  NVMe -> host (read into pre-alloc buffer) ---")
+    write_buffered(path, mv_src, fsync=True)  # ensure file exists
+    t = wall_time(lambda: read_into(path, mv_dst, odirect=False), n4)
+    print(f"  read cached (warm)        : {gbps(nb_a,t):7.2f} GB/s  ({t*1e3:7.2f} ms)  [served from page cache]")
+    if O_DIRECT:
+        def rd_cold():
+            drop_file_cache(path)
+            read_into(path, mv_dst, odirect=True)
+        t = wall_time(rd_cold, n4, warmup=0)
+        print(f"  read O_DIRECT (cold)      : {gbps(nb_a,t):7.2f} GB/s  ({t*1e3:7.2f} ms)  [TRUE drive read]")
     os.remove(path)
 
 
@@ -132,11 +192,54 @@ def bench_layout(args):
     def backup_pf():
         ops.transfer_kv_all_layer_mla_lf_pf.default(dptr, host, didx, hidx, item, layout_dim, L, bq, nw)
 
+    rows = [("AOT load   lf->lf", load_lf), ("AOT load   pf->lf (REAL)", load_pf),
+            ("AOT backup lf->lf", backup_lf), ("AOT backup lf->pf (REAL)", backup_pf)]
+
+    if args.jit:
+        try:
+            from sglang.jit_kernel.hicache import (
+                can_use_hicache_jit_kernel,
+                transfer_hicache_all_layer_mla as jit_all,
+                transfer_hicache_one_layer_mla as jit_one,
+            )
+            assert can_use_hicache_jit_kernel(element_size=item), \
+                "JIT not usable for this element_size (compile failed? apply PR #25154 on ROCm)"
+            d2 = [d.view(args.dev_tokens, item) for d in dev]
+            d2b = [d.view(args.dev_tokens, item) for d in dev2]
+            h3 = host.view(args.host_tokens, L, item)
+            hlptr = torch.tensor([host.data_ptr() + li * item for li in range(L)],
+                                 dtype=torch.uint64, device="cuda")
+
+            def jit_load_lf():
+                for li in range(L):
+                    jit_one(cache_dst=d2[li], indices_dst=didx,
+                            cache_src=d2b[li], indices_src=didx, element_dim=item)
+
+            def jit_load_pf():
+                for li in range(L):
+                    jit_one(cache_dst=d2[li], indices_dst=didx,
+                            cache_src=h3[:, li, :], indices_src=hidx, element_dim=item)
+
+            def jit_backup_lf():
+                jit_all(ptr_dst=dptr2, indices_dst=didx, ptr_src=dptr, indices_src=didx,
+                        cache_src_stride_bytes=item, cache_dst_stride_bytes=item, element_size=item)
+
+            def jit_backup_pf():
+                jit_all(ptr_dst=hlptr, indices_dst=hidx, ptr_src=dptr, indices_src=didx,
+                        cache_src_stride_bytes=item, cache_dst_stride_bytes=layout_dim, element_size=item)
+
+            rows += [("JIT load   lf->lf", jit_load_lf), ("JIT load   pf->lf (REAL)", jit_load_pf),
+                     ("JIT backup lf->lf", jit_backup_lf), ("JIT backup lf->pf (REAL)", jit_backup_pf)]
+        except Exception as exc:
+            print(f"  [JIT skip] {str(exc)[:110]}")
+
     print(f"  {args.tokens} tok/call, {moved/1e6:.0f} MB/all-layer")
-    for label, fn in [("load   lf->lf", load_lf), ("load   pf->lf (REAL)", load_pf),
-                      ("backup lf->lf", backup_lf), ("backup lf->pf (REAL)", backup_pf)]:
-        t = cuda_time(fn, args.iters)
-        print(f"  {label:22} : {gbps(moved,t):7.2f} GB/s  ({t*1e3:8.3f} ms)")
+    for label, fn in rows:
+        try:
+            t = cuda_time(fn, args.iters)
+            print(f"  {label:26} : {gbps(moved,t):7.2f} GB/s  ({t*1e3:8.3f} ms)")
+        except Exception as exc:
+            print(f"  {label:26} : [error] {str(exc)[:60]}")
 
 
 def main():
@@ -152,6 +255,8 @@ def main():
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--skip-hops", action="store_true")
     p.add_argument("--skip-layout", action="store_true")
+    p.add_argument("--jit", action="store_true",
+                   help="also bench the JIT kernels (apply PR #25154 first on ROCm)")
     args = p.parse_args()
 
     assert torch.cuda.is_available(), "no CUDA/HIP device"
