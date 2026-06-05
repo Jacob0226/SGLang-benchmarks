@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>HiCache KV transfer — MI355X bottleneck map</title>
+<style>
+  body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#0f1420;color:#e6edf3;margin:0;padding:28px}
+  h1{font-size:20px;margin:0 0 4px} .sub{color:#9aa7b4;font-size:13px;margin-bottom:22px}
+  .legend{font-size:12px;color:#9aa7b4;margin:6px 0 20px}
+  .pill{display:inline-block;padding:2px 8px;border-radius:10px;margin-right:8px;color:#06121f;font-weight:600}
+  .row{display:flex;align-items:center;gap:0;margin:26px 0}
+  .lbl{width:150px;font-weight:600;font-size:14px}
+  .layer{width:150px;height:74px;border-radius:10px;display:flex;flex-direction:column;
+         align-items:center;justify-content:center;font-weight:700;border:1px solid #2b3a4d;background:#16202e}
+  .layer small{font-weight:400;color:#9aa7b4;font-size:11px;margin-top:3px}
+  .arrow{flex:1;position:relative;height:74px;display:flex;flex-direction:column;align-items:center;justify-content:center}
+  .bar{height:18px;border-radius:9px;width:88%;position:relative}
+  .seg{font-size:13px;font-weight:700;margin-bottom:3px}
+  .seg small{font-weight:400;color:#9aa7b4}
+  .dir{font-size:11px;color:#9aa7b4;margin-top:3px}
+  .note{font-size:12px;color:#9aa7b4;margin-top:2px}
+  table{border-collapse:collapse;margin-top:24px;font-size:13px}
+  th,td{border:1px solid #2b3a4d;padding:6px 12px;text-align:left}
+  th{background:#16202e}
+  .b-red{background:#ff5d5d} .b-org{background:#ffae42} .b-yel{background:#ffd84d} .b-grn{background:#43d17a}
+  .tag{font-size:11px;padding:1px 6px;border-radius:6px;color:#06121f;font-weight:700}
+</style>
+</head>
+<body>
+  <h1>HiCache KV-cache transfer — MI355X (DeepSeek-R1 MLA, page_first + L3 file)</h1>
+  <div class="sub">Measured bandwidth per stage. Lower = bottleneck. (GB/s, larger is better)</div>
+  <div class="legend">
+    <span class="pill b-red">&lt; 3</span><span class="pill b-org">3–8</span>
+    <span class="pill b-yel">8–25</span><span class="pill b-grn">&gt; 40</span>
+    &nbsp; GPU op = on GPU timeline · file I/O = host/CPU thread
+  </div>
+
+  <!-- PREFETCH -->
+  <div class="row">
+    <div class="lbl" style="color:#ffae42">PREFETCH<br><small style="color:#9aa7b4">(L3 hit → load KV back)</small></div>
+    <div class="layer">L3<small>NVMe file</small></div>
+    <div class="arrow">
+      <div class="seg">4.89 GB/s <small>(file read)</small></div>
+      <div class="bar b-org"></div>
+      <div class="dir">L3 → L2 &nbsp;·&nbsp; host/CPU thread</div>
+    </div>
+    <div class="layer">L2<small>host pinned RAM</small></div>
+    <div class="arrow">
+      <div class="seg">5.4 GB/s <small>(pf→lf kernel)</small></div>
+      <div class="bar b-org"></div>
+      <div class="dir">L2 → L1 &nbsp;·&nbsp; GPU op (scatter+layout)</div>
+    </div>
+    <div class="layer">L1<small>GPU HBM</small></div>
+  </div>
+
+  <!-- BACKUP -->
+  <div class="row">
+    <div class="lbl" style="color:#5db0ff">BACKUP<br><small style="color:#9aa7b4">(write_through → store)</small></div>
+    <div class="layer">L1<small>GPU HBM</small></div>
+    <div class="arrow">
+      <div class="seg">19.6 GB/s <small>(lf→pf kernel)</small></div>
+      <div class="bar b-yel"></div>
+      <div class="dir">L1 → L2 &nbsp;·&nbsp; GPU op</div>
+    </div>
+    <div class="layer">L2<small>host pinned RAM</small></div>
+    <div class="arrow">
+      <div class="seg" style="color:#ff5d5d">1.64 GB/s ⚠ BOTTLENECK <small>(file write+fsync)</small></div>
+      <div class="bar b-red"></div>
+      <div class="dir">L2 → L3 &nbsp;·&nbsp; host/CPU thread · ~31% of 1-drive · 7 NVMe idle</div>
+    </div>
+    <div class="layer">L3<small>NVMe file</small></div>
+  </div>
+
+  <p class="note">Reference — L1↔L2 bulk contiguous copy hits <b>57 GB/s</b> (≈ PCIe/xGMI ceiling).
+     The transfer kernels are slower than that because they gather/scatter by token index
+     and convert layout: load lf→lf 15.4, pf→lf 5.4 · backup lf→lf 22.4, lf→pf 19.6.</p>
+
+  <table>
+    <tr><th>Stage</th><th>Mechanism</th><th>GB/s</th><th>Ceiling</th><th>Verdict</th></tr>
+    <tr><td>L1↔L2 bulk</td><td>contiguous memcpy</td><td>57</td><td>~63 (PCIe5 x16)</td><td><span class="tag b-grn">near optimal</span></td></tr>
+    <tr><td>BACKUP: L1→L2 (lf→pf)</td><td>GPU kernel</td><td>19.6</td><td>57</td><td><span class="tag b-yel">scatter penalty</span></td></tr>
+    <tr><td>BACKUP: L2→L3 write</td><td>file + fsync</td><td>1.64</td><td>~5.3/drive ×8</td><td><span class="tag b-red">main bottleneck</span></td></tr>
+    <tr><td>PREFETCH: L3→L2 read</td><td>file read</td><td>4.89</td><td>~6.8/drive</td><td><span class="tag b-org">slow</span></td></tr>
+    <tr><td>PREFETCH: L2→L1 (pf→lf)</td><td>GPU kernel</td><td>5.4</td><td>57</td><td><span class="tag b-org">stale AMD kernel</span></td></tr>
+  </table>
+
+  <h1 style="font-size:16px;margin-top:34px">Microbench results (MI355X, DeepSeek MLA item=1152B)</h1>
+
+  <div style="display:flex;gap:32px;flex-wrap:wrap;margin-top:10px">
+    <div>
+      <div class="sub" style="margin:0 0 6px">[HOPS] bulk-contiguous per link</div>
+      <table>
+        <tr><th>hop</th><th>GB/s</th></tr>
+        <tr><td>L1↔L2 (HBM↔pinned)</td><td>57</td></tr>
+        <tr><td>L3→L2 (NVMe read)</td><td>4.89</td></tr>
+        <tr><td class="b-red" style="color:#06121f">L2→L3 (NVMe write)</td><td class="b-red" style="color:#06121f">1.64</td></tr>
+      </table>
+    </div>
+    <div>
+      <div class="sub" style="margin:0 0 6px">[LAYOUT] MLA transfer kernels (L1↔L2)</div>
+      <table>
+        <tr><th>op</th><th>GB/s</th></tr>
+        <tr><td>load lf→lf</td><td>15.4</td></tr>
+        <tr><td>load <b>pf→lf</b> (real)</td><td>5.4</td></tr>
+        <tr><td>backup lf→lf</td><td>22.4</td></tr>
+        <tr><td>backup <b>lf→pf</b> (real)</td><td>19.6</td></tr>
+      </table>
+    </div>
+    <div>
+      <div class="sub" style="margin:0 0 6px">[L2→L3 write] strategy PoC (1 drive)</div>
+      <table>
+        <tr><th>strategy</th><th>GB/s</th></tr>
+        <tr><td>per-page + fsync (current)</td><td>1.12</td></tr>
+        <tr><td>per-page, no fsync</td><td>1.94</td></tr>
+        <tr><td>bulk, no fsync</td><td>1.95</td></tr>
+        <tr><td>bulk O_DIRECT</td><td>1.53</td></tr>
+        <tr><td class="b-grn" style="color:#06121f">parallel ×8 (1 drive)</td><td class="b-grn" style="color:#06121f">3.34</td></tr>
+        <tr><td>parallel ×8 over 8 drives</td><td>~5.3×N (est)</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <p class="note" style="margin-top:18px">
+    <b>Take-aways:</b> backup is gated by the <b>NVMe write (1.64 GB/s, single drive, per-write fsync)</b> —
+    fix with no-fsync / large sequential writes / O_DIRECT / stripe over the 8 idle drives (~5.3×N).
+    Prefetch is gated by the <b>pf→lf load kernel (5.4)</b> (9-month-stale AMD kernel; JIT kernel via PR&nbsp;#25154 is 1.3–5× faster) and the file read (4.89).
+    L1↔L2 is already near the link ceiling.
+  </p>
+</body>
+</html>

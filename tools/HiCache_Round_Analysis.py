@@ -425,10 +425,23 @@ def main() -> None:
         srow("skipped_gap_ms", [round(r["skipped_gap_ms"], 1) for r in results])
         srow("gpu_busy_util_pct", [round(r["gpu_busy_util_pct"], 1) for r in results])
         srow("extend_steps", [r["extend_steps"] for r in results])
-        for c in ("total_gpu", "compute", "cache", "comm"):
-            vals = [round(per_tok(r, cls_ms(r, c)), 2) for r in results]
+
+        # End-to-end wall time per token, split into GPU-busy vs GPU-idle:
+        #   wall_us_per_tok = total_gpu_us_per_tok + gpu_idle_us_per_tok
+        # total_gpu only counts GPU-busy time, so a fast-compute run that stalls
+        # on cache IO (low gpu_busy_util) looks "cheap" there while wall/idle
+        # reveal it is actually slower end-to-end (this drives TTFT).
+        def srow_pertok(name, ms_fn):
+            vals = [round(per_tok(r, ms_fn(r)), 2) for r in results]
             ratio = round(vals[0] / vals[1], 2) if two and vals[1] else None
-            srow(f"{c}_us_per_tok", vals, ratio)
+            srow(name, vals, ratio)
+
+        srow_pertok("wall_us_per_tok", lambda r: r["round_wall_ms"])
+        srow_pertok("total_gpu_us_per_tok", lambda r: r["gpu_wall_busy_ms"])
+        srow_pertok("gpu_idle_us_per_tok",
+                    lambda r: max(0.0, r["round_wall_ms"] - r["gpu_wall_busy_ms"]))
+        for c in ("compute", "cache", "comm"):
+            srow_pertok(f"{c}_us_per_tok", lambda r, c=c: cls_ms(r, c))
         w.writerow([])
 
         # EXTEND-step distribution: how many steps of each (batch size, tokens).
@@ -496,9 +509,17 @@ def main() -> None:
             print(f"    {c:<24}{s['sum_us']/1000.0:>9.1f} ms{s['sum_us']/tk:>9.3f} us/tok  (n={s['count']})")
     if two:
         print(f"\n==== COMPARISON us/tok ({labels[0]} vs {labels[1]}) ====")
-        for c in ("total_gpu", "compute", "cache", "comm"):
-            va, vb = per_tok(results[0], cls_ms(results[0], c)), per_tok(results[1], cls_ms(results[1], c))
-            print(f"  {c:<12}{va:>9.2f}{vb:>9.2f}  ratio={va/vb:.2f}" if vb else f"  {c:<12}{va:>9.2f}")
+        metrics = [
+            ("wall", lambda r: r["round_wall_ms"]),
+            ("total_gpu", lambda r: r["gpu_wall_busy_ms"]),
+            ("gpu_idle", lambda r: max(0.0, r["round_wall_ms"] - r["gpu_wall_busy_ms"])),
+            ("compute", lambda r: cls_ms(r, "compute")),
+            ("cache", lambda r: cls_ms(r, "cache")),
+            ("comm", lambda r: cls_ms(r, "comm")),
+        ]
+        for name, fn in metrics:
+            va, vb = per_tok(results[0], fn(results[0])), per_tok(results[1], fn(results[1]))
+            print(f"  {name:<12}{va:>9.2f}{vb:>9.2f}  ratio={va/vb:.2f}" if vb else f"  {name:<12}{va:>9.2f}")
 
     print(f"\n[INFO] wrote single summary.csv (round + comparison + kernels + layer) under {out}")
 
