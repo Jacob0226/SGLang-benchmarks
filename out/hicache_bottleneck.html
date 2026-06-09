@@ -177,7 +177,18 @@
 
     <b>Why FP8 idles more than BF16:</b> the host-side coordination (a)+(b) costs a roughly fixed wall-time; FP8 attention shortens GPU compute so the GPU finishes early and exposes that wait as idle, whereas BF16's longer compute overlaps/hides it (≈0% idle). Both attentions give nearly the same round time (~17 s) — the round is gated by the host path, not by compute.<br><br>
 
-    <b>0609 net:</b> JIT now works end-to-end on MI355X FP8 (was silently AOT) and removes the transfer-gated bubbles; the remaining idle is concurrency/scheduling-bound. <i>Next: re-profile with higher <code>max_parallel</code> to attack the request-arrival bubbles; this section will be updated with those results.</i>
+    <b>0609 net:</b> JIT now works end-to-end on MI355X FP8 (was silently AOT) and removes the transfer-gated bubbles; the remaining idle is concurrency/scheduling-bound.<br><br>
+
+    <b>5. Higher concurrency fills the idle bubbles — but it is not automatically a win.</b> Re-profiled JIT+RAID0+FP8 with <code>max_parallel</code> 8→64 and 100 clients (wait_complete):
+  </div>
+  <table>
+    <tr><th>config (MI355X, JIT+RAID0, FP8)</th><th>GPU busy</th><th>GPU idle</th><th>hit rate (R4–R8)</th><th>TTFT (R4–R8)</th></tr>
+    <tr><td>max_parallel 8, 30 clients</td><td>~53%</td><td>~47%</td><td class="win">0.70–0.87</td><td class="win">1.5–5 s</td></tr>
+    <tr><td>max_parallel 64, 100 clients</td><td class="win">88%</td><td class="win">12%</td><td class="lose">0.12–0.23</td><td class="lose">20–66 s</td></tr>
+  </table>
+  <div class="note" style="margin-top:8px">
+    At mp64/100c the GPU idle collapses 47%→12% (the request-arrival bubbles get filled — confirming they are concurrency-fixable), <b>but the GPU is now busy doing wasted re-compute</b>: 100 clients × growing prompts (R8 ≈ 3.6M tokens) overflow L2=20 GB (≈611K fp8 tokens), the cache thrashes, hit collapses to ~0.12, and TTFT explodes to 20–66 s. <b>Filling bubbles ≠ faster</b> when the cache cannot hold the working set.<br><br>
+    <b>Sweet spot for JIT/RAID0 to help TTFT:</b> high concurrency <i>and</i> L2 large enough to hold the working set (≈120 GB+ for 100 clients here) so hit stays high and the time is spent on L3→L2→L1 transfer (which JIT/RAID0 accelerate) rather than re-compute. Neither mp8/30c (GPU idle, but high hit / low TTFT) nor mp64/100c-with-small-L2 (GPU busy, but thrashing) is that regime.
   </div>
 </body>
 </html>
