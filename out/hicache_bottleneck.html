@@ -2,129 +2,150 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>HiCache KV transfer — MI355X bottleneck map</title>
+<title>HiCache KV transfer — MI355X vs B200</title>
 <style>
   body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#0f1420;color:#e6edf3;margin:0;padding:28px}
-  h1{font-size:20px;margin:0 0 4px} .sub{color:#9aa7b4;font-size:13px;margin-bottom:22px}
-  .legend{font-size:12px;color:#9aa7b4;margin:6px 0 20px}
-  .pill{display:inline-block;padding:2px 8px;border-radius:10px;margin-right:8px;color:#06121f;font-weight:600}
-  .row{display:flex;align-items:center;gap:0;margin:26px 0}
-  .lbl{width:150px;font-weight:600;font-size:14px}
-  .layer{width:150px;height:74px;border-radius:10px;display:flex;flex-direction:column;
+  h1{font-size:20px;margin:0 0 4px} h2{font-size:16px;margin:30px 0 8px}
+  .sub{color:#9aa7b4;font-size:13px;margin-bottom:18px}
+  .row{display:flex;align-items:center;margin:22px 0}
+  .lbl{width:160px;font-weight:600;font-size:14px}
+  .layer{width:140px;height:70px;border-radius:10px;display:flex;flex-direction:column;
          align-items:center;justify-content:center;font-weight:700;border:1px solid #2b3a4d;background:#16202e}
   .layer small{font-weight:400;color:#9aa7b4;font-size:11px;margin-top:3px}
-  .arrow{flex:1;position:relative;height:74px;display:flex;flex-direction:column;align-items:center;justify-content:center}
-  .bar{height:18px;border-radius:9px;width:88%;position:relative}
-  .seg{font-size:13px;font-weight:700;margin-bottom:3px}
+  .arrow{flex:1;min-height:70px;display:flex;flex-direction:column;justify-content:center;padding:0 14px}
+  .seg{font-size:13px;font-weight:700;margin-bottom:5px;text-align:center}
   .seg small{font-weight:400;color:#9aa7b4}
-  .dir{font-size:11px;color:#9aa7b4;margin-top:3px}
-  .note{font-size:12px;color:#9aa7b4;margin-top:2px}
-  table{border-collapse:collapse;margin-top:24px;font-size:13px}
-  th,td{border:1px solid #2b3a4d;padding:6px 12px;text-align:left}
-  th{background:#16202e}
-  .b-red{background:#ff5d5d} .b-org{background:#ffae42} .b-yel{background:#ffd84d} .b-grn{background:#43d17a}
-  .tag{font-size:11px;padding:1px 6px;border-radius:6px;color:#06121f;font-weight:700}
+  .brow{display:flex;align-items:center;width:100%;margin:2px 0}
+  .bar{height:13px;border-radius:6px;min-width:2px}
+  .b-mi{background:#ffae42} .b-b2{background:#43d17a}
+  .tag{font-size:11px;color:#c7d2dd;margin-left:7px;white-space:nowrap}
+  .scale{font-size:10px;color:#6b7886;text-align:center;margin-top:4px}
+  .note{font-size:12px;color:#9aa7b4;margin-top:6px;max-width:1000px;line-height:1.5}
+  table{border-collapse:collapse;margin-top:10px;font-size:13px}
+  th,td{border:1px solid #2b3a4d;padding:6px 12px;text-align:right}
+  th{background:#16202e} td:first-child,th:first-child{text-align:left}
+  .b-red{background:#ff5d5d;color:#06121f} .b-org{background:#ffae42;color:#06121f}
+  .b-yel{background:#ffd84d;color:#06121f} .b-grn{background:#43d17a;color:#06121f}
+  .tables{display:flex;gap:30px;flex-wrap:wrap}
+  .win{color:#43d17a;font-weight:600} .lose{color:#ff8a8a}
+  .ltable td,.ltable th{text-align:left;vertical-align:top}
 </style>
 </head>
 <body>
-  <h1>HiCache KV-cache transfer — MI355X (DeepSeek-R1 MLA, page_first + L3 file)</h1>
-  <div class="sub">Measured bandwidth per stage. Lower = bottleneck. (GB/s, larger is better)</div>
-  <div class="legend">
-    <span class="pill b-red">&lt; 3</span><span class="pill b-org">3–8</span>
-    <span class="pill b-yel">8–25</span><span class="pill b-grn">&gt; 40</span>
-    &nbsp; GPU op = on GPU timeline · file I/O = host/CPU thread
-  </div>
+  <h1>HiCache KV-cache transfer — MI355X vs B200 (DeepSeek-R1 MLA, 1152 B/token/layer)</h1>
+  <div class="sub">Per-stage bandwidth of the <b>actual HiCache single-stream code path</b>, GB/s (higher = faster). Bar length ∝ GB/s; orange = MI355X, green = B200. True-drive O_DIRECT numbers are in the HOPS table below.</div>
 
   <!-- PREFETCH -->
   <div class="row">
-    <div class="lbl" style="color:#ffae42">PREFETCH<br><small style="color:#9aa7b4">(L3 hit → load KV back)</small></div>
+    <div class="lbl" style="color:#ffae42">PREFETCH<br><small style="color:#9aa7b4">L3 → L2 → L1</small></div>
     <div class="layer">L3<small>NVMe file</small></div>
     <div class="arrow">
-      <div class="seg">4.89 GB/s <small>(file read)</small></div>
-      <div class="bar b-org"></div>
-      <div class="dir">L3 → L2 &nbsp;·&nbsp; host/CPU thread</div>
+      <div class="seg">file read <small>host/CPU · code path (no fsync ≈ drive)</small></div>
+      <div class="brow"><span class="bar b-mi" style="width:16.5%"></span><span class="tag">MI355X 6.0</span></div>
+      <div class="brow"><span class="bar b-b2" style="width:51.7%"></span><span class="tag">B200 18.8</span></div>
     </div>
     <div class="layer">L2<small>host pinned RAM</small></div>
     <div class="arrow">
-      <div class="seg">5.4 GB/s <small>(pf→lf kernel)</small></div>
-      <div class="bar b-org"></div>
-      <div class="dir">L2 → L1 &nbsp;·&nbsp; GPU op (scatter+layout)</div>
+      <div class="seg">pf→lf kernel <small>GPU op</small></div>
+      <div class="brow"><span class="bar b-mi" style="width:14.9%"></span><span class="tag">MI355X 5.4</span></div>
+      <div class="brow"><span class="bar b-b2" style="width:27.5%"></span><span class="tag">B200 10.0</span></div>
     </div>
     <div class="layer">L1<small>GPU HBM</small></div>
   </div>
 
   <!-- BACKUP -->
   <div class="row">
-    <div class="lbl" style="color:#5db0ff">BACKUP<br><small style="color:#9aa7b4">(write_through → store)</small></div>
+    <div class="lbl" style="color:#5db0ff">BACKUP<br><small style="color:#9aa7b4">L1 → L2 → L3</small></div>
     <div class="layer">L1<small>GPU HBM</small></div>
     <div class="arrow">
-      <div class="seg">19.6 GB/s <small>(lf→pf kernel)</small></div>
-      <div class="bar b-yel"></div>
-      <div class="dir">L1 → L2 &nbsp;·&nbsp; GPU op</div>
+      <div class="seg">lf→pf kernel <small>GPU op</small></div>
+      <div class="brow"><span class="bar b-mi" style="width:53.9%"></span><span class="tag">MI355X 19.6</span></div>
+      <div class="brow"><span class="bar b-b2" style="width:83.6%"></span><span class="tag">B200 30.4</span></div>
     </div>
     <div class="layer">L2<small>host pinned RAM</small></div>
     <div class="arrow">
-      <div class="seg" style="color:#ff5d5d">1.64 GB/s ⚠ BOTTLENECK <small>(file write+fsync)</small></div>
-      <div class="bar b-red"></div>
-      <div class="dir">L2 → L3 &nbsp;·&nbsp; host/CPU thread · ~31% of 1-drive · 7 NVMe idle</div>
+      <div class="seg">file write (buffered tofile) <small>host/CPU · HiCache path (drive ceiling 5.7 / 29.3)</small></div>
+      <div class="brow"><span class="bar b-mi" style="width:4.5%"></span><span class="tag">MI355X 1.6</span></div>
+      <div class="brow"><span class="bar b-b2" style="width:4.1%"></span><span class="tag">B200 1.5</span></div>
     </div>
     <div class="layer">L3<small>NVMe file</small></div>
   </div>
+  <div class="scale">bar length ∝ GB/s (same scale across all stages, full width ≈ 32 GB/s) &nbsp;·&nbsp; <span style="color:#ffae42">■</span> MI355X &nbsp; <span style="color:#43d17a">■</span> B200</div>
 
-  <p class="note">Reference — L1↔L2 bulk contiguous copy hits <b>57 GB/s</b> (≈ PCIe/xGMI ceiling).
-     The transfer kernels are slower than that because they gather/scatter by token index
-     and convert layout: load lf→lf 15.4, pf→lf 5.4 · backup lf→lf 22.4, lf→pf 19.6.</p>
-
-  <table>
-    <tr><th>Stage</th><th>Mechanism</th><th>GB/s</th><th>Ceiling</th><th>Verdict</th></tr>
-    <tr><td>L1↔L2 bulk</td><td>contiguous memcpy</td><td>57</td><td>~63 (PCIe5 x16)</td><td><span class="tag b-grn">near optimal</span></td></tr>
-    <tr><td>BACKUP: L1→L2 (lf→pf)</td><td>GPU kernel</td><td>19.6</td><td>57</td><td><span class="tag b-yel">scatter penalty</span></td></tr>
-    <tr><td>BACKUP: L2→L3 write</td><td>file + fsync</td><td>1.64</td><td>~5.3/drive ×8</td><td><span class="tag b-red">main bottleneck</span></td></tr>
-    <tr><td>PREFETCH: L3→L2 read</td><td>file read</td><td>4.89</td><td>~6.8/drive</td><td><span class="tag b-org">slow</span></td></tr>
-    <tr><td>PREFETCH: L2→L1 (pf→lf)</td><td>GPU kernel</td><td>5.4</td><td>57</td><td><span class="tag b-org">stale AMD kernel</span></td></tr>
-  </table>
-
-  <h1 style="font-size:16px;margin-top:34px">Microbench results (MI355X, DeepSeek MLA item=1152B)</h1>
-
-  <div style="display:flex;gap:32px;flex-wrap:wrap;margin-top:10px">
+  <h2>Per-stage results (GB/s)</h2>
+  <div class="tables">
     <div>
-      <div class="sub" style="margin:0 0 6px">[HOPS] bulk-contiguous per link</div>
+      <div class="sub" style="margin:0 0 4px">[HOPS] bulk contiguous</div>
       <table>
-        <tr><th>hop</th><th>GB/s</th></tr>
-        <tr><td>L1↔L2 (HBM↔pinned)</td><td>57</td></tr>
-        <tr><td>L3→L2 (NVMe read)</td><td>4.89</td></tr>
-        <tr><td class="b-red" style="color:#06121f">L2→L3 (NVMe write)</td><td class="b-red" style="color:#06121f">1.64</td></tr>
+        <tr><th>hop</th><th>MI355X<br><small>1 drive</small></th><th>B200<br><small>/raid stripe</small></th></tr>
+        <tr><td>L1↔L2 (HBM↔pinned)</td><td>57</td><td>55.6</td></tr>
+        <tr><td>L3→L2 (NVMe read)</td><td>6.0</td><td class="win">18.8</td></tr>
+        <tr><td>L2→L3 (NVMe write)</td><td>5.7</td><td class="win">29.3</td></tr>
+      </table>
+      <div class="scale" style="text-align:left;margin-top:4px">NVMe = O_DIRECT 288 MB single-stream (true drive BW)</div>
+    </div>
+    <div>
+      <div class="sub" style="margin:0 0 4px">[LAYOUT] MLA transfer kernels</div>
+      <table>
+        <tr><th>op</th><th>MI355X</th><th>B200</th></tr>
+        <tr><td>load lf→lf</td><td>15.4</td><td class="win">27.2</td></tr>
+        <tr><td>load pf→lf (real)</td><td>5.4</td><td class="win">10.0</td></tr>
+        <tr><td>backup lf→lf</td><td>22.4</td><td class="win">30.4</td></tr>
+        <tr><td>backup lf→pf (real)</td><td>19.6</td><td class="win">30.4</td></tr>
       </table>
     </div>
     <div>
-      <div class="sub" style="margin:0 0 6px">[LAYOUT] MLA transfer kernels (L1↔L2)</div>
+      <div class="sub" style="margin:0 0 4px">[LAYOUT] AOT vs JIT — MI355X (PR&nbsp;#25154)</div>
       <table>
-        <tr><th>op</th><th>GB/s</th></tr>
-        <tr><td>load lf→lf</td><td>15.4</td></tr>
-        <tr><td>load <b>pf→lf</b> (real)</td><td>5.4</td></tr>
-        <tr><td>backup lf→lf</td><td>22.4</td></tr>
-        <tr><td>backup <b>lf→pf</b> (real)</td><td>19.6</td></tr>
+        <tr><th>op</th><th>AOT</th><th>JIT</th><th>×</th></tr>
+        <tr><td>load lf→lf</td><td>15.4</td><td class="b-grn">56.5</td><td class="win">3.7×</td></tr>
+        <tr><td>load pf→lf (real)</td><td>5.4</td><td class="b-grn">12.1</td><td class="win">2.2×</td></tr>
+        <tr><td>backup lf→lf</td><td>22.4</td><td class="b-grn">52.0</td><td class="win">2.3×</td></tr>
+        <tr><td>backup lf→pf (real)</td><td>19.6</td><td class="b-grn">39.6</td><td class="win">2.0×</td></tr>
       </table>
     </div>
     <div>
-      <div class="sub" style="margin:0 0 6px">[L2→L3 write] strategy PoC (1 drive)</div>
+      <div class="sub" style="margin:0 0 4px">[L2→L3 write] code-path PoC <small>(drive ceiling 5.7 MI / 29.3 B200)</small></div>
       <table>
-        <tr><th>strategy</th><th>GB/s</th></tr>
-        <tr><td>per-page + fsync (current)</td><td>1.12</td></tr>
-        <tr><td>per-page, no fsync</td><td>1.94</td></tr>
-        <tr><td>bulk, no fsync</td><td>1.95</td></tr>
-        <tr><td>bulk O_DIRECT</td><td>1.53</td></tr>
-        <tr><td class="b-grn" style="color:#06121f">parallel ×8 (1 drive)</td><td class="b-grn" style="color:#06121f">3.34</td></tr>
-        <tr><td>parallel ×8 over 8 drives</td><td>~5.3×N (est)</td></tr>
+        <tr><th>strategy</th><th>MI355X<br><small>/data 1 drive</small></th><th>B200<br><small>/raid</small></th></tr>
+        <tr><td>bulk buffered, no fsync (≈ current <code>tofile</code>)</td><td>1.95</td><td>0.65</td></tr>
+        <tr><td>per-page buffered, no fsync</td><td>1.94</td><td>1.65</td></tr>
+        <tr><td>per-page + fsync</td><td>1.12</td><td>0.64</td></tr>
+        <tr><td>bulk O_DIRECT</td><td>1.53</td><td>0.61</td></tr>
+        <tr><td>parallel ×8</td><td class="b-grn">3.34</td><td class="b-grn">2.94</td></tr>
       </table>
     </div>
   </div>
 
-  <p class="note" style="margin-top:18px">
-    <b>Take-aways:</b> backup is gated by the <b>NVMe write (1.64 GB/s, single drive, per-write fsync)</b> —
-    fix with no-fsync / large sequential writes / O_DIRECT / stripe over the 8 idle drives (~5.3×N).
-    Prefetch is gated by the <b>pf→lf load kernel (5.4)</b> (9-month-stale AMD kernel; JIT kernel via PR&nbsp;#25154 is 1.3–5× faster) and the file read (4.89).
-    L1↔L2 is already near the link ceiling.
-  </p>
+  <h2>Findings</h2>
+  <div class="note">
+    <b>1.</b> <b>L1↔L2 is equal</b> on both (≈56 GB/s) — already at the PCIe Gen5 ×16 ceiling.<br>
+    <b>2.</b> <b>B200 transfer kernels are 1.4–1.85× faster</b> than MI355X (newer CUDA kernels vs the 9-month-stale AMD AOT kernel); B200 also has <b>no backup pf-penalty</b> (lf 30.4 = pf 30.4), while MI355X drops 22.4→19.6.<br>
+    <b>3.</b> <b>The NVMe drives are NOT slow — earlier "1 GB/s" was a benchmark artifact.</b> True O_DIRECT 288 MB single-stream (same harness): MI355X <code>/data</code> (1 drive) write 5.7 / read 6.0; B200 <code>/raid</code> write <b>29.3</b> / read <b>18.8</b>. B200's <code>/raid</code> is a striped multi-NVMe array — ~5× the MI355X single drive. The old Python harness over-stated reads (page-cache leak) and under-stated writes (<code>tobytes()</code> copy, no O_DIRECT).<br>
+    <b>4.</b> <b>pf→lf LOAD penalty on both</b> (~2.7–2.85× vs lf→lf): MI355X 5.4 vs 15.4, B200 10.0 vs 27.2. Fixed by the JIT kernel (see 6).<br>
+    <b>5.</b> <b>The L2→L3 backup bottleneck is software, not hardware — and it's the <i>buffered single-stream</i> write, not fsync.</b> The file backend's <code>set()</code> just does <code>numpy.tofile()</code> (buffered, <b>no fsync</b>), giving only ~1.5–1.6 GB/s on <i>both</i> boxes. fsync is nearly free here (buffered no-fsync 1.76 vs +fsync 1.64); the gap to the drive is the buffered page-cache path itself (memcpy + dirty-page writeback throttling + low queue depth). O_DIRECT large-block hits 5.7 (MI) / 29.3 (B200), so the drive is almost idle: <b>~3.5× headroom on MI355X, ~20× on B200</b>. Fix = O_DIRECT / parallel writers, not removing fsync.<br>
+    <b>6.</b> <b>JIT kernel (PR&nbsp;#25154) fixes the MI355X transfer gap.</b> On MI355X the JIT (non-temporal, unrolled) kernel beats the AOT kernel <b>2.0–3.7×</b>, and on the two production paths it more than doubles them: load pf→lf 5.4→12.1 (now &gt; B200 AOT 10.0), backup lf→pf 19.6→39.6 (now &gt; B200 AOT 30.4).<br>
+    <b>Net:</b> L1↔L2 is at the PCIe ceiling on both. NVMe hardware is fast (MI 6, B200 19–29 GB/s); the real L2↔L3 bottleneck is HiCache's buffered single-stream <code>tofile()</code> write (~1.5 GB/s, no fsync involved), which wastes most of the drive — fixable in software (O_DIRECT / parallel writers), with the biggest win on B200. On GPU transfer, AOT favors B200, but PR&nbsp;#25154's JIT kernel brings MI355X to/above B200 AOT.
+  </div>
+
+  <h2>Note — transfer direction vs name vs method</h2>
+  <div class="note">
+    Tiers: <b>L1</b> = GPU HBM, <b>L2</b> = host pinned RAM, <b>L3</b> = NVMe / storage backend.
+  </div>
+  <table class="ltable">
+    <tr><th>direction</th><th>operation name</th><th>method / object</th><th>when</th></tr>
+    <tr><td>L2→L1 (host→device, load back to HBM)</td><td>load (load-back)</td><td><code>load()</code>, <code>load_buffer</code>, <code>LayerLoadingEvent</code></td><td>on prefix hit whose data sits in host; loaded synchronously at schedule time</td></tr>
+    <tr><td>L1→L2 (device→host, back up to host)</td><td>write-to-host (backup-to-host)</td><td><code>write()</code>, <code>write_buffer</code>, <code>write_backup()</code></td><td>governed by <code>--hicache-write-policy</code> (see below)</td></tr>
+    <tr><td>L3→L2 (storage→host)</td><td>prefetch</td><td><code>prefetch_thread</code>, <code>PrefetchOperation</code></td><td>async; <code>--hicache-storage-prefetch-policy</code> decides whether to wait</td></tr>
+    <tr><td>L2→L3 (host→storage)</td><td>backup (write to storage)</td><td><code>write_storage()</code>, <code>backup_thread_func</code></td><td>after a host hit / backup, persisted to storage</td></tr>
+  </table>
+  <div class="note">
+    <b><code>write_back</code> is a policy, not a direction name.</b> It is one value of <code>--hicache-write-policy</code> controlling <i>when</i> the L1→L2 write-to-host happens:<br>
+    &nbsp;&nbsp;• <code>write_through</code> — write on hit (threshold=1, almost immediately) → host is a <b>superset</b> of device (inclusive).<br>
+    &nbsp;&nbsp;• <code>write_back</code> — write only when the device entry is <b>evicted</b>.<br>
+    &nbsp;&nbsp;• <code>write_through_selective</code> — write after hit count reaches a threshold (=2).<br>
+    The <code>best_effort</code> / <code>wait_complete</code> / <code>timeout</code> prefetch policy applies <b>only to L3→L2</b>; L1/L2 hits are synchronous.<br>
+    <b>Capacity (under write_through):</b> since L2 (host) is a superset of L1 (device), the effective cache size ≈ <b>L2 alone</b> — <i>not</i> L1+L2. L1 is just the HBM-resident subset.
+  </div>
 </body>
 </html>

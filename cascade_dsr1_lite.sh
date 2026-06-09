@@ -230,10 +230,9 @@ if [ -n "$CACHE_MODES" ]; then
 fi
 
 apply_no_aiter_mem_fraction_patch() {
-  local script_dir patch repo candidate
+  local script_dir repo candidate patch_dir
   script_dir="$(dirname "$(readlink -f "$0")")"
-  patch="$script_dir/HiCachePatch/no-aiter-mem-fraction.sh"
-  [ -f "$patch" ] || { echo "ERROR: $patch not found" >&2; exit 1; }
+  patch_dir="$script_dir/HiCachePatch"
 
   repo=""
   for candidate in /sgl-workspace/sglang "$HOME/work-space/sglang"; do
@@ -244,8 +243,19 @@ apply_no_aiter_mem_fraction_patch() {
   done
   [ -n "$repo" ] || { echo "ERROR: cannot find sglang checkout to patch" >&2; exit 1; }
 
-  echo ">>> applying HiCachePatch/no-aiter-mem-fraction.sh to $repo"
-  bash "$patch" "$repo"
+  # FP8 prefill attention with --page-size > 1 REQUIRES the AITER MLA page-size
+  # fix (PR #25556, applied by apply-all.sh). Without it gsm8k collapses
+  # (0.975 -> 0.005). So when FP8 prefill attn is requested, apply ALL patches;
+  # otherwise just the mem-fraction patch.
+  if [ "${AITER_FP8_PREFILL_ATTN:-0}" = "1" ]; then
+    [ -f "$patch_dir/apply-all.sh" ] || { echo "ERROR: $patch_dir/apply-all.sh not found" >&2; exit 1; }
+    echo ">>> FP8 prefill attn ON -> applying HiCachePatch/apply-all.sh (incl. pr25556 page-size fix) to $repo"
+    bash "$patch_dir/apply-all.sh" "$repo"
+  else
+    [ -f "$patch_dir/no-aiter-mem-fraction.sh" ] || { echo "ERROR: $patch_dir/no-aiter-mem-fraction.sh not found" >&2; exit 1; }
+    echo ">>> applying HiCachePatch/no-aiter-mem-fraction.sh to $repo"
+    bash "$patch_dir/no-aiter-mem-fraction.sh" "$repo"
+  fi
 }
 
 apply_no_aiter_mem_fraction_patch
@@ -655,7 +665,11 @@ collect_host_info | tee "$LOG_DIR/host_info.log" >/dev/null
 # ============================== L3 file store + disk check ==============================
 HICACHE_FILE_STORE_DIR=""
 if [[ "$CACHE_MODE" == L3_* ]]; then
-  HICACHE_FILE_STORE_DIR="/tmp/cascade_dsr1_l3_${TAG}_${HICACHE_SIZE}"
+  # L3 backing dir. Default /tmp (docker overlay → boot drive). Set L3_BASE_DIR=/raid
+  # to put L3 on the 7-drive RAID0 (see tools/setup_raid0_l3.sh); requires the
+  # container to be started with -v /raid:/raid.
+  L3_BASE_DIR="${L3_BASE_DIR:-/tmp}"
+  HICACHE_FILE_STORE_DIR="${L3_BASE_DIR}/cascade_dsr1_l3_${TAG}_${HICACHE_SIZE}"
   rm -rf "$HICACHE_FILE_STORE_DIR" 2>/dev/null
   mkdir -p "$HICACHE_FILE_STORE_DIR"
   export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$HICACHE_FILE_STORE_DIR"
@@ -786,7 +800,7 @@ case "$CACHE_MODE" in
       --hicache-mem-layout "$HICACHE_MEM_LAYOUT"
       --hicache-write-policy "$HICACHE_WRITE_POLICY"
       --hicache-storage-backend file
-      --hicache-storage-prefetch-policy best_effort
+      --hicache-storage-prefetch-policy "${HICACHE_PREFETCH_POLICY:-best_effort}"
     )
     # Override the L3 prefetch trigger threshold (sglang code default 256
     # tokens). Empty = leave default. Translated to the JSON extra-config

@@ -124,10 +124,17 @@ SGL_DEVICE void store_nc(uint4* __restrict__ dst, const uint4& value) {
 
 template <int64_t kBytes, uint32_t kNumThreads>
 SGL_DEVICE auto load_vec(const void* __restrict__ src) {
-  static_assert(kBytes % 128 == 0, "kBytes must be multiple of 128 bytes");
-  static_assert(128 % kNumThreads == 0, "kNumThreads must divide 128 bytes");
-  constexpr uint32_t kLoopCount = kBytes / 128;
-  using Package = details::PackageType<128 / kNumThreads>;
+  // Pick the widest vector unit (16/8/4 bytes) that tiles kBytes evenly across
+  // the kNumThreads cooperating threads. This generalises the old fixed 128-byte
+  // loop so element sizes that are a multiple of 4*kNumThreads but NOT of 128
+  // (e.g. DeepSeek MLA fp8 element_size=576, kNumThreads<=16) are supported.
+  constexpr uint32_t kUnit = (kBytes % (16 * kNumThreads) == 0)  ? 16
+                             : (kBytes % (8 * kNumThreads) == 0) ? 8
+                             : (kBytes % (4 * kNumThreads) == 0) ? 4
+                                                                 : 0;
+  static_assert(kUnit != 0, "kBytes must be a multiple of 4*kNumThreads");
+  constexpr uint32_t kLoopCount = kBytes / (kUnit * kNumThreads);
+  using Package = details::PackageType<kUnit>;
   using Storage = details::LocalStorage<Package, kLoopCount>;
 
   const auto src_packed = static_cast<const Package*>(src);
