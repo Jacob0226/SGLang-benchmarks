@@ -147,5 +147,37 @@
     The <code>best_effort</code> / <code>wait_complete</code> / <code>timeout</code> prefetch policy applies <b>only to L3→L2</b>; L1/L2 hits are synchronous.<br>
     <b>Capacity (under write_through):</b> since L2 (host) is a superset of L1 (device), the effective cache size ≈ <b>L2 alone</b> — <i>not</i> L1+L2. L1 is just the HBM-resident subset.
   </div>
+
+  <h2>0609 — E2E JIT enablement &amp; GPU-bubble analysis (DeepSeek-R1 FP8, 30 clients, L1 10 / L2 20)</h2>
+  <div class="note">
+    <b>1. JIT HiCache kernel was never actually used in any FP8 run — both platforms ran AOT.</b><br>
+    &nbsp;&nbsp;• MI355X (ROCm): blocked by <code>memory_pool_host: can_use_jit = _is_cuda and …</code> — <code>_is_cuda</code> is False on ROCm.<br>
+    &nbsp;&nbsp;• B200 (CUDA): passes <code>_is_cuda</code> but blocked by <code>can_use_hicache_jit_kernel(576)=False</code> — FP8 MLA element = 576 B and the gate required <code>%128==0</code> (576%128=64). JIT only engaged for BF16 KV (element 1152).<br>
+    Confirmed by traces: both show only AOT <code>transfer_kv_*_mla_*</code> kernels, zero JIT.<br><br>
+
+    <b>2. Fix (committed): make JIT usable for FP8 576 on ROCm.</b><br>
+    &nbsp;&nbsp;• <code>hicache.cuh load_vec</code>: adaptive vector unit (16/8/4 B) instead of a fixed 128-B loop → supports any element that tiles across threads (576 = 9×64). No regression for 1152.<br>
+    &nbsp;&nbsp;• <code>hicache.py</code> gate <code>%128 → %64</code>; <code>memory_pool_host</code> JIT gate <code>_is_cuda → (_is_cuda or _is_hip)</code>.<br>
+    &nbsp;&nbsp;• Validated: byte-exact round-trip, GSM8K 0.94–0.95 (correct), microbench load pf→lf 3.2→8.9 GB/s (2.8×), backup lf→pf 14.3→28.0 (2.0×). After the patch the E2E trace shows <code>hicache_transfer_per_layer</code> (JIT), no AOT.<br><br>
+
+    <b>3. GPU idle / bubble (R8 profile, best_effort, RAID0 L3, same config):</b>
+  </div>
+  <table>
+    <tr><th>config (MI355X unless noted)</th><th>GPU busy</th><th>GPU idle</th><th>per-step transfer gaps</th></tr>
+    <tr><td>AOT transfer</td><td>49.4%</td><td class="lose">50.6%</td><td>185–283 ms ×5–6</td></tr>
+    <tr><td>JIT + RAID0</td><td>53.2%</td><td>46.8%</td><td class="win">&lt;30 ms</td></tr>
+    <tr><td>B200 (AOT, reference)</td><td>63.3%</td><td>36.7%</td><td>40–133 ms</td></tr>
+  </table>
+  <div class="note" style="margin-top:8px">
+    (Each trace has a ~10 s round-barrier gap that is excluded from the per-step view; per-step idle MI355X AOT ≈20.7% → JIT+RAID0 ≈13.7%.)<br><br>
+
+    <b>4. What causes the MI355X bubbles — two distinct kinds (CPU is NOT the cause: EPYC 9575F 64-core ≥ B200 Xeon 8570):</b><br>
+    &nbsp;&nbsp;<b>(a) transfer-gated</b> — the 185–283 ms gaps. The scheduler/cache-controller host threads stall (lock/queue) while the slower AOT transfer + single-drive L3 work drains. <b>Fixed by JIT (+RAID0): gaps drop to &lt;30 ms.</b><br>
+    &nbsp;&nbsp;<b>(b) request-arrival / scheduling</b> — the big <code>queue.get</code>/<code>wait</code> gaps + the round barrier. The scheduler is idle waiting for the next batch of client requests; <b>not transfer-related</b> — JIT/RAID0 cannot help. Needs higher concurrency (<code>max_parallel</code>) and/or async/overlapped cache management.<br><br>
+
+    <b>Why FP8 idles more than BF16:</b> the host-side coordination (a)+(b) costs a roughly fixed wall-time; FP8 attention shortens GPU compute so the GPU finishes early and exposes that wait as idle, whereas BF16's longer compute overlaps/hides it (≈0% idle). Both attentions give nearly the same round time (~17 s) — the round is gated by the host path, not by compute.<br><br>
+
+    <b>0609 net:</b> JIT now works end-to-end on MI355X FP8 (was silently AOT) and removes the transfer-gated bubbles; the remaining idle is concurrency/scheduling-bound. <i>Next: re-profile with higher <code>max_parallel</code> to attack the request-arrival bubbles; this section will be updated with those results.</i>
+  </div>
 </body>
 </html>
