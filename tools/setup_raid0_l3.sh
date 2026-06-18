@@ -1,34 +1,69 @@
 #!/usr/bin/env bash
-# Build a RAID0 array from the 7 idle Micron 7450 NVMe drives (nvme1..nvme7)
+# Build a RAID0 array from every IDLE NVMe drive on the box (auto-detected)
 # and mount it at /raid for use as the HiCache L3 directory.
 #
 # SAFETY:
-#   * nvme0 (boot/root) is NEVER included.
-#   * Refuses any target drive that is mounted, has a partition table, or has a filesystem.
+#   * The boot/root drive is auto-detected (via the disk backing / and
+#     /boot/efi) and NEVER included -- we do NOT hard-code a device number,
+#     because Linux nvmeN numbering follows PCIe enumeration order, not boot
+#     order (e.g. on this box the boot drive is nvme7, not nvme0).
+#   * Only drives with NO partition table, NO filesystem, and NO mountpoint
+#     are eligible -- any drive that already holds data is refused.
 #   * RAID0 has NO redundancy: a single drive failure loses the whole array.
 #     That is fine for a scratch KV-cache (L3) tier — it is recomputable.
 #
 # Run with sudo:  sudo bash tools/setup_raid0_l3.sh
+#   override the auto-detected member list with:  DRIVES="/dev/nvmeXn1 ..." sudo -E bash tools/setup_raid0_l3.sh
 set -euo pipefail
 
 MD=/dev/md0
 MNT=/raid
 OWNER=${SUDO_USER:-jacchang}
-DRIVES=(/dev/nvme1n1 /dev/nvme2n1 /dev/nvme3n1 /dev/nvme4n1 /dev/nvme5n1 /dev/nvme6n1 /dev/nvme7n1)
 
-echo ">>> target drives: ${DRIVES[*]}"
-echo ">>> EXCLUDED (boot): /dev/nvme0n1"
+# ---- detect the boot/root disk(s) so we never touch them ----
+# Map the filesystem source of / and /boot/efi back to their parent whole
+# disk (PKNAME), e.g. /dev/nvme7n1p2 -> nvme7n1. Anything in this set is
+# excluded from the RAID0 regardless of its device number.
+declare -A BOOT_DISKS=()
+for mp in / /boot /boot/efi; do
+  src=$(findmnt -no SOURCE "$mp" 2>/dev/null) || continue
+  [[ -n "$src" ]] || continue
+  pk=$(lsblk -no PKNAME "$src" 2>/dev/null | head -1)
+  [[ -z "$pk" ]] && pk=$(basename "$src")   # source is already a whole disk
+  [[ -n "$pk" ]] && BOOT_DISKS["$pk"]=1
+done
+echo ">>> boot/root disk(s) auto-detected & EXCLUDED: ${!BOOT_DISKS[*]:-<none?>}"
 
-# ---- safety checks ----
+# ---- build the candidate member list ----
+# Honor a caller-supplied DRIVES override; otherwise auto-collect every whole
+# NVMe disk that is not a boot disk, has no filesystem, and is not mounted.
+if [[ -n "${DRIVES:-}" ]]; then
+  read -r -a DRIVES <<< "$DRIVES"
+  echo ">>> using caller-supplied DRIVES override"
+else
+  DRIVES=()
+  while read -r disk; do
+    [[ -n "${BOOT_DISKS[$disk]:-}" ]] && continue          # skip boot disk
+    if lsblk -no FSTYPE "/dev/$disk" | grep -q .; then continue; fi   # skip if any fs
+    if lsblk -no MOUNTPOINT "/dev/$disk" | grep -q .; then continue; fi  # skip if mounted
+    DRIVES+=("/dev/$disk")
+  done < <(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && $1 ~ /^nvme/ {print $1}' | sort -V)
+fi
+
+[[ ${#DRIVES[@]} -ge 1 ]] || { echo "FATAL: no idle NVMe drives found to build the array"; exit 1; }
+echo ">>> target drives (${#DRIVES[@]}): ${DRIVES[*]}"
+
+# ---- safety checks (defense-in-depth; re-verify each member) ----
 for d in "${DRIVES[@]}"; do
-  [[ "$d" == /dev/nvme0n1 ]] && { echo "FATAL: refusing nvme0 (boot)"; exit 1; }
+  name=$(basename "$d")
+  [[ -n "${BOOT_DISKS[$name]:-}" ]] && { echo "FATAL: $d is a boot disk — aborting"; exit 1; }
   [[ -b "$d" ]] || { echo "FATAL: $d is not a block device"; exit 1; }
   if lsblk -no MOUNTPOINT "$d" | grep -q .; then
     echo "FATAL: $d (or a child) is mounted — aborting"; exit 1; fi
   if lsblk -no FSTYPE "$d" | grep -q .; then
     echo "FATAL: $d has a filesystem/partition — aborting (won't wipe data)"; exit 1; fi
 done
-echo ">>> all 7 drives confirmed empty & unmounted."
+echo ">>> all ${#DRIVES[@]} drives confirmed empty & unmounted."
 
 # ---- create array ----
 echo ">>> creating RAID0 $MD (chunk 512K)"
@@ -48,5 +83,6 @@ echo "Optional persistence across reboot (review before running):"
 echo "  mdadm --detail --scan | sudo tee -a /etc/mdadm.conf"
 echo "  echo '$MD  $MNT  ext4  noatime,nofail  0 0' | sudo tee -a /etc/fstab"
 echo
-echo "Point HiCache L3 here by setting in cascade_dsr1_lite.sh:"
-echo "  HICACHE_FILE_STORE_DIR=$MNT/cascade_dsr1_l3_...   (instead of /tmp/...)"
+echo "Point HiCache L3 here when running cascade_dsr1_lite.sh:"
+echo "  1) start the container with the array mounted in:   -v $MNT:$MNT"
+echo "  2) run the bench with:   L3_BASE_DIR=$MNT ./cascade_dsr1_lite.sh ... --cache-modes L3_file"
