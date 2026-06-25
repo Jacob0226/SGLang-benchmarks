@@ -1,5 +1,6 @@
 import re
 import csv
+import math
 import argparse
 from datetime import date as _date
 from pathlib import Path
@@ -179,6 +180,14 @@ def _safe_float(value):
         return None
 
 
+def _geomean(values):
+    """對一串值取幾何平均 (只算 > 0 的數字)。全空則回傳 None。"""
+    nums = [f for f in (_safe_float(v) for v in values) if f is not None and f > 0]
+    if not nums:
+        return None
+    return math.exp(sum(math.log(x) for x in nums) / len(nums))
+
+
 def compute_derived_metrics(record: dict, tp: int):
     """加 2 個 derived 欄位 (給第一份 table 用):
        Interactivity (tok/s/user)            = 1000 / Median TPOT (ms)
@@ -314,22 +323,54 @@ def _build_side_by_side(records, ordered_columns, tp):
     return summary_header, summary_rows, full_header, full_rows, row_keys
 
 
-def build_meta_row(*, accuracy=None, tp=None):
-    """組第一列的 Accuracy / TP 資訊；兩者皆無則回傳 None。"""
-    meta = []
-    if accuracy is not None:
-        meta += ["Accuracy", accuracy]
-    if tp:
-        meta += [f"TP{tp}"]
-    return meta or None
+def build_meta_block(*, variant=None, image=None, framework=None,
+                     precision=None, tp=None, accuracy=None, run_date=None):
+    """組左上角的 metadata 區塊 (每項一列 [label, value])。空值略過。"""
+    rows = []
+    pairs = [
+        ("Model", variant),
+        ("Image", image),
+        ("Framework", framework),
+        ("Precision", precision),
+        ("TP", f"TP{tp}" if tp else None),
+        ("Accuracy", accuracy),
+        ("Date", run_date),
+    ]
+    for label, value in pairs:
+        if value not in (None, ""):
+            rows.append([label, value])
+    return rows
 
 
-def write_csv(records, column_order, output_csv, *, tp, accuracy=None):
+def build_geomean_row(summary_rows, group_key):
+    """對同一 input/output 群組的 summary_rows 取 geomean，組出一列。
+    summary_rows: list of lists，欄位順序 = SUMMARY_COLUMNS。
+    對 Interactivity / Token TPUT per GPU / TTFT / TPOT 取幾何平均。"""
+    # 欄位索引: 3=Interactivity, 4=Token TPUT per GPU, 5=TTFT, 6=TPOT
+    intvty = _geomean(r[3] for r in summary_rows)
+    tput = _geomean(r[4] for r in summary_rows)
+    ttft = _geomean(r[5] for r in summary_rows)
+    tpot = _geomean(r[6] for r in summary_rows)
+    return [
+        group_key[0],
+        group_key[1],
+        "geomean",
+        round(intvty, 1) if intvty is not None else "",
+        int(tput) if tput is not None else "",
+        round(ttft, 2) if ttft is not None else "",
+        round(tpot, 2) if tpot is not None else "",
+    ]
+
+
+def write_csv(records, column_order, output_csv, *, tp, accuracy=None,
+              meta=None):
     """左右並排輸出：
-      (可選) 第一列顯示 Accuracy / TP
+      左上角 metadata 區塊 (Model / Image / Framework / Precision / TP /
+        Accuracy / Date，每項一列)
       左表 = summary (input_len/output_len/concurrency/Interactivity/
-             Token Throughput per GPU/TTFT/TPOT，TTFT、TPOT 取 median)
-      中間空一欄
+             Token TPUT per GPU/TTFT/TPOT，TTFT、TPOT 取 median)，
+             每個 input/output 群組底部附一列 geomean
+      中間空 GAP_COLS 欄
       右表 = 其他 parse 來的完整 metrics
     """
     if not records:
@@ -347,22 +388,47 @@ def write_csv(records, column_order, output_csv, *, tp, accuracy=None):
      full_header, full_rows, row_keys) = _build_side_by_side(
         records, ordered_columns, tp)
 
-    meta_row = build_meta_row(accuracy=accuracy, tp=tp)
+    meta = meta or {}
+    meta_block = build_meta_block(
+        variant=meta.get("variant"),
+        image=meta.get("image"),
+        framework=meta.get("framework"),
+        precision=meta.get("precision"),
+        tp=tp,
+        accuracy=accuracy,
+        run_date=meta.get("run_date"),
+    )
     gap = [""] * GAP_COLS  # 左右兩表中間空白欄
+    full_width = len(full_header)
 
-    # CSV：左右並排，中間留 GAP_COLS 個空白欄；
-    #      不同 input/output 長度群組 (i1k、i8k...) 之間插入空白列切成兩個 table。
+    # CSV：左上角先放 metadata 區塊，空一列後接表格本體。
+    #      左右並排，中間留 GAP_COLS 個空白欄；不同 input/output 長度群組
+    #      (i1k、i8k...) 各自結尾附一列 geomean，群組之間再插入空白列。
     with open(output_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        if meta_row:
-            writer.writerow(meta_row)
+        for row in meta_block:
+            writer.writerow(row)
+        if meta_block:
+            writer.writerow([])
+
         writer.writerow(summary_header + gap + full_header)
-        prev_key = None
+
+        # 先依群組收集 summary_rows，才能算每組 geomean。
+        groups = []  # list of (key, [summary_rows], [full_rows])
         for s_row, f_row, key in zip(summary_rows, full_rows, row_keys):
-            if prev_key is not None and key != prev_key:
+            if not groups or groups[-1][0] != key:
+                groups.append((key, [], []))
+            groups[-1][1].append(s_row)
+            groups[-1][2].append(f_row)
+
+        for gi, (key, s_rows, f_rows) in enumerate(groups):
+            if gi > 0:
                 writer.writerow([])  # 群組間空白列
-            writer.writerow(s_row + gap + f_row)
-            prev_key = key
+            for s_row, f_row in zip(s_rows, f_rows):
+                writer.writerow(s_row + gap + f_row)
+            # 群組 geomean (右表對應位置留空)
+            geo_row = build_geomean_row(s_rows, key)
+            writer.writerow(geo_row + gap + [""] * full_width)
 
 
 def main():
@@ -507,6 +573,13 @@ def main():
         args.output,
         tp=tp_size,
         accuracy=accuracy,
+        meta=dict(
+            variant=variant,
+            image=image,
+            framework=framework,
+            precision=precision,
+            run_date=run_date,
+        ),
     )
 
     print("-" * 30)
