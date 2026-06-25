@@ -8,6 +8,7 @@
 # ./GLM.sh --prof --dual-stream-rocm --tag DualStream
 # ./GLM.sh --tp 4 --tag 0507_TP4    # tensor parallel size (auto: TP=4 for FP4 models, TP=8 for FP8)
 # ./GLM.sh --docker rocm/sgl-dev:v0.5.10rc0-rocm720-mi35x-20260412   # tag results dir with docker image
+# ./GLM.sh --port 8600              # change server port (default 8552; also: PORT=8600 ./GLM.sh)
 #
 # GLM-5 / GLM-5.1 FP4 examples (auto-detects quant scheme from model name;
 # mirrors InferenceX recipes — see SemiAnalysisAI/InferenceX benchmarks/
@@ -17,7 +18,7 @@
 set -euo pipefail
 set -x
 ulimit -n 65535
-sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'
+sh -c 'echo 0 > /proc/sys/kernel/numa_balancing' 2>/dev/null || echo "[warn] cannot disable numa_balancing (need root); continuing"
 
 MTP_ENABLED="false"
 PROF_ENABLED="false"
@@ -71,6 +72,10 @@ while [[ $# -gt 0 ]]; do
         ;;
     --docker)
         DOCKER="$2"
+        shift 2
+        ;;
+    --port)
+        PORT="$2"
         shift 2
         ;;
     *)
@@ -135,9 +140,11 @@ export SGLANG_ROCM_FUSED_DECODE_MLA=0
 export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
 # export AITER_ONLINE_TUNE=1
 HOST="localhost"
-PORT="8552"
+# Override with `--port <n>` or `PORT=<n> ./GLM.sh`. Default 8552.
+PORT="${PORT:-8234}"
 DATASET="random"
-in_out_tokens=("8192:1024" "1024:1024")
+in_out_tokens=("8192:1024" "1024:1024" "70000:300")
+in_out_tokens=("70000:300")
 random_range_ratio=0.8
 concurrencies=(4 8 16 32 64 128 256)
 PROMPT_MULTIPLIER=5
@@ -149,6 +156,16 @@ else
     COMBINED_SUFFIX=""
 fi
 
+# Vendor tag inserted into profiler trace filenames (e.g. ..._p8-AMD-TP-0-...).
+# Auto-detect: AMD on ROCm, NV otherwise. Override with: VENDOR_TAG=AMD ./GLM.sh ...
+if [ -z "${VENDOR_TAG:-}" ]; then
+    if [ -e /dev/kfd ] || command -v rocm-smi >/dev/null 2>&1; then
+        VENDOR_TAG="AMD"
+    else
+        VENDOR_TAG="NV"
+    fi
+fi
+
 # ===================== Argument  =====================
 SPECIAL_TAG="-bench"
 if [ "$PROF_ENABLED" == "true" ]; then
@@ -158,7 +175,7 @@ if [ "$PROF_ENABLED" == "true" ]; then
 
     # Debug
     # in_out_tokens=("1024:1024")
-    concurrencies=(64 4)
+    concurrencies=(4)
 fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
 LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}${MTP_TAG}${SPECIAL_TAG}${USER_TAG}"
@@ -224,7 +241,7 @@ rename_profiler_artifacts() {
         [ -f "${trace_file}" ] || continue
         filename=$(basename "${trace_file}")
         tp_rank=$(sed -E 's/^.*-TP-([0-9]+)\.trace\.json\.gz$/\1/' <<< "${filename}")
-        new_name="in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}${COMBINED_SUFFIX}-TP-${tp_rank}${NOGRAPH_SUFFIX}.trace.json.gz"
+        new_name="in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}${COMBINED_SUFFIX}-${VENDOR_TAG}-TP-${tp_rank}${NOGRAPH_SUFFIX}.trace.json.gz"
         mv "${trace_file}" "${target_dir_path}/${new_name}"
         echo "Renamed trace: ${filename} -> ${new_name}"
     done
@@ -271,7 +288,7 @@ rename_profiler_artifacts_by_stage() {
             continue
         fi
 
-        new_name="in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}${COMBINED_SUFFIX}-TP-${tp_rank}-${stage}${NOGRAPH_SUFFIX}.trace.json.gz"
+        new_name="in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}${COMBINED_SUFFIX}-${VENDOR_TAG}-TP-${tp_rank}-${stage}${NOGRAPH_SUFFIX}.trace.json.gz"
         mv "${trace_file}" "${target_dir_path}/${new_name}"
         echo "Renamed trace: ${filename} -> ${new_name}"
     done
@@ -391,6 +408,17 @@ start_server() {
         cmd+=("${EXTRA_SERVER_ARGS[@]}")
     fi
 
+    # Preflight: fail fast if the port is already taken (otherwise the model
+    # loads for ~2 min and only then dies with "[Errno 98] Address already in
+    # use"). Common cause: a stale/orphaned sglang server from a previous run,
+    # or another server sharing this host. Stop it or pick another --port.
+    if (exec 3<>"/dev/tcp/${HOST}/${PORT}") 2>/dev/null; then
+        exec 3>&- 3<&-
+        echo "!!! ERROR: ${HOST}:${PORT} is already in use. Stop the existing server " \
+             "(e.g. 'pkill -9 -f sglang.launch_server') or run with '--port <free-port>'." | tee -a "$logfile"
+        exit 1
+    fi
+
     # Start server in background
     echo ">>> Executing command:" | tee -a "$logfile"
     echo "${cmd[*]}" | tee -a "$logfile"
@@ -398,7 +426,14 @@ start_server() {
     "${cmd[@]}" 2>&1 | tee -a "$logfile" &
 
     echo ">>> Waiting for server to be ready (checking: '${logfile}')..." | tee -a "$logfile"
-    until [ "$(curl -s -o /dev/null -w "%{http_code}" "http://${HOST}:$PORT/health")" -eq 200 ]; do
+    until [ "$(curl -s -o /dev/null -w "%{http_code}" "http://${HOST}:$PORT/health" 2>/dev/null)" = "200" ]; do
+        # Detect server death during startup (port bind failure, OOM, GPU fault)
+        # so we don't poll forever. pgrep is scoped to this server's port.
+        if ! pgrep -f "sglang.launch_server.*--port $PORT" >/dev/null 2>&1; then
+            echo "!!! ERROR: server process died during startup. See '${logfile}' " \
+                 "(look for 'Address already in use', OOM, or 'Memory access fault')." | tee -a "$logfile"
+            exit 1
+        fi
         echo "Waiting for server to be ready at http://${HOST}:$PORT/health..."
         sleep 5
     done
@@ -427,11 +462,16 @@ accuracy_test() {
     gsm8k_logfile=$LOG_DIR/Accuracy_GSM8K.log
     if ! grep -q "$gsm8k_logfile" "$FINISH_LOG"; then
         echo ">>> Running Accuracy check (GSM8K)..."
+        # --parallel caps how many GSM8K requests run concurrently. A very high
+        # value (e.g. 1200) floods the server into one giant batch (#running-req
+        # ~1197) which can trip a GPU memory-access fault in the MXFP4/tilelang
+        # NSA kernels on MI355X. Accuracy is unaffected by lowering it (same 1200
+        # questions, fewer in flight). Override with GSM8K_PARALLEL=<n>.
         gsm8k_cmd=(
             python3 /sgl-workspace/sglang/benchmark/gsm8k/bench_sglang.py 
                 --port "$PORT" 
                 --num-questions 1200 
-                --parallel 1200
+                --parallel "${GSM8K_PARALLEL:-256}"
         )
         log_command "$gsm8k_logfile" "${gsm8k_cmd[@]}"
         echo "$gsm8k_logfile" >> "$FINISH_LOG"
@@ -510,11 +550,17 @@ run_benchmarks() {
 
 
 # ===================== Package Setup =====================
-if [[ "${MODEL_NAME}" == *GLM-5* ]]; then
-    if ! is_rocm_gpu_env; then
-        export SGL_ENABLE_JIT_DEEPGEMM=1
+if ! is_rocm_gpu_env; then
+    export SGL_ENABLE_JIT_DEEPGEMM=1
+    # NV image ships a PEP 668 "externally managed" Python; install the
+    # missing 'distro' dep (imported by sglang.bench_serving) with the
+    # override flag. ROCm image already has it, so skip there.
+    if ! python3 -c "import distro" >/dev/null 2>&1; then
+        python3 -m pip install --user --break-system-packages distro
     fi
 fi
+
+
 
 # ------------------- Start -----------------
 if [ "$PROF_ENABLED" == "true" ]; then
