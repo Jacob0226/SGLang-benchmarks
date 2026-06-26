@@ -12,7 +12,49 @@ Usage:
 
 import argparse
 import csv  # for reading input CSVs
+import os
 import sys
+
+
+def _trace_busy(path: str):
+    """Compute Σduration, union-busy, overlap factor and decode-step count from
+    a raw *.trace.json.gz (graph-ON) trace.
+
+    union-busy = wall time the GPU is actually busy (overlapping kernels on
+    different streams counted once); overlap = Σduration / union-busy.
+    Returns a dict or None on failure.
+    """
+    import gzip
+    import json
+    from collections import Counter
+    try:
+        with gzip.open(path, "rt") as f:
+            t = json.load(f)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] could not read trace {path}: {e}", file=sys.stderr)
+        return None
+    evs = t if isinstance(t, list) else t.get("traceEvents", [])
+    k = [e for e in evs if isinstance(e, dict)
+         and str(e.get("cat", "")).lower() == "kernel" and e.get("ph") == "X"]
+    if not k:
+        return None
+    iv = sorted((e["ts"], e["ts"] + e["dur"]) for e in k)
+    sumd = sum(e["dur"] for e in k)
+    tot = 0.0
+    cs, ce = iv[0]
+    for s, e in iv[1:]:
+        if s > ce:
+            tot += ce - cs
+            cs, ce = s, e
+        else:
+            ce = max(ce, e)
+    tot += ce - cs
+    steps = (sum(c for n, c in Counter(e["name"] for e in k).items()
+                 if "topk_transform_decode" in n) // 78) or 1
+    return {"sum_ms": sumd / 1e3, "busy_ms": tot / 1e3,
+            "overlap": (sumd / tot if tot else 0.0),
+            "steps": steps, "busy_per_step": tot / steps / 1e3,
+            "nkernels": len(k)}
 
 
 def load_breakdown(path: str) -> list[dict]:
@@ -327,8 +369,14 @@ def build_comparison(rows_a, rows_b, label_a, label_b):
     return header, output_rows, section_meta
 
 
-def write_xlsx(header, rows, section_meta, label_a, label_b, path):
-    """Write comparison to Excel with formulas, subtotals, and summary."""
+def write_xlsx(header, rows, section_meta, label_a, label_b, path, meta_info=None):
+    """Write comparison to Excel with formulas, subtotals, and summary.
+
+    meta_info (optional dict): adds a metadata block above the table describing
+    the profile and the source traces, plus overlap-factor / union-busy stats.
+    Keys: title, a_name, b_name, a_busy, b_busy (the *_busy dicts come from
+    _trace_busy()).
+    """
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side, numbers
     from openpyxl.utils import get_column_letter
@@ -342,6 +390,42 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
     header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2",
                               fill_type="solid")
     thin_border = Border(bottom=Side(style="thin", color="CCCCCC"))
+
+    # --- Metadata block (above the table). RO = number of rows it occupies, so
+    # every absolute row reference below is shifted down by RO. ---
+    RO = 0
+    if meta_info:
+        meta_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6",
+                                fill_type="solid")
+        meta_lines = []
+        meta_lines.append(f"Profile: {meta_info.get('title', '') or '(unspecified)'}")
+        meta_lines.append(f"{label_a} trace: {meta_info.get('a_name', '')}")
+        meta_lines.append(f"{label_b} trace: {meta_info.get('b_name', '')}")
+        ab = meta_info.get("a_busy")
+        bb = meta_info.get("b_busy")
+        if ab and bb:
+            meta_lines.append(
+                f"GPU-busy (graph-ON, per decode step): "
+                f"{label_a} {ab['busy_per_step']:.2f} ms (overlap {ab['overlap']:.2f}x) | "
+                f"{label_b} {bb['busy_per_step']:.2f} ms (overlap {bb['overlap']:.2f}x) | "
+                f"{label_b}/{label_a} = "
+                f"{(bb['busy_per_step']/ab['busy_per_step']*100 if ab['busy_per_step'] else 0):.0f}%"
+            )
+            meta_lines.append(
+                "NOTE: the Σduration table/Summary below ignores cross-stream "
+                "overlap; use the GPU-busy line above for wall-clock (TPOT) comparison."
+            )
+        elif ab or bb:
+            one = ab or bb
+            who = label_a if ab else label_b
+            meta_lines.append(
+                f"GPU-busy (graph-ON): {who} {one['busy_per_step']:.2f} ms/step "
+                f"(overlap {one['overlap']:.2f}x)")
+        for i, ln in enumerate(meta_lines, 1):
+            c = ws.cell(row=i, column=1, value=ln)
+            c.font = arial_bold if i == 1 else arial
+            c.fill = meta_fill
+        RO = len(meta_lines) + 1  # +1 blank separator row before the table
 
     # Assign a distinct subtotal color per unique layer_type (in order of first appearance)
     SUBTOTAL_PALETTE = [
@@ -371,20 +455,20 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
 
     # --- Write header ---
     for c, val in enumerate(header, 1):
-        cell = ws.cell(row=1, column=c, value=val)
+        cell = ws.cell(row=1 + RO, column=c, value=val)
         cell.font = arial_bold
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center")
-    ws.freeze_panes = "A2"
+    ws.freeze_panes = f"A{2 + RO}"
 
     # Build a map from excel row -> layer_type for subtotal rows
     subtotal_layer_type: dict[int, str] = {}
     for meta in section_meta:
-        xl_sub = meta["subtotal_idx"] + 2  # +2: 1-indexed + header
+        xl_sub = meta["subtotal_idx"] + 2 + RO  # +2: 1-indexed + header
         subtotal_layer_type[xl_sub] = meta["layer_type"]
 
     # --- Write data rows ---
-    for r, row_data in enumerate(rows, 2):
+    for r, row_data in enumerate(rows, 2 + RO):
         is_separator = not any(row_data)
         is_subtotal = any(v in ("__SUM_A__", "__SUM_B__", "__RATIO__")
                           for v in row_data if isinstance(v, str))
@@ -409,8 +493,8 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
     cb = get_column_letter(COL_B_US)
 
     for meta in section_meta:
-        xl_row = meta["subtotal_idx"] + 2  # +2: 1-indexed + header
-        data_start_xl = meta["data_start"] + 2
+        xl_row = meta["subtotal_idx"] + 2 + RO  # +2: 1-indexed + header
+        data_start_xl = meta["data_start"] + 2 + RO
         data_end_xl = xl_row - 1  # row before subtotal
         sfill = _get_subtotal_fill(meta["layer_type"])
 
@@ -440,7 +524,7 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
         left=Side(style="thin"), right=Side(style="thin"),
         top=Side(style="thin"), bottom=Side(style="thin"))
 
-    summary_start = len(rows) + 4  # 2 rows gap after data
+    summary_start = len(rows) + 4 + RO  # 2 rows gap after data
     r = summary_start
 
     # --- Optimization columns ---
@@ -505,8 +589,8 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
         # dict) since the same Section name can appear under multiple
         # LayerType groups (e.g. prepare_attn shows up for both Layer A and B)
         # and a flat dict would let the second occurrence overwrite the first.
-        st_row = meta["subtotal_idx"] + 2
-        data_start_xl = meta["data_start"] + 2
+        st_row = meta["subtotal_idx"] + 2 + RO
+        data_start_xl = meta["data_start"] + 2 + RO
 
         ws.cell(row=r, column=1,
                 value=f"=A{data_start_xl}").font = arial
@@ -580,7 +664,7 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path):
     # --- Auto-fit column widths ---
     for c in range(1, len(header) + 1):
         max_len = len(str(header[c - 1]))
-        for row in range(2, min(len(rows) + 2, 50)):
+        for row in range(2 + RO, min(len(rows) + 2 + RO, 50 + RO)):
             val = ws.cell(row=row, column=c).value
             if val and not str(val).startswith("="):
                 max_len = max(max_len, min(len(str(val)), 60))
@@ -601,6 +685,13 @@ def main():
                    help="Labels for the two platforms (default: A B)")
     p.add_argument("--out", required=True, metavar="XLSX",
                    help="Output Excel path (e.g. comparison.xlsx)")
+    p.add_argument("--title", default="",
+                   help="Profile description written in the first row of the output")
+    p.add_argument("--trace-a", default="", metavar="TRACE",
+                   help="Source graph-ON trace for label A; its name is shown and "
+                        "its overlap-factor / union-busy are computed")
+    p.add_argument("--trace-b", default="", metavar="TRACE",
+                   help="Source graph-ON trace for label B (name + overlap/union-busy)")
     args = p.parse_args()
 
     rows_a = load_breakdown(args.file_a)
@@ -621,8 +712,16 @@ def main():
     header, output, section_meta = build_comparison(
         rows_a, rows_b, args.labels[0], args.labels[1])
 
+    meta_info = {
+        "title": args.title,
+        "a_name": os.path.basename(args.trace_a) if args.trace_a else os.path.basename(args.file_a),
+        "b_name": os.path.basename(args.trace_b) if args.trace_b else os.path.basename(args.file_b),
+        "a_busy": _trace_busy(args.trace_a) if args.trace_a else None,
+        "b_busy": _trace_busy(args.trace_b) if args.trace_b else None,
+    }
+
     write_xlsx(header, output, section_meta,
-               args.labels[0], args.labels[1], args.out)
+               args.labels[0], args.labels[1], args.out, meta_info)
     print(f"[INFO] Written to {args.out}", file=sys.stderr)
 
 

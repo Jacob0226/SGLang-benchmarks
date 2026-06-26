@@ -146,7 +146,7 @@ DATASET="random"
 in_out_tokens=("8192:1024" "1024:1024" "70000:300")
 in_out_tokens=("70000:300")
 random_range_ratio=0.8
-concurrencies=(4 8 16 32 64 128 256)
+concurrencies=(4 8 16 32 64) # 128 256
 PROMPT_MULTIPLIER=5
 if [ "$PROF_COMBINED" == "true" ]; then
     PROF_CMD=(--profile --profile-num-steps 5)
@@ -174,7 +174,7 @@ if [ "$PROF_ENABLED" == "true" ]; then
     PROMPT_MULTIPLIER=2 # Faster for no cuda graph profiling
 
     # Debug
-    # in_out_tokens=("1024:1024")
+    in_out_tokens=("8192:1024")
     concurrencies=(4)
 fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
@@ -321,7 +321,7 @@ start_server() {
             --mem-fraction-static "$MEM_FRACTION_STATIC"
             --kv-cache-dtype fp8_e4m3
             --disable-radix-cache
-            --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}'
+            --model-loader-extra-config "{\"enable_multithread_load\": true, \"num_threads\": ${WEIGHT_LOAD_THREADS:-32}}"
     )
     if [ ${#QUANT_ARGS[@]} -gt 0 ]; then
         cmd+=("${QUANT_ARGS[@]}")
@@ -531,16 +531,25 @@ run_benchmarks() {
                 if [ "$PROF_ENABLED" == "true" ]; then
                     profiler_dirs_before=$(list_profiler_dirs) # Get the current folders under $LOG_DIR
                 fi
-                log_command "$logfile" "${cmd[@]}"
+                # Don't let a profiler-teardown crash (server segfault / NCCL
+                # heartbeat / known ROCm torch-profiler teardown fault) abort the
+                # whole run via `set -e`. The trace is typically already flushed
+                # to disk before the crash, so we still want to fall through to
+                # the rename step below and continue with the next iteration.
+                if ! log_command "$logfile" "${cmd[@]}"; then
+                    echo "[warn] command exited non-zero for ${logfile} (likely profiler teardown crash); traces may still be present — continuing to rename."
+                fi
                 echo "$logfile" >> "$FINISH_LOG"
 
                 if [ "$PROF_ENABLED" == "true" ]; then
                     profiler_dirs_after=$(list_profiler_dirs) # Get the current folders under $LOG_DIR. This time will have another torch profiler folder
                     echo ">>> Processing profiler traces..."
                     if prof_cmd_has_profile_by_stage; then
-                        rename_profiler_artifacts_by_stage "${input_tokens}" "${output_tokens}" "${c}" "${num_prompts}" "${profiler_dirs_before}" "${profiler_dirs_after}"
+                        rename_profiler_artifacts_by_stage "${input_tokens}" "${output_tokens}" "${c}" "${num_prompts}" "${profiler_dirs_before}" "${profiler_dirs_after}" \
+                            || echo "[warn] rename_profiler_artifacts_by_stage failed for ${logfile}; raw trace dir left in place — continuing."
                     else
-                        rename_profiler_artifacts "${input_tokens}" "${output_tokens}" "${c}" "${num_prompts}" "${profiler_dirs_before}" "${profiler_dirs_after}"
+                        rename_profiler_artifacts "${input_tokens}" "${output_tokens}" "${c}" "${num_prompts}" "${profiler_dirs_before}" "${profiler_dirs_after}" \
+                            || echo "[warn] rename_profiler_artifacts failed for ${logfile}; raw trace dir left in place — continuing."
                     fi
                 fi
             fi
@@ -587,13 +596,19 @@ for PROF_MODE in "${PROF_SERVER_MODES[@]}"; do
         LOG_DIR="${BASE_LOG_DIR}"
     fi
 
-    echo ">>> [${PROF_MODE}] Starting server and benchmarks..."
-    start_server
-    warmup
-    if [ "$PROF_MODE" == "default" ]; then
-        accuracy_test
-    fi
-    run_benchmarks
+    # Run each profiling mode inside a subshell so any fatal error — server
+    # death (start_server's `exit 1`), profiler teardown crash, etc. — only
+    # aborts THIS mode rather than the whole script. The next mode (e.g.
+    # no-cuda-graph) still runs, and the cleanup below always executes.
+    (
+        echo ">>> [${PROF_MODE}] Starting server and benchmarks..."
+        start_server
+        warmup
+        if [ "$PROF_MODE" == "default" ]; then
+            accuracy_test
+        fi
+        run_benchmarks
+    ) || echo "[warn] profiling mode '${PROF_MODE}' aborted (exit $?); continuing to cleanup and next mode."
 
     pkill -9 python || true
     pkill -f sglang || true

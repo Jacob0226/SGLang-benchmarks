@@ -1,0 +1,25 @@
+# Profiling traces and benchmark result dumps (large binaries, regenerable)
+results/
+*.trace.json.gz
+*.trace.json
+*.zip
+
+# Analysis output dirs (xlsx/csv/gz, regenerable from scripts)
+B200_GLM5_FP8_Analysis/
+MI355X_GLM5_FP8_Analysis/
+GLM5_FP8_Analysis_test/
+trace_analysis/
+*.pkl
+
+# Benchmark CSV/JSON outputs
+*.csv
+answer_sglang.json
+val_sglang.json
+result.jsonl
+
+# Caches and scratch
+__pycache__/
+*.pyc
+tmp/
+tmp2/
+tmp_output_srt.txt
