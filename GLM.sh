@@ -84,7 +84,14 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
-MODEL_NAME=$(basename "${MODEL_PATH%/}")
+# Use the last two path components joined with '_' so the org is kept, e.g.
+#   /data/huggingface/hub/amd/GLM-5.1-MXFP4    -> amd_GLM-5.1-MXFP4
+#   /data/huggingface/hub/nvidia/GLM-5-NVFP4   -> nvidia_GLM-5-NVFP4
+#   /data/huggingface/hub/zai-org/GLM-5.1-FP8  -> zai-org_GLM-5.1-FP8
+_MODEL_PATH_TRIMMED="${MODEL_PATH%/}"
+_MODEL_LEAF=$(basename "${_MODEL_PATH_TRIMMED}")
+_MODEL_ORG=$(basename "$(dirname "${_MODEL_PATH_TRIMMED}")")
+MODEL_NAME="${_MODEL_ORG}_${_MODEL_LEAF}"
 
 # ===================== Quantization auto-detection (matches InferenceX) =====================
 # Pick --quantization and --mem-fraction-static based on the model name.
@@ -144,7 +151,6 @@ HOST="localhost"
 PORT="${PORT:-8234}"
 DATASET="random"
 in_out_tokens=("8192:1024" "1024:1024" "70000:300")
-in_out_tokens=("70000:300")
 random_range_ratio=0.8
 concurrencies=(4 8 16 32 64) # 128 256
 PROMPT_MULTIPLIER=5
@@ -178,7 +184,12 @@ if [ "$PROF_ENABLED" == "true" ]; then
     concurrencies=(4)
 fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
-LOG_DIR="$HOME/SGLang-benchmarks/results/$DOCKER_FILENAME/${MODEL_NAME}${MTP_TAG}${SPECIAL_TAG}${USER_TAG}"
+# Layout: results/<model>/<docker-image>/<tags>
+# The leaf is the combined tag portion (MTP/bench-or-prof/user tag) with the
+# leading '-' stripped so it doesn't start with a dash.
+LEAF_TAG="${MTP_TAG}${SPECIAL_TAG}${USER_TAG}"
+LEAF_TAG="${LEAF_TAG#-}"
+LOG_DIR="$HOME/SGLang-benchmarks/results/${MODEL_NAME}/$DOCKER_FILENAME/${LEAF_TAG}"
 FINISH_LOG="$LOG_DIR/Finish.log"
 mkdir -p "$LOG_DIR"
 touch "$FINISH_LOG"
@@ -471,7 +482,7 @@ accuracy_test() {
             python3 /sgl-workspace/sglang/benchmark/gsm8k/bench_sglang.py 
                 --port "$PORT" 
                 --num-questions 1200 
-                --parallel "${GSM8K_PARALLEL:-256}"
+                --parallel "${GSM8K_PARALLEL:-1200}"
         )
         log_command "$gsm8k_logfile" "${gsm8k_cmd[@]}"
         echo "$gsm8k_logfile" >> "$FINISH_LOG"
