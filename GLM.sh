@@ -119,11 +119,21 @@ NEED_DISABLE_SHARED_FUSION="false"
 case "${MODEL_NAME}" in
     *NVFP4*)
         QUANT_ARGS=(--quantization modelopt_fp4)
-        MEM_FRACTION_STATIC="0.9"
-        # FP4 default TP=4 — InferenceX runs both TP=4 and TP=8 for B200
-        # NVFP4 (yaml: { tp: 4, conc 4–256 } is the main sweep); we pick
-        # TP=4 so it cross-compares cleanly with MI355X MXFP4 also at TP=4.
-        [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
+        MEM_FRACTION_STATIC="0.8"
+        case "${MODEL_NAME}" in
+            *GLM-5.2*)
+                # GLM-5.2 (glm_moe_dsa): NVIDIA's HF card launches at TP=8
+                # But I need TP4
+                # (https://huggingface.co/nvidia/GLM-5.2-NVFP4).
+                [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
+                ;;
+            *)
+                # GLM-5 NVFP4 default TP=4 — InferenceX runs both TP=4 and TP=8
+                # for B200 NVFP4 (yaml: { tp: 4, conc 4–256 } is the main sweep);
+                # we pick TP=4 so it cross-compares cleanly with MI355X MXFP4 at TP=4.
+                [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
+                ;;
+        esac
         ;;
     *MXFP4*)
         # MXFP4 self-declares; shared experts are also MXFP4 -> fusion OK.
@@ -153,6 +163,8 @@ DATASET="random"
 in_out_tokens=("8192:1024" "1024:1024" "70000:300")
 random_range_ratio=0.8
 concurrencies=(4 8 16 32 64) # 128 256
+# in_out_tokens=("1024:1024")
+# concurrencies=(32 64)
 PROMPT_MULTIPLIER=5
 if [ "$PROF_COMBINED" == "true" ]; then
     PROF_CMD=(--profile --profile-num-steps 5)
@@ -362,6 +374,23 @@ start_server() {
             NEED_DISABLE_SHARED_FUSION="true"
             export SGLANG_ENABLE_HIP_DUAL_STREAM=1
         fi
+    elif [[ "${MODEL_NAME}" == *GLM-5.2* ]]; then
+        # GLM-5.2 (glm_moe_dsa) on B200: use NVIDIA's OFFICIAL HF launch settings
+        # verbatim (https://huggingface.co/nvidia/GLM-5.2-NVFP4):
+        #     --tp 8 --quantization modelopt_fp4 --tool-call-parser glm47
+        #     --reasoning-parser glm45 --trust-remote-code
+        #     --chunked-prefill-size 16384 --mem-fraction-static 0.80
+        # TP (8) / quant (modelopt_fp4) / parsers / trust-remote-code / mem-fraction
+        # (0.80) are already set above; here we only add the 16K prefill chunk.
+        # We deliberately do NOT apply the GLM-5 / GLM-5.1 B200 tuning block below
+        # (--attention-backend nsa, --enable-flashinfer-allreduce-fusion,
+        # --stream-interval 30, --moe-runner-backend, 32K chunking, --cuda-graph-max-bs):
+        # that combo triggered a reproducible TP all-gather (vocab-sized) deadlock on
+        # the DSA path. Letting sglang auto-pick backends matches NV's command and
+        # ran stably in testing.
+        cmd+=(
+            --chunked-prefill-size 16384
+        )
     else
         # NVIDIA (B200) specific optimizations. Matches InferenceX
         # glm5_fp4_b200.sh / glm5_fp8_b200.sh: trtllm NSA, flashinfer MoE,
@@ -578,6 +607,17 @@ if ! is_rocm_gpu_env; then
     if ! python3 -c "import distro" >/dev/null 2>&1; then
         python3 -m pip install --user --break-system-packages distro
     fi
+    # GLM-5.2 (nvidia/GLM-5.2-NVFP4) uses the glm_moe_dsa architecture, which the
+    # transformers pinned in lmsysorg/sglang images (==5.8.1) is too old to load
+    # ("layer_types entries must be in ... deepseek_sparse_attention"). Per the NV
+    # model card (https://huggingface.co/nvidia/GLM-5.2-NVFP4), upgrade transformers
+    # before launching. (--break-system-packages: same PEP 668 override as above.)
+    # Gated to GLM-5.2 only so other models (GLM-5 / GLM-5.1) keep the pinned version.
+    case "${MODEL_NAME}" in
+        *GLM-5.2*)
+            python3 -m pip install -U --break-system-packages "transformers>=5.3.0"
+            ;;
+    esac
 fi
 
 
