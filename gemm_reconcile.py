@@ -229,12 +229,16 @@ def cmd_reconcile(args):
             winners[k] = (best_b, best_post, backend_rows[best_b][k])
             final_pick[k] = backend_rows[best_b][k]
             chosen = best_b
-        elif k in native_rows:
-            # nobody beats default -> write explicit torch native row
+        elif args.write_native and k in native_rows:
+            # OPTIONAL: explicit torch-native row. OFF by default because, when this
+            # CSV is merged ON TOP of aiter's bundled configs, a torch-native row
+            # OVERRIDES aiter's already-tuned (often faster) kernel for that shape
+            # -> regression. By omitting it, "no improvement" shapes fall through to
+            # whatever the deployed base config (aiter's) provides.
             final_pick[k] = native_rows[k]
             chosen = "torch(native)"
         else:
-            chosen = best_b or "none"
+            chosen = "default" if not improved else (best_b or "none")
         # ledger row (record regardless of improvement)
         base = master_by_key.get(k, {})
         ledger_new.append({
@@ -322,6 +326,10 @@ def main():
     r.add_argument("--ledger", required=True)
     r.add_argument("--final", required=True)
     r.add_argument("--min-improvement-pct", type=float, default=5.0)
+    r.add_argument("--write-native", action="store_true", default=False,
+                   help="Also emit explicit torch-native rows for shapes no backend "
+                        "improved. OFF by default: such rows override a faster base "
+                        "(e.g. aiter) config when merged on top of it.")
     r.set_defaults(func=cmd_reconcile)
     fl = sub.add_parser("filter")
     fl.add_argument("--to-tune-dir", required=True, dest="to_tune_dir")

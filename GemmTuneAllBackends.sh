@@ -31,6 +31,7 @@ sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing' 2>/dev/null \
 GEMM_DIR="${HOME}/SGLang-benchmarks/amd_gemm_tuning/glm5.1_mxfp4_tp4"
 MASTER_INPUT="${GEMM_DIR}/glm5.1_mxfp4_gemm_input.csv"
 RECONCILE="${HOME}/SGLang-benchmarks/gemm_reconcile.py"
+PROGRESS="${HOME}/SGLang-benchmarks/gemm_progress.py"
 
 AITER_DIR="/sgl-workspace/aiter"
 TUNER_DIRECT="${AITER_DIR}/csrc/gemm_a16w16/gemm_a16w16_tune.py"   # non-hipblaslt
@@ -51,7 +52,13 @@ FINAL="${VERROOT}/tuned/glm5.1_mxfp4_bf16_tuned_gemm.csv"
 
 NGPU=8
 MIN_IMPROVEMENT_PCT=5
-COMMON_ARGS=( --splitK --warmup 10 --iters 50 --timeout 120 --batch 1
+# NOTE: --timeout omitted on purpose -> aiter default = None (no per-task timeout),
+# matching how aiter tuned its shipped configs. A 120s cap previously truncated the
+# flydsl/asm sweeps and missed the deep split_k kernels (small-M was much worse than
+# aiter). Trade-off: with no timeout a genuine GPU hang stalls the run (non-hipblaslt
+# backends here have no crash-retry wrapper); if that happens, re-add --timeout 1200
+# or run the hipblaslt-style subprocess wrapper.
+COMMON_ARGS=( --splitK --warmup 10 --iters 50 --batch 1
               --compare --update_improved --min_improvement_pct "${MIN_IMPROVEMENT_PCT}" )
 
 mkdir -p "${WORK}" "$(dirname "${FINAL}")"
@@ -152,19 +159,30 @@ for b in "${BACKENDS[@]}"; do
         continue
     fi
 
+    # live tqdm progress bar for this backend (tracks attempted shapes via the
+    # compare-report "batch N/M" headers across all GPUs). Best-effort.
+    rm -f "${BDIR}/.monitor_stop"
+    python3 "${PROGRESS}" --backend-dir "${BDIR}" --total "${REM}" &
+    monitor_pid=$!
+
     pids=()
     for g in $(seq 0 $((NGPU-1))); do
         shard="${BDIR}/remaining/shard_${g}.csv"
         [[ -s "${shard}" ]] || continue
         [[ "$(wc -l < "${shard}")" -gt 1 ]] || continue   # skip header-only
+        # Per-backend per-GPU stdout log: persists "timed out" / "No valid
+        # solutions" / "candidate count: 0" so we can later tell, per shape,
+        # whether a no-result was a TIMEOUT (recoverable with longer --timeout)
+        # or a genuine NO-SOLUTION. Appended so resumes keep history.
         CUDA_VISIBLE_DEVICES=${g} python3 "${tuner}" \
             --tuned_file "${BDIR}/shard_${g}.csv" \
             --input_file "${shard}" \
-            "${args[@]}" &
+            "${args[@]}" >> "${BDIR}/run_gpu${g}.log" 2>&1 &
         pids+=( "$!" )
     done
     pass_ok=1
     for pid in "${pids[@]}"; do wait "${pid}" || pass_ok=0; done
+    touch "${BDIR}/.monitor_stop"; wait "${monitor_pid}" 2>/dev/null || true
 
     elapsed=$((SECONDS-start))
     nproc=$(cat "${BDIR}"/compare_tmp/aiter_compare/*.candidate.csv 2>/dev/null | tail -n +2 | cut -d, -f3-5 | sort -u | wc -l)
