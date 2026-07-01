@@ -192,7 +192,7 @@ if [ "$PROF_ENABLED" == "true" ]; then
     PROMPT_MULTIPLIER=2 # Faster for no cuda graph profiling
 
     # Debug
-    in_out_tokens=("8192:1024")
+    in_out_tokens=("1024:1024" "8192:1024")
     concurrencies=(4)
 fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
@@ -661,8 +661,8 @@ for PROF_MODE in "${PROF_SERVER_MODES[@]}"; do
         run_benchmarks
     ) || echo "[warn] profiling mode '${PROF_MODE}' aborted (exit $?); continuing to cleanup and next mode."
 
+    echo "[${PROF_SERVER_MODES[@]}], now is the end of ${PROF_MODE}"
     pkill -9 python || true
-    pkill -f sglang || true
     sleep 10
 done
 
