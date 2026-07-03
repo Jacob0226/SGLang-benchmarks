@@ -663,6 +663,7 @@ for PROF_MODE in "${PROF_SERVER_MODES[@]}"; do
 
     echo "[${PROF_SERVER_MODES[@]}], now is the end of ${PROF_MODE}"
     pkill -9 python || true
+    pkill -9 sglang || true
     sleep 10
 done
 
