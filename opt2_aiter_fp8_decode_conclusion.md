@@ -45,11 +45,22 @@ Saved as `opt2_aiter_fp8_decode.patch`.
 
 | decode backend | GSM8K (200q) | Median TPOT | Output tok/s |
 |---|---|---|---|
-| tilelang (baseline)      | —          | **14.52 ms** | 259.9 |
-| aiter fp8 opt#2 (64 spl) | 0.945      | 24.55 ms     | 158.8 |
-| aiter fp8 opt#2 (16 spl) | 0.945      | 24.45 ms     | 158.7 |
+| tilelang (baseline)                | —     | **14.52 ms** | 259.9 |
+| aiter fp8 opt#2 (64 spl)           | 0.945 | 24.55 ms     | 158.8 |
+| aiter fp8 opt#2 (16 spl)           | 0.945 | 24.45 ms     | 158.7 |
+| aiter fp8 opt#2 (`--page-size 64`) | —     | 24.53 ms     | —     |
 
 Identical launch flags except `--nsa-decode-backend {tilelang|aiter}`.
+
+### `--page-size 64` experiment (empirical, per user request)
+Tested explicitly. Result: **no effect** on the aiter DSA decode.
+- `--page-size 64` → TPOT 24.53 ms (identical to the implicit run).
+- `--page-size 1` → server log still prints **"Setting page size to 64 for
+  DeepSeek DSA"** and `server_args.page_size=64`. **SGLang forces page_size=64 for
+  DeepSeek DSA** regardless of the flag, so the knob is not adjustable for GLM-5.2,
+  and `_forward_aiter` runs its internal `page_size=1` kernel layout either way.
+- (page_size 64 *does* help on some non-DSA models, where the flag is honored and
+  changes KV paging / the decode kernel — but that path is pinned here.)
 
 --------------------------------------------------------------------------------
 ## Why ATOM's MLA is faster, but the SGLang integration got 69% slower
