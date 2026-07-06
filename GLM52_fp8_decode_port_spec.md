@@ -207,3 +207,31 @@ decode branch. Much smaller than the spec's original "replace everything".
 - opt#2 diagnosis corrected: not a buffer-format port; both use compacted CSR +
   the same aiter kernel/metadata fn. Divergence isolated to `intra_batch_mode` /
   `topk` args in `_prepare_aiter_dsa_decode_metadata`. See table above.
+
+## opt#2 RESOLVED — aiter fp8 decode now works, but is SLOWER than tilelang
+
+The GPU-fault blocker is fixed. Enabling the aiter fp8 MLA decode core
+(`--nsa-decode-backend aiter --kv-cache-dtype fp8_e4m3`) required 4 changes in
+`dsa_backend.py` (saved as `opt2_aiter_fp8_decode.patch`):
+1. `intra_batch_mode=True -> False` (buffer sizing, runtime `get_mla_metadata_v1`,
+   and the kwarg passed into `mla_decode_fwd`) + drop `topk=` — fixes the OOB.
+2. Add `q_scale=ones` when Q is fp8 (asm kernel asserts `fp8 Q requires q_scale`).
+3. Force MLA output `o`/`o_kernel` to bf16 (`kn_mla_reduce_v1` rejects fp8 output).
+4. `aiter_dsa_max_split_per_batch 64 -> 16` (match ATOM; no measurable effect).
+
+**Validation (GLM-5.2-MXFP4, TP4, MI355X, isl1024/osl512, conc4):**
+
+| decode backend | GSM8K (200q) | Median TPOT | Output tok/s |
+|---|---|---|---|
+| tilelang (baseline) | — | **14.52 ms** | 259.9 |
+| aiter fp8 (opt#2)   | **0.945** | 24.45 ms | 158.7 |
+
+**Conclusion:** correctness is perfect (GSM8K 0.945, 0 invalid) but the aiter fp8
+decode core is ~69% **slower** than tilelang on MI355X for GLM-5.2. `num_kv_splits`
+tuning (64->16) did not move it. tilelang is the InferenceX-tuned MI355X default
+and wins here. ATOM's speed advantage in the side-by-side comes from its *whole*
+attention subsystem (seg-MLA `page_size>1` kernel + fused projections + tuning),
+not the decode core alone; swapping only the core kernel regresses. opt#2 is a
+correctness/enablement result, NOT a perf win — do not merge as an optimization
+on MI355X. Capturing ATOM's advantage would require the seg-MLA path, a much
+larger port.
