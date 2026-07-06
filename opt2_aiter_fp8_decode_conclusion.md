@@ -12,11 +12,12 @@
   runs correctly: **GSM8K 0.945**, 0 invalid.
 - But it is **~69% slower** than the current tilelang decode on MI355X:
   **median TPOT 24.45 ms vs 14.52 ms**.
-- Root cause: **tilelang is the tuned MI355X default**, and ATOM's real advantage
-  comes from its *whole* attention subsystem (seg-MLA `page_size>1` kernel + fused
-  projections + shape tuning), **not the decode core kernel alone**. Swapping only
-  the core kernel replaces a fast tilelang path with a slower generic aiter asm
-  path → regression.
+- Root cause (revised — see correction below): NOT seg-MLA. Both ATOM and this
+  SGLang path run the `page_size=1` decode. The most plausible cost is that
+  SGLang rebuilds the aiter decode metadata (`get_mla_metadata_v1`) and compacts
+  indices (`get_valid_kv_indices`) **per layer, every step (78x/step)**, while
+  ATOM builds it **once per step** and shares it across layers; plus tilelang is
+  the tuned MI355X default. Needs a kernel trace to confirm.
 - => opt#2 is a **correctness / enablement** result, **not** a perf win on MI355X.
   Kept on a separate WIP branch; the clean +5% opt#1 branch was not touched.
 
@@ -51,64 +52,82 @@ Saved as `opt2_aiter_fp8_decode.patch`.
 Identical launch flags except `--nsa-decode-backend {tilelang|aiter}`.
 
 --------------------------------------------------------------------------------
-## Why ATOM's MLA kernel is faster, but the SGLang integration got 69% slower
+## Why ATOM's MLA is faster, but the SGLang integration got 69% slower
 
-This is the key question. The short answer: **I only swapped one kernel, but
-ATOM's speed comes from a whole tuned pipeline — and the kernel I swapped *to* is
-slower than the tilelang kernel I swapped *from*.**
+### CORRECTION: it is NOT seg-MLA (an earlier draft wrongly said so)
+Verified from the ATOM source + run logs:
+- `atom/utils/envs.py`: `ATOM_MLA_PAGE_SIZE` **defaults to 1**, and `ATOM_GLM.sh`
+  does **not** set it. So `use_seg_mla = (not use_triton_mla) and
+  ATOM_MLA_PAGE_SIZE>1` is **False** — ATOM ran the **`page_size=1`** decode too.
+- ATOM run logs show `kv_cache_block_size=16` (the KV *pool* paging), which is
+  unrelated to the MLA decode kernel's `page_size`.
+- SGLang's `_forward_aiter` **hardcodes** `page_size=1`
+  (`kv_cache.view(-1,1,1,head_dim)`, metadata `page_size=1`), independent of the
+  server `--page-size`. The opt#2 run already had server `page_size=64` (KV pool)
+  and the decode still ran `page_size=1` internally.
 
-### 1. "ATOM is faster" was measured on the *whole attention block*, not the core
-In the side-by-side (`analysis_GLM5.2/...SideBySide_GLM5.2.xlsx`), the per-decode-
-layer **MLA section** is ATOM ~60 µs vs SGLang(tilelang) ~87 µs. That number sums
-**everything** in the attention block: input norm, q/k/v projections
-(`q_proj_and_k_up_proj`, `v_up_proj_and_o_proj`), RoPE + KV write, the decode core,
-and the reduce. ATOM wins that *aggregate* because of several subsystem-level
-choices, only one of which is the decode core:
+=> Setting `--page-size 64` cannot invoke seg-MLA for the aiter DSA decode, and
+ATOM does not use seg-MLA either. So seg-MLA is not the explanation.
 
-- **seg-MLA (`page_size>1`) asm kernel.** ATOM runs `use_seg_mla` (gated on
-  `ATOM_MLA_PAGE_SIZE>1`) with a padded q row stride and `num_kv_splits=None`
-  (kernel auto). This is a *different, newer asm kernel* than the `page_size=1`
-  persistent path. SGLang's aiter DSA decode uses the **`page_size=1`** path — the
-  slower variant.
-- **Fused projections** absorbed into fewer, well-shaped GEMMs.
-- **Shape-specific tuning** (ATOM ships tuned configs for its exact GLM shapes).
+### The real leading hypothesis: per-layer metadata rebuild overhead
+The `page_size=1` `mla_decode_fwd` **is the same kernel family** ATOM calls, so
+the core kernel is unlikely to be 69% slower on its own. What differs is
+**how often SGLang rebuilds the decode metadata**:
 
-### 2. What opt#2 actually did: replace *only* the core kernel
-opt#2 changed SGLang's decode from **tilelang** → **aiter `mla_decode_fwd`
-(page_size=1)**. Everything else (projections, norms, RoPE/KV write, the
-compacted-CSR index build) stayed as SGLang's. So we did **not** import ATOM's
-seg-MLA kernel, its fused projections, or its tuning — we imported the *generic*
-aiter asm decode core on the `page_size=1` path.
+- SGLang's `_forward_aiter` (called **once per layer, per decode step**) runs, on
+  the fp8 branch, both:
+  - `get_valid_kv_indices(...)` — compacts the `[bs, topk]` page table into CSR;
+  - `_prepare_aiter_dsa_decode_metadata(...)` → `get_mla_metadata_v1(...)` — the
+    persistent work-scheduling build.
+  With 78 layers that is **~78 rebuilds per decode step** (a GPU launch, and
+  possibly a sync, each time).
+- ATOM builds its decode metadata **once per step** in `prepare_decode` and
+  **shares** the work buffers across all layers (`_set_mla_persistent_worker_buffers`),
+  so the per-step scheduling cost is paid once, not 78x.
 
-### 3. The kernel we swapped *from* (tilelang) is the tuned MI355X default
-SGLang/InferenceX use **tilelang NSA decode as the MI355X default** precisely
-because it is well-tuned for gfx950 GLM decode. The aiter `mla_decode_fwd`
-`page_size=1` path is a generic fallback, not tuned for this shape/HW. So the swap
-went **fast tuned kernel → slow generic kernel** for this config.
+At conc4/bs≈4 the actual attention math is tiny, so this fixed per-layer launch
+overhead can easily dominate and explain the ~10 ms/token gap.
 
-### 4. Evidence that the core kernel path is the bottleneck (not scheduling)
-`num_kv_splits 64 → 16` (ATOM's value) changed TPOT by <0.1 ms (24.55 → 24.45).
-If over-splitting/reduce scheduling were the cost, 16 would have helped a lot at
-bs≈4. It didn't → the cost is inside the **`page_size=1` asm decode kernel itself**,
-consistent with it being the un-tuned/non-seg variant.
+### Supporting evidence
+`num_kv_splits 64 → 16` (ATOM's value) moved TPOT by <0.1 ms (24.55 → 24.45). If
+the decode kernel's KV-split/reduce work were the cost, 16 would have helped a lot
+at bs≈4; it didn't — pointing away from the kernel's inner loop and toward
+fixed per-call overhead (metadata/index rebuild + launch), which split count does
+not change.
 
-### 5. Net
-Faster ATOM attention ≠ faster aiter decode core. To actually beat tilelang on
-MI355X you'd need to port the **seg-MLA (`page_size>1`) path + fused projections +
-tuned configs**, i.e. the whole subsystem — a much larger change than the 4-line
-metadata/dtype fix that unblocked correctness. The 4 fixes are still valuable:
-they make the aiter fp8 decode path *functionally usable* in SGLang (which it
-wasn't before), and they document the exact ATOM↔SGLang contract mismatch.
+### Also contributing
+- **tilelang is the tuned MI355X default** (InferenceX). The aiter `page_size=1`
+  path is a generic fallback, not shape/HW-tuned for gfx950 GLM decode.
+- SGLang keeps its own (unfused) projections; ATOM's `q_proj_and_k_up` /
+  `v_up_proj_and_o` are fused — but that affects the projection GEMMs, not the
+  decode-vs-decode delta measured here.
+
+### Net / how to actually make opt#2 faster
+Not seg-MLA. The tractable levers, in order:
+1. **Hoist the aiter decode metadata build out of the per-layer path** — compute
+   `get_mla_metadata_v1` + `get_valid_kv_indices` once per step in
+   `init_forward_metadata` and reuse across layers (mirror ATOM). This is the most
+   likely big win and is a real code change, not a launch flag.
+2. Confirm first with a **kernel trace** of the aiter-in-SGLang decode: if
+   `get_mla_metadata` / `get_valid_kv_indices` appear ~78x/step, (1) is confirmed.
+3. Only if the kernel itself is slow, consider tuning configs for aiter
+   `mla_decode_fwd` on gfx950.
+
+The 4 correctness fixes remain valuable: they make the aiter fp8 decode path
+*functionally usable* in SGLang (it GPU-faulted before) and document the exact
+ATOM↔SGLang contract mismatch.
 
 --------------------------------------------------------------------------------
 ## Caveats / not yet done
 - Only one bench point (conc4, isl1024/osl512). Higher concurrency / longer
   contexts could shift the tilelang-vs-aiter gap, but tilelang is expected to keep
   the lead on MI355X.
-- Did **not** capture a kernel trace of the aiter-in-SGLang run; §4 above is
-  inferred from the split-count experiment + architecture, not from a per-kernel
-  profile. A trace would confirm the core-kernel attribution.
-- seg-MLA (`page_size>1`) path not attempted in SGLang.
+- Did **not** yet capture a kernel trace of the aiter-in-SGLang run; the
+  per-layer-metadata-rebuild hypothesis is inferred from the code + the split-count
+  experiment, not from a per-kernel profile. A trace is the next step to confirm.
+- seg-MLA (`page_size>1`) is a dead end here: neither ATOM nor SGLang's aiter DSA
+  decode uses it (both `page_size=1`); `--page-size 64` does not change the decode
+  kernel path.
 
 --------------------------------------------------------------------------------
 ## Artifacts
