@@ -358,6 +358,15 @@ start_server() {
             --nsa-decode-backend tilelang
             --tokenizer-worker-num $((TP_SIZE * 2))
         )
+        # opt#3: aiter fused allreduce(+residual+rmsnorm) replaces the unfused
+        # cross_device_reduce + add_rmsnorm_quant pair (~12us/layer on MI355X,
+        # matching ATOM's allreduce_fusion_kernel_1stage). gfx950-only path; enable
+        # only for the AMD MXFP4 GLM-5.1/5.2 recipes it was validated against.
+        case "${MODEL_NAME}" in
+            amd_GLM-5.1-MXFP4|amd_GLM-5.2-MXFP4)
+                cmd+=(--enable-aiter-allreduce-fusion)
+                ;;
+        esac
         if [ "$DUAL_STREAM_ROCM" == "true" ]; then
             # Two independent toggles must both be set for full ROCm dual-stream:
             #   (a) --disable-shared-experts-fusion
@@ -622,6 +631,25 @@ fi
 
 
 
+prof_mode_complete() {
+    # True (0) if every expected profile output for the CURRENT mode (LOG_DIR +
+    # PROMPT_MULTIPLIER already set for this mode) already exists on disk. Lets a
+    # re-run skip a whole mode — server launch + warmup + GSM8K included — and jump
+    # straight to the mode that still needs data (e.g. cuda-graph already profiled
+    # -> go directly to no-cuda-graph). Only meaningful in --prof mode.
+    [ "$PROF_ENABLED" == "true" ] || return 1
+    local io input_tokens output_tokens c num_prompts prof_dir
+    for io in "${in_out_tokens[@]}"; do
+        IFS=":" read -r input_tokens output_tokens <<< "$io"
+        for c in "${concurrencies[@]}"; do
+            num_prompts=$((c * PROMPT_MULTIPLIER))
+            prof_dir="${LOG_DIR}/prof_in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}${COMBINED_SUFFIX}"
+            [ -d "$prof_dir" ] || return 1
+        done
+    done
+    return 0
+}
+
 # ------------------- Start -----------------
 if [ "$PROF_ENABLED" == "true" ]; then
     PROF_SERVER_MODES=("default" "no-cuda-graph")
@@ -645,6 +673,14 @@ for PROF_MODE in "${PROF_SERVER_MODES[@]}"; do
         export SGLANG_TORCH_PROFILER_DIR=$LOG_DIR
     else
         LOG_DIR="${BASE_LOG_DIR}"
+    fi
+
+    # Smart skip: if this mode's profile dirs already exist, don't launch the
+    # server / warmup / GSM8K at all — jump to the next mode. (e.g. cuda-graph
+    # profiling already done -> go straight to no-cuda-graph.)
+    if prof_mode_complete; then
+        echo ">>> [${PROF_MODE}] all profile dirs already present under '${LOG_DIR}' — skipping server launch / warmup / gsm8k for this mode."
+        continue
     fi
 
     # Run each profiling mode inside a subshell so any fatal error — server

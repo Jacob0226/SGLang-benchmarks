@@ -35,6 +35,13 @@ def canon(sec, kn=""):
     if ("cross_device_reduce" in k or "all_reduce" in k or "allreduce" in k
             or "nccl" in k or "reduce_1stage" in k):
         return "norm/comm"
+    # q/k rmsnorm is MLA attention's internal q/k normalization (after q_a/kv_a
+    # down-proj), NOT the residual-stream input/post-attn layernorm. Force it to
+    # MLA_attention on both sides — ATOM annotates it under a generic "rmsnorm"
+    # module (which the "norm" rule below would wrongly send to norm/comm), while
+    # SGLang annotates it under DeepseekV2AttentionMLA.
+    if "fused_qk_rmsnorm" in k or "qk_rmsnorm" in k:
+        return "MLA_attention"
     s = str(sec).lower()
     if s.startswith("prepare_"):
         return "norm/comm"
