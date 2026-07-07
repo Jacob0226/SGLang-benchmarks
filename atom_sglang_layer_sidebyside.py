@@ -42,6 +42,13 @@ def canon(sec, kn=""):
     # SGLang annotates it under DeepseekV2AttentionMLA.
     if "fused_qk_rmsnorm" in k or "qk_rmsnorm" in k:
         return "MLA_attention"
+    # DSA sparse indexer kernels are part of attention (produce the topk selection);
+    # classify by name so ATOM's (which land under generic annotations / "other")
+    # and SGLang's line up in MLA_attention on both sides.
+    if any(t in k for t in ("kn_entry_2c", "paged_mqa_logits", "topk_transform",
+                            "radix_topk", "convert_req_index", "indexer_k_quant",
+                            "hadamard", "wv_splitk")):
+        return "MLA_attention"
     s = str(sec).lower()
     if s.startswith("prepare_"):
         return "norm/comm"
@@ -79,7 +86,7 @@ def graph_name_avg(evs):
     return {n:v[1]/v[0] for n,v in agg.items()}
 
 
-def atom_layer(evs):
+def atom_layer(evs, want_full=False):
     ks=_k(evs); p,t=_dom(ks); ks=[k for k in ks if (k["pid"],k["tid"])==(p,t)]
     ga=[a for a in _g(evs) if (a["pid"],a["tid"])==(p,t)]
     l0=sorted([a for a in ga if a["name"].startswith("model.layers.0.")],key=lambda a:a["ts"])
@@ -96,11 +103,21 @@ def atom_layer(evs):
             m=re.match(r"model\.layers\.(\d+)\.",a["name"])
             if m: lay[int(m.group(1))].append(a["ts"])
     layers=sorted(lay); lstart={n:min(lay[n]) for n in layers}
-    chosen=None
+    def _has_indexer(s0,s1):
+        # "full" indexer layer = runs the topk indexer this step (vs "shared" which
+        # reuses a prior layer's selection). Detected by the indexer kernels.
+        return any(("paged_mqa_logits" in k["name"] or "kn_entry_2c" in k["name"]
+                    or "topk_transform" in k["name"]) and s0<=k["ts"]<s1 for k in ks)
+    cands=[]
     for i,n in enumerate(layers):
         s0=lstart[n]; s1=lstart[layers[i+1]] if i+1<len(layers) else f1
         if n>=3 and any(a["name"]=="mxfp4_moe" and s0<=a["ts"]<s1 for a in ga):
-            chosen=(n,s0,s1); break
+            cands.append((n,s0,s1,_has_indexer(s0,s1)))
+    chosen=None
+    for (n,s0,s1,full) in cands:
+        if full==want_full: chosen=(n,s0,s1); break
+    if chosen is None and cands:
+        n,s0,s1,_=cands[0]; chosen=(n,s0,s1)
     if chosen is None:
         n=layers[len(layers)//2]; i=layers.index(n)
         chosen=(n,lstart[n],lstart[layers[i+1]] if i+1<len(layers) else f1)
@@ -125,23 +142,82 @@ def atom_layer(evs):
     return n, seq
 
 
-def sglang_layerB(path):
+def sglang_layer(path, want_full=False):
     wb=load_workbook(path,read_only=True,data_only=True);ws=wb.active
     hdr=[c.value for c in next(ws.iter_rows(min_row=1,max_row=1))];ix={h:i for i,h in enumerate(hdr)}
+    rows=list(ws.iter_rows(min_row=2,values_only=True)); wb.close()
+    # Auto-pick the MoE decode layer (matches the excel's "one MoE decode layer"):
+    # the layer-type group whose kernels include an MoE GEMM (mfma_moe / moe_sorting).
+    # Hardcoding "B" breaks across traces — e.g. the short-output (1024:16) no-graph
+    # trace groups dense full-indexer layers as A/B and the MoE layer as C.
+    layer_letters=[]
+    for row in rows:
+        lt=str(row[ix["LayerType"]] or "")
+        if lt and lt[0].isalpha() and lt[1:2]==":" and lt[0] not in layer_letters:
+            layer_letters.append(lt[0])
+    def _rows(L): return [r for r in rows if str(r[ix["LayerType"]] or "").startswith(L+":")]
+    def _has(L, *subs): return any(any(s in str(r[ix["KernelName"]] or "") for s in subs) for r in _rows(L))
+    def _is_moe(L):  return _has(L, "mfma_moe", "moe_sorting")
+    def _is_full(L): return _has(L, "paged_mqa_logits", "kn_entry_2c", "topk_transform")
+    # Prefer an MoE layer matching the requested indexer kind (shared/full); else any
+    # layer matching the kind (e.g. dense full-indexer if no full MoE layer captured);
+    # else the first group.
+    pick=None
+    for L in layer_letters:
+        if _is_moe(L) and _is_full(L)==want_full: pick=L; break
+    if pick is None:
+        for L in layer_letters:
+            if _is_full(L)==want_full: pick=L; break
+    if pick is None:
+        pick=layer_letters[0] if layer_letters else "B"
     seq=[]
-    for row in ws.iter_rows(min_row=2,values_only=True):
-        lt=str(row[ix["LayerType"]] or ""); kn=row[ix["KernelName"]]; sec=row[ix["Section"]]
-        if not kn or sec=="Subtotal" or not lt.startswith("B"): continue
+    for row in _rows(pick):
+        kn=row[ix["KernelName"]]; sec=row[ix["Section"]]
+        if not kn or sec=="Subtotal": continue
         av=row[ix["AvgDuration_us"]]
         try: av=float(av)
         except: av=0.0
         seq.append((canon(sec, kn), str(kn), av))
-    wb.close(); return seq
+    return pick, seq
+
+
+import subprocess, functools
+
+@functools.lru_cache(maxsize=8192)
+def _demangle(name):
+    # Traces store raw C++ Itanium-mangled symbols for aiter template kernels
+    # (e.g. _ZN5aiter30allreduce_fusion_kernel_1stageI...). Try a real demangler
+    # first (llvm-cxxfilt handles the bf16 `DF16b` mangling; binutils c++filt is
+    # often too old and returns it unchanged). If none works, fall back to a
+    # version-independent heuristic that pulls the clean function name out of the
+    # Itanium nested-name encoding (`_ZN <len><ns> <len><fn> ...`).
+    if not name.startswith("_Z"):
+        return name
+    for tool in ("llvm-cxxfilt", "c++filt"):
+        try:
+            out = subprocess.run([tool, "--", name], capture_output=True, text=True, timeout=5)
+            d = out.stdout.strip()
+            if out.returncode == 0 and d and not d.startswith("_Z"):
+                return d
+        except Exception:
+            pass
+    m = re.match(r"_ZN(.*)", name)
+    if m:
+        s = m.group(1); idents = []; i = 0
+        while i < len(s) and s[i].isdigit():
+            j = i
+            while j < len(s) and s[j].isdigit():
+                j += 1
+            ln = int(s[i:j]); idents.append(s[j:j + ln]); i = j + ln
+        if idents:
+            return idents[-1]  # innermost = function name (drops template/param mangling)
+    return name
 
 
 def short(n):
+    n=_demangle(str(n))
     n=n.split("(")[0]
-    for pre in ("void ","aiter::","_ZN5aiter","_ZN7sgl_hip","std::"): n=n.replace(pre,"")
+    for pre in ("void ","aiter::","_ZN5aiter","_ZN7sgl_hip","std::","__hip_","c10::"): n=n.replace(pre,"")
     return n[:52]
 
 
@@ -150,10 +226,15 @@ def main():
     ap.add_argument("--atom-time",required=True); ap.add_argument("--atom-struct",required=True)
     ap.add_argument("--sglang-step3",required=True); ap.add_argument("--out",required=True)
     ap.add_argument("--title",default="")
+    ap.add_argument("--layer-kind",choices=["shared","full"],default="shared",
+                    help="shared = MoE decode layer that reuses the indexer selection "
+                         "(default); full = a layer that runs the topk indexer this step.")
     a=ap.parse_args()
+    want_full=(a.layer_kind=="full")
     atom_time=graph_name_avg(load(a.atom_time))
-    ln,atom_seq=atom_layer(load(a.atom_struct))
-    sg_seq=sglang_layerB(a.sglang_step3)
+    ln,atom_seq=atom_layer(load(a.atom_struct), want_full)
+    sg_letter,sg_seq=sglang_layer(a.sglang_step3, want_full)
+    print(f"layer-kind={a.layer_kind}: ATOM layer {ln}, SGLang layer group {sg_letter}")
 
     A=[(s,short(k),round(atom_time.get(k,0.0),2)) for s,k in atom_seq]
     S=[(s,short(k),round(av,2)) for s,k,av in sg_seq]
@@ -165,7 +246,7 @@ def main():
         "norm/comm":PatternFill("solid",fgColor="FCE4D6"),
         "other":PatternFill("solid",fgColor="F2F2F2")}
     wb=Workbook(); ws=wb.active; ws.title="SideBySide"
-    ws.cell(1,1,a.title or f"one MoE decode layer, kernels in CALL order (ATOM layer {ln} | SGLang layer B)").font=BOLD
+    ws.cell(1,1,a.title or f"{a.layer_kind} decode layer, kernels in CALL order (ATOM layer {ln} | SGLang group {sg_letter})").font=BOLD
     hdr=["#","ATOM section","ATOM kernel","ATOM us","","SGLang section","SGLang kernel","SGLang us"]
     for c,h in enumerate(hdr,1):
         cell=ws.cell(2,c,h); cell.font=BOLD; cell.fill=HFILL; cell.alignment=Alignment(horizontal="center")
