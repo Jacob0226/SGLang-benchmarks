@@ -142,52 +142,38 @@ def _analyze(atom_time, atom_struct_evs, sg_time, sg_struct_evs, want_full):
     return ln, sg_layer, A, S, asum, ssum
 
 
-def _fill_sheet(ws, title, A, S, asum, ssum):
-    ws.cell(1, 1, title).font = BOLD
+BLOCK_W = 8   # columns per block: # | ATOM sec | ATOM kernel | ATOM us | spacer | SGLang sec | SGLang kernel | SGLang us
+GAP = 3       # blank columns between the shared and full blocks
+
+
+def _write_block(ws, c0, label, A, S, asum, ssum, body_rows):
+    ws.cell(1, c0, label).font = BOLD
     hdr = ["#", "ATOM section", "ATOM kernel", "ATOM us", "", "SGLang section", "SGLang kernel", "SGLang us"]
-    for c, h in enumerate(hdr, 1):
-        cell = ws.cell(2, c, h); cell.font = BOLD; cell.fill = HFILL; cell.alignment = Alignment(horizontal="center")
-    ws.freeze_panes = "A3"; r = 3
+    for j, h in enumerate(hdr):
+        cell = ws.cell(2, c0 + j, h); cell.font = BOLD; cell.fill = HFILL; cell.alignment = Alignment(horizontal="center")
+    r = 3
     for i in range(max(len(A), len(S))):
         asec, ak, au = A[i] if i < len(A) else ("", "", "")
         ssec, sk, su = S[i] if i < len(S) else ("", "", "")
-        ws.cell(r, 1, i).font = REG
-        for c, v in ((2, asec), (3, ak), (4, au)):
-            cell = ws.cell(r, c, v if v != "" else None); cell.font = REG
-            if c == 2 and asec in SF: cell.fill = SF[asec]
-        for c, v in ((6, ssec), (7, sk), (8, su)):
-            cell = ws.cell(r, c, v if v != "" else None); cell.font = REG
-            if c == 6 and ssec in SF: cell.fill = SF[ssec]
+        ws.cell(r, c0, i).font = REG
+        for j, v in ((1, asec), (2, ak), (3, au)):
+            cell = ws.cell(r, c0 + j, v if v != "" else None); cell.font = REG
+            if j == 1 and asec in SF: cell.fill = SF[asec]
+        for j, v in ((5, ssec), (6, sk), (7, su)):
+            cell = ws.cell(r, c0 + j, v if v != "" else None); cell.font = REG
+            if j == 5 and ssec in SF: cell.fill = SF[ssec]
         r += 1
-    r += 1; ws.cell(r, 2, "Section subtotals (us/layer)").font = BOLD; r += 1
-    ws.cell(r, 2, "Section").font = BOLD; ws.cell(r, 4, "ATOM").font = BOLD; ws.cell(r, 8, "SGLang").font = BOLD; r += 1
+    sr = body_rows + 4  # aligned subtotals across blocks
+    ws.cell(sr, c0 + 1, "Section subtotals (us/layer)").font = BOLD; sr += 1
+    ws.cell(sr, c0 + 1, "Section").font = BOLD; ws.cell(sr, c0 + 3, "ATOM").font = BOLD; ws.cell(sr, c0 + 7, "SGLang").font = BOLD; sr += 1
     for sec in SECTIONS:
-        ws.cell(r, 2, sec).font = REG
-        if sec in SF: ws.cell(r, 2).fill = SF[sec]
-        ws.cell(r, 4, round(asum.get(sec, 0.0), 1)).font = REG
-        ws.cell(r, 8, round(ssum.get(sec, 0.0), 1)).font = REG; r += 1
-    ws.cell(r, 2, "TOTAL").font = BOLD; ws.cell(r, 4, round(sum(asum.values()), 1)).font = BOLD
-    ws.cell(r, 8, round(sum(ssum.values()), 1)).font = BOLD
-    for c, w in enumerate([5, 14, 52, 9, 3, 14, 52, 9], 1): ws.column_dimensions[chr(64 + c)].width = w
-
-
-def _fill_summary(ws, res):
-    # res = {"shared": (asum,ssum), "full": (asum,ssum)}
-    ws.cell(1, 1, "GLM-5.2 decode-layer subtotals (us/layer): ATOM vs SGLang, shared & full").font = BOLD
-    cols = ["section", "ATOM shared", "SGLang shared", "Δ shared", "", "ATOM full", "SGLang full", "Δ full"]
-    for c, h in enumerate(cols, 1):
-        cell = ws.cell(3, c, h); cell.font = BOLD; cell.fill = HFILL; cell.alignment = Alignment(horizontal="center")
-    r = 4
-    for sec in SECTIONS + ["TOTAL"]:
-        ws.cell(r, 1, sec).font = BOLD if sec == "TOTAL" else REG
-        if sec in SF: ws.cell(r, 1).fill = SF[sec]
-        for kind, base in (("shared", 2), ("full", 6)):
-            asum, ssum = res[kind]
-            a = sum(asum.values()) if sec == "TOTAL" else asum.get(sec, 0.0)
-            s = sum(ssum.values()) if sec == "TOTAL" else ssum.get(sec, 0.0)
-            ws.cell(r, base, round(a, 1)); ws.cell(r, base + 1, round(s, 1)); ws.cell(r, base + 2, round(s - a, 1))
-        r += 1
-    for c, w in enumerate([16, 12, 13, 9, 3, 12, 11, 9], 1): ws.column_dimensions[chr(64 + c)].width = w
+        ws.cell(sr, c0 + 1, sec).font = REG
+        if sec in SF: ws.cell(sr, c0 + 1).fill = SF[sec]
+        ws.cell(sr, c0 + 3, round(asum.get(sec, 0.0), 1)).font = REG
+        ws.cell(sr, c0 + 7, round(ssum.get(sec, 0.0), 1)).font = REG; sr += 1
+    ws.cell(sr, c0 + 1, "TOTAL").font = BOLD
+    ws.cell(sr, c0 + 3, round(sum(asum.values()), 1)).font = BOLD
+    ws.cell(sr, c0 + 7, round(sum(ssum.values()), 1)).font = BOLD
 
 
 def build(atom_time_p, atom_struct_p, sg_time_p, sg_struct_p, out_p, kinds, title):
@@ -197,22 +183,27 @@ def build(atom_time_p, atom_struct_p, sg_time_p, sg_struct_p, out_p, kinds, titl
     sg_time = _sglang_kernel_time_avg(load(sg_time_p))
     sg_struct_evs = load(sg_struct_p)
 
-    wb = Workbook()
-    summary_ws = wb.active; summary_ws.title = "Summary"
-    res = {}
-    for kind in kinds:
-        want_full = (kind == "full")
-        ln, sgl, A, S, asum, ssum = _analyze(atom_time, atom_struct_evs, sg_time, sg_struct_evs, want_full)
-        res[kind] = (asum, ssum)
-        ws = wb.create_sheet(title=kind.capitalize())
-        _fill_sheet(ws, f"{title} [{kind}] (ATOM layer {ln} | SGLang layer {sgl})", A, S, asum, ssum)
+    order = [k for k in ("shared", "full") if k in kinds]
+    data = {}
+    for kind in order:
+        ln, sgl, A, S, asum, ssum = _analyze(atom_time, atom_struct_evs, sg_time, sg_struct_evs, kind == "full")
+        data[kind] = (ln, sgl, A, S, asum, ssum)
         print(f"[{kind}] ATOM layer {ln} | SGLang layer {sgl} | "
               + "ATOM " + ",".join(f"{s}={asum.get(s,0):.1f}" for s in SECTIONS)
               + " | SGLang " + ",".join(f"{s}={ssum.get(s,0):.1f}" for s in SECTIONS))
-    if len(kinds) == 2:
-        _fill_summary(summary_ws, res)
-    else:
-        wb.remove(summary_ws)
+
+    body_rows = max(max(len(d[2]), len(d[3])) for d in data.values())
+    wb = Workbook(); ws = wb.active; ws.title = "SideBySide"
+    for bi, kind in enumerate(order):
+        ln, sgl, A, S, asum, ssum = data[kind]
+        c0 = 1 + bi * (BLOCK_W + GAP)
+        _write_block(ws, c0, f"{kind.upper()}  (ATOM layer {ln} | SGLang layer {sgl})  —  {title}",
+                     A, S, asum, ssum, body_rows)
+    for bi in range(len(order)):
+        c0 = 1 + bi * (BLOCK_W + GAP)
+        for j, w in enumerate([5, 14, 46, 9, 3, 14, 46, 9]):
+            ws.column_dimensions[chr(64 + c0 + j)].width = w
+    ws.freeze_panes = "A3"
     wb.save(out_p); print("written", out_p)
 
 
