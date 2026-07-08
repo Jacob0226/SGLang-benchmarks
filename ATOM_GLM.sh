@@ -26,7 +26,7 @@ esac; done
 
 _M="${MODEL%/}"; MODEL_NAME="$(basename "$(dirname "$_M")")_$(basename "$_M")"
 DOCKER_FN=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
-HOST="localhost"; DATASET="random"; RANGE_RATIO=1.0
+HOST="localhost"; DATASET="random"; RANGE_RATIO=0.8
 VENDOR_TAG="${VENDOR_TAG:-AMD}"   # inserted into GLM.sh-style trace filenames
 
 export SAFETENSORS_FAST_GPU=1
@@ -42,7 +42,7 @@ GSM8K_CONCURRENT="${GSM8K_CONCURRENT:-65}"
 
 # Benchmark sweep. Override via env for smoke tests, e.g.
 #   IN_OUT="512:64" CONC="4" ./ATOM_GLM.sh --prof
-IFS=' ' read -ra in_out <<< "${IN_OUT:-8192:1024 1024:1024 70000:300}"
+IFS=' ' read -ra in_out <<< "${IN_OUT:-1024:1024 8192:1024 70000:300}"
 IFS=' ' read -ra concurrencies <<< "${CONC:-4 8 16 32 64}"
 MULT=5
 SPECIAL="-bench"
