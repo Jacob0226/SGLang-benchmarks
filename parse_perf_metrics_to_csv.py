@@ -302,8 +302,8 @@ def build_summary_row(record: dict, tp: int):
         "concurrency": record.get("concurrency", ""),
         INTERACTIVITY_HDR: interactivity,
         TPUT_PER_GPU_HDR: tput_per_gpu,
-        "TTFT": median_ttft_ms if median_ttft_ms is not None else "",
-        "TPOT": median_tpot_ms if median_tpot_ms is not None else "",
+        "TTFT": int(round(median_ttft_ms)) if median_ttft_ms is not None else "",
+        "TPOT": round(median_tpot_ms, 1) if median_tpot_ms is not None else "",
     }
 
 
@@ -323,23 +323,27 @@ def _build_side_by_side(records, ordered_columns, tp):
     return summary_header, summary_rows, full_header, full_rows, row_keys
 
 
-def build_meta_block(*, variant=None, image=None, framework=None,
-                     precision=None, tp=None, accuracy=None, run_date=None):
-    """組左上角的 metadata 區塊 (每項一列 [label, value])。空值略過。"""
-    rows = []
-    pairs = [
-        ("Model", variant),
-        ("Image", image),
-        ("Framework", framework),
-        ("Precision", precision),
-        ("TP", f"TP{tp}" if tp else None),
-        ("Accuracy", accuracy),
-        ("Date", run_date),
+def build_meta_block(*, hardware=None, framework=None, precision=None, tp=None,
+                     image=None, commit=None, machine=None, accuracy=None):
+    """組頂端的 metadata 區塊，layout 與交付表格一致：
+        [Hardware, Framework, PRECISION, "", TPn]
+        [Docker, image]
+        [Commit, commit_url]
+        [Machine, machine, Accuracy, accuracy]
+    """
+    return [
+        [
+            hardware or "",
+            framework or "",
+            (precision or "").upper(),
+            "",
+            f"TP{tp}" if tp else "",
+        ],
+        ["Docker", image or ""],
+        ["Commit", commit or ""],
+        ["Machine", machine or "", "Accuracy",
+         accuracy if accuracy is not None else ""],
     ]
-    for label, value in pairs:
-        if value not in (None, ""):
-            rows.append([label, value])
-    return rows
 
 
 def build_geomean_row(summary_rows, group_key):
@@ -364,71 +368,48 @@ def build_geomean_row(summary_rows, group_key):
 
 def write_csv(records, column_order, output_csv, *, tp, accuracy=None,
               meta=None):
-    """左右並排輸出：
-      左上角 metadata 區塊 (Model / Image / Framework / Precision / TP /
-        Accuracy / Date，每項一列)
-      左表 = summary (input_len/output_len/concurrency/Interactivity/
-             Token TPUT per GPU/TTFT/TPOT，TTFT、TPOT 取 median)，
-             每個 input/output 群組底部附一列 geomean
-      中間空 GAP_COLS 欄
-      右表 = 其他 parse 來的完整 metrics
+    """輸出交付格式：
+      頂端 metadata 區塊 (Hardware/Framework/Precision/TP、Docker、Commit、
+        Machine + Accuracy)，空一列後接 summary 表格。
+      summary 表 = input_len / output_len / concurrency / Interactivity /
+        Token TPUT per GPU / TTFT / TPOT (TTFT、TPOT 取 median 取整)。
+      不同 input/output 長度群組 (i1k、i8k…) 之間插入一列空白。
     """
     if not records:
         print("No records found to write.")
         return
 
-    front_columns = ["input_len", "output_len", "concurrency", "source_file"]
-    middle_columns = [
-        c for c in column_order
-        if c not in front_columns and c not in DERIVED_COLUMNS
-    ]
-    ordered_columns = front_columns + middle_columns + DERIVED_COLUMNS
-
-    (summary_header, summary_rows,
-     full_header, full_rows, row_keys) = _build_side_by_side(
-        records, ordered_columns, tp)
+    summary_rows, row_keys = [], []
+    for r in records:
+        srow = build_summary_row(r, tp)
+        summary_rows.append([srow[c] for c in SUMMARY_COLUMNS])
+        row_keys.append((r.get("input_len"), r.get("output_len")))
 
     meta = meta or {}
     meta_block = build_meta_block(
-        variant=meta.get("variant"),
-        image=meta.get("image"),
+        hardware=meta.get("hardware"),
         framework=meta.get("framework"),
         precision=meta.get("precision"),
         tp=tp,
+        image=meta.get("image"),
+        commit=meta.get("commit"),
+        machine=meta.get("machine"),
         accuracy=accuracy,
-        run_date=meta.get("run_date"),
     )
-    gap = [""] * GAP_COLS  # 左右兩表中間空白欄
-    full_width = len(full_header)
 
-    # CSV：左上角先放 metadata 區塊，空一列後接表格本體。
-    #      左右並排，中間留 GAP_COLS 個空白欄；不同 input/output 長度群組
-    #      (i1k、i8k...) 各自結尾附一列 geomean，群組之間再插入空白列。
     with open(output_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         for row in meta_block:
             writer.writerow(row)
-        if meta_block:
-            writer.writerow([])
+        writer.writerow([])
+        writer.writerow(SUMMARY_COLUMNS)
 
-        writer.writerow(summary_header + gap + full_header)
-
-        # 先依群組收集 summary_rows，才能算每組 geomean。
-        groups = []  # list of (key, [summary_rows], [full_rows])
-        for s_row, f_row, key in zip(summary_rows, full_rows, row_keys):
-            if not groups or groups[-1][0] != key:
-                groups.append((key, [], []))
-            groups[-1][1].append(s_row)
-            groups[-1][2].append(f_row)
-
-        for gi, (key, s_rows, f_rows) in enumerate(groups):
-            if gi > 0:
+        prev_key = None
+        for s_row, key in zip(summary_rows, row_keys):
+            if prev_key is not None and key != prev_key:
                 writer.writerow([])  # 群組間空白列
-            for s_row, f_row in zip(s_rows, f_rows):
-                writer.writerow(s_row + gap + f_row)
-            # 群組 geomean (右表對應位置留空)
-            geo_row = build_geomean_row(s_rows, key)
-            writer.writerow(geo_row + gap + [""] * full_width)
+            writer.writerow(s_row)
+            prev_key = key
 
 
 def main():
@@ -484,6 +465,24 @@ def main():
         type=str,
         default="",
         help="Docker image tag。預設空字串。",
+    )
+    parser.add_argument(
+        "--hardware",
+        type=str,
+        default="MI355X",
+        help="硬體名稱 (metadata 第一列)。預設 'MI355X'。",
+    )
+    parser.add_argument(
+        "--machine",
+        type=str,
+        default="",
+        help="Machine hostname (metadata)。預設空字串。",
+    )
+    parser.add_argument(
+        "--commit",
+        type=str,
+        default="",
+        help="Commit URL (metadata)。預設空字串。",
     )
     parser.add_argument(
         "--date",
@@ -574,11 +573,12 @@ def main():
         tp=tp_size,
         accuracy=accuracy,
         meta=dict(
-            variant=variant,
+            hardware=args.hardware,
             image=image,
             framework=framework,
             precision=precision,
-            run_date=run_date,
+            machine=args.machine,
+            commit=args.commit,
         ),
     )
 

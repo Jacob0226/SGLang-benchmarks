@@ -160,9 +160,14 @@ HOST="localhost"
 # Override with `--port <n>` or `PORT=<n> ./GLM.sh`. Default 8552.
 PORT="${PORT:-8234}"
 DATASET="random"
-in_out_tokens=("8192:1024" "1024:1024" "70000:300")
+in_out_tokens=("1024:1024" "8192:1024"  "70000:300")
 random_range_ratio=0.8
 concurrencies=(4 8 16 32 64) # 128 256
+# Optional env overrides (space-separated), e.g. for a targeted single-config
+# rerun without editing this file:
+#   IN_OUT_OVERRIDE="1024:1024" CONC_OVERRIDE="8" ./GLM.sh ...
+if [ -n "${IN_OUT_OVERRIDE:-}" ]; then read -ra in_out_tokens <<< "$IN_OUT_OVERRIDE"; fi
+if [ -n "${CONC_OVERRIDE:-}" ]; then read -ra concurrencies <<< "$CONC_OVERRIDE"; fi
 # in_out_tokens=("1024:1024")
 # concurrencies=(32 64)
 PROMPT_MULTIPLIER=5
@@ -192,7 +197,7 @@ if [ "$PROF_ENABLED" == "true" ]; then
     PROMPT_MULTIPLIER=2 # Faster for no cuda graph profiling
 
     # Debug
-    in_out_tokens=("1024:1024" "8192:1024")
+    in_out_tokens=("1024:16" "8192:16")
     concurrencies=(4)
 fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
@@ -496,11 +501,11 @@ warmup() {
         --port "${PORT}" 
         --model "${MODEL_PATH}" 
         --dataset-name "${DATASET}" 
-        --random-input 2048
-        --random-output 256
+        --random-input 1024
+        --random-output 16
         --random-range-ratio "${random_range_ratio}"
         --max-concurrency 4 
-        --num-prompt 8 
+        --num-prompt 4 
         --output-file /dev/null
     )
     log_command "$warmup_log" "${warmup_cmd[@]}"

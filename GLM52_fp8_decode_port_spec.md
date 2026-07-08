@@ -203,7 +203,22 @@ decode branch. Much smaller than the spec's original "replace everything".
 ## Done in this investigation
 - opt#1 (fp8 MLA absorbed bmm for GLM) — landed on branch
   `jacob/glm-mla-fp8-absorbed-bmm` (Jacob0226/sglang). 15.66→14.89 ms, GSM8K 0.929.
-- opt#3 (fused allreduce) — skipped; SGLang norm/comm already ≤ ATOM per trace.
+- opt#3 (fused allreduce) — **CORRECTION: not a valid skip.** The earlier "SGLang
+  norm/comm ≤ ATOM" was read off the excel *section subtotal* (norm/comm ATOM 37 vs
+  SGLang 22.1), which is **miscategorised** (one of SGLang's two
+  `cross_device_reduce` got bucketed into MoE/MLP, and the residual-add+rmsnorm
+  around the MLA output is counted under MLA_attention). At the **kernel level** ATOM
+  is faster: per allreduce+norm event ATOM fuses `allreduce_fusion_kernel_1stage` =
+  **11.19us**, vs SGLang unfused `26cross_device_reduce_1stage` (12.21) +
+  `24add_rmsnorm_quant_kernel` (4.94) = **17.15us**; ×2/layer → ATOM **22.4us** vs
+  SGLang **34.3us**, i.e. ATOM ~**12us/layer faster** on comm+norm. opt#3 is real.
+  SGLang already ships the equivalent: `--enable-aiter-allreduce-fusion`
+  (`communicator.py::apply_aiter_all_reduce_fusion`, gated only off CP/deterministic),
+  which routes to aiter's fused allreduce(+residual+rmsnorm) — the same
+  `allreduce_fusion_kernel_1stage` family ATOM uses. So opt#3 ≈ *enable that flag*
+  (and confirm the GLM-5.2 model tags `hidden_states._sglang_needs_allreduce_fusion`),
+  not a new kernel. NOT overlapping with PR #30195 (that fuses the *indexer q/k RoPE*
+  `kn_entry_2c_...` → `apply_rope_inplace`, a different kernel).
 - opt#2 diagnosis corrected: not a buffer-format port; both use compacted CSR +
   the same aiter kernel/metadata fn. Divergence isolated to `intra_batch_mode` /
   `topk` args in `_prepare_aiter_dsa_decode_metadata`. See table above.
@@ -226,12 +241,169 @@ The GPU-fault blocker is fixed. Enabling the aiter fp8 MLA decode core
 | tilelang (baseline) | — | **14.52 ms** | 259.9 |
 | aiter fp8 (opt#2)   | **0.945** | 24.45 ms | 158.7 |
 
-**Conclusion:** correctness is perfect (GSM8K 0.945, 0 invalid) but the aiter fp8
-decode core is ~69% **slower** than tilelang on MI355X for GLM-5.2. `num_kv_splits`
-tuning (64->16) did not move it. tilelang is the InferenceX-tuned MI355X default
-and wins here. ATOM's speed advantage in the side-by-side comes from its *whole*
-attention subsystem (seg-MLA `page_size>1` kernel + fused projections + tuning),
-not the decode core alone; swapping only the core kernel regresses. opt#2 is a
-correctness/enablement result, NOT a perf win — do not merge as an optimization
-on MI355X. Capturing ATOM's advantage would require the seg-MLA path, a much
-larger port.
+**Conclusion (SUPERSEDED — see below):** correctness is perfect (GSM8K 0.945) but
+the aiter fp8 decode core was ~69% **slower** than tilelang. The earlier verdict
+("do not merge; tilelang wins; would need seg-MLA") was **wrong about the cause**.
+
+--------------------------------------------------------------------------------
+## opt#2 FIXED — the 69% was per-layer metadata rebuild, now hoisted → parity
+
+**Root cause (confirmed by microbench + CUDA-graph capture, `tools/glm52_aiter_decode_microbench.py`):**
+The aiter kernel itself was never the problem. It is the *correct* ATOM kernel
+`mla_a8w8_qh16_qseqlen1_gqaratio16_ps` and runs at **16us captured** — matching
+ATOM's ~13.7us (mla+reduce). The regression was that SGLang's `_forward_aiter`
+rebuilt the aiter decode **work-schedule** (`get_mla_metadata_v1`, ~85us) +
+compacted indices (`get_valid_kv_indices`, ~31us) **once per layer = 75x/step**,
+all captured *inside* the decode CUDA graph. ATOM builds the schedule **once per
+step** and shares it.
+
+Deployment-accurate per-decode-step MLA cost, captured in a CUDA graph (bs=4,
+seq≈1400, nhead=16, 75 layers):
+
+| strategy | ms/step |
+|---|---|
+| CURRENT opt#2 (rebuild schedule ×75) | **9.03** |
+| FIX: hoist `get_mla_metadata_v1` ×1/step | **2.14** (−6.9 ms) |
+| upper bound: hoist schedule + compaction ×1/step | 0.96 |
+
+The ~9 ms/step rebuild ≈ the +9.9 ms TPOT regression measured end-to-end.
+
+**Fix (`opt2_aiter_fp8_decode_hoisted.patch`, on top of the 4 opt#2 correctness
+edits):** hoist the schedule build out of the per-layer path into the metadata-prep
+hooks — `init_forward_metadata` (eager), `_build_forward_metadata_cuda_graph`
+(capture), and `_apply_cuda_graph_metadata` (replay) — via a new
+`_build_aiter_dsa_decode_schedule(...)`. It writes once per step into the
+persistent `self.aiter_dsa_work_*` buffers (built *outside* the captured graph,
+same pattern SGLang already uses for the DeepGEMM paged-MQA schedule), keyed on
+`dsa_cu_seqlens_k` (the topk-clipped KV counts, identical across all MLA layers in
+a step). `_forward_aiter` now only *consumes* those buffers + runs the per-layer
+index compaction. CUDA-graph-safe: control flow / kernel pointers are stable; only
+buffer contents are refreshed per replay.
+
+**Validation (GLM-5.2-MXFP4, TP4, MI355X, isl1024/osl512, conc4, same box/flags,
+`--cuda-graph-max-bs 64`, GPUs 4-7):**
+
+| decode backend | Median TPOT | GSM8K(200) |
+|---|---|---|
+| tilelang (tuned MI355X default) | 16.12 ms | 0.955 |
+| aiter fp8 opt#2 (before hoist)  | 24.45 ms | 0.945 |
+| **aiter fp8 opt#2 + hoist**     | **16.82 ms** | **0.960** |
+
+The fix turns a **69% regression into ~4% (parity)** with the tuned tilelang
+default, correctness preserved, and validates the aiter fp8 decode core runs at
+ATOM speed. A follow-up experiment hoisting/parallelising `get_valid_kv_indices`
+too (front-packed fast copy, `tools`) was **correct (GSM8K 0.940) but gave no
+speedup** at bs=4 (16.83 ms) — the compaction overlaps other work and is not the
+bottleneck. Remaining gap to ATOM (11.73 ms) is ATOM's *fused projections + whole
+attention subsystem*, not the decode core — a separate, larger effort.
+
+Artifacts: `opt2_aiter_fp8_decode_hoisted.patch`,
+`tools/glm52_aiter_decode_microbench.py`, `tools/glm52_decode_bench.sh`,
+bench logs under `tmp/opt2_bench/`.
+
+--------------------------------------------------------------------------------
+## Why the excel's "aiter core is faster" does NOT make the decode faster
+
+The excel (conc4) shows the isolated aiter core `mla_a8w8...ps` (8.01) + `kn_mla_
+reduce_v1_ps` (5.69) = 13.7us BEATING tilelang `main_kernel`×2 = 18.6us. But the
+aiter decode *path* is still not faster end-to-end. Two reasons, confirmed by
+adding the **i1k-o1k conc64** config:
+
+**1. Extra work the excel's single-kernel view hides.** The aiter path must, per
+decode step, also (a) build the persistent work-schedule `get_mla_metadata_v1`
+and (b) compact the sparse selection into CSR `get_valid_kv_indices`. tilelang's
+`main_kernel` consumes the `[bs, topk]` padded page-table *directly* and pays
+neither. The schedule build **scales ~O(bs·CUs)**: microbench captured cost
+85us @bs4 -> **545us @bs64**. Even hoisted to once/step it is pure overhead
+tilelang doesn't have.
+
+**2. conc64 measurement (same box/flags, `--cuda-graph-max-bs 64`):**
+
+| config | metric | tilelang | aiter+hoist |
+|---|---|---|---|
+| conc4  | median TPOT   | 16.12 ms | 16.89 ms |
+| conc64 | median TPOT   | 33.18 ms | 38.02 ms |
+| conc64 | **median ITL**(steady state) | 28.30 ms | **29.11 ms** |
+| conc64 | mean ITL      | 32.95 ms | 61.11 ms |
+| conc64 | P99 ITL       | 128 ms   | 324 ms |
+| conc64 | **max ITL**   | 2.7 s    | **31.1 s** |
+| conc64 | output tok/s  | 1827     | 1010 |
+
+**The conc64 gap was a cuda-graph-cap artifact I introduced, not a kernel deficit
+and NOT a real tuning requirement.** SGLang's *default* decode `max_bs` on MI355X
+is **512** (`server_args.py` gpu_mem>160GB branch), which already covers conc64
+(peak running bs ~72). My bench script had capped `--cuda-graph-max-bs 64` only to
+dodge a capture-time OOM at `--mem-fraction-static 0.85` (the default 512-bucket
+capture ran the GPU out of memory: "Capturing batches bs=496 avail 12.47GB, tried
+16GB"). That 64 cap (< peak 72) forced some decode steps to **eager**, and eager
+hurts the aiter path far more than tilelang (its per-step schedule build ~545us@bs64
++ index compaction + more launches run un-captured) → the 31s max-ITL tail. The
+correct fix is to keep the default max_bs (or any value ≥ peak) and instead lower
+`--mem-fraction-static` so the capture fits; setting 96 just happened to clear the
+peak. Re-running with `--cuda-graph-max-bs 96` (≥ peak) collapses the tail:
+
+| conc64 (i1k-o1k) | tilelang g64 | aiter g64 | **aiter g96** |
+|---|---|---|---|
+| output tok/s | 1827 | 1010 | **1798** |
+| mean TPOT | 32.89 | 61.00 | **33.40** |
+| median ITL | 28.30 | 29.11 | 29.08 |
+| P99 ITL | 128 | 324 | **127** |
+| max ITL | 2.7 s | 31.1 s | **2.71 s** |
+
+**Final verdict:** with the graph cap set above peak concurrency, aiter fp8 decode
+**matches tilelang at conc64** (throughput 1798 vs 1827, identical max ITL) and is
+at parity at conc4. So the excel's isolated core-kernel win (13.7 vs 18.6us) is
+real but does NOT make the *path* faster: aiter pays a per-step schedule build +
+per-layer CSR compaction that tilelang's kernel avoids (it consumes the padded
+`[bs,topk]` table directly), which nets out to parity. To make aiter actually
+*beat* tilelang would require removing that overhead — feed the padded table to
+the kernel directly (the `intra_batch_mode` topk-strided path, currently faulting)
+and/or fold the schedule build into the graph — plus ATOM's fused projections for
+the rest of the layer. **Operational takeaway: the default decode max_bs (512 on
+MI355X) already covers these workloads; do NOT cap it below peak running batch for
+the aiter DSA decode (my 64 cap caused the tail). If capture OOMs, lower
+`--mem-fraction-static`, don't shrink max_bs below peak.**
+
+--------------------------------------------------------------------------------
+## ATOM vs SGLang: who runs get_mla_metadata_v1 / the CSR compaction (verified)
+
+Both schemes feed the aiter `mla_decode_fwd` a persistent work-schedule + a
+compacted CSR kv-index buffer — the difference is *where/how often*.
+
+| step | ATOM | SGLang (pre-fix) | SGLang (post-fix) |
+|---|---|---|---|
+| `get_mla_metadata_v1` (schedule) | **once/step** in `prepare_decode` → `_set_ubatch_mla_buffers` (`aiter_mla.py:1331`), keyed on `sparse_kv_indptr` | **per layer ×78** in `_forward_aiter` | **once/step** in metadata-prep (matches ATOM) |
+| CSR `kv_indices` compaction | **not a separate per-layer pass** — the indexer writes the compacted `sparse_kv_indices_buffer` directly, and `sparse_kv_indptr` is built once/step (`aiter_mla.py:598-603`); every attention layer *reads* that shared buffer | **per layer** via `get_valid_kv_indices` (compacts the `[bs,topk]` padded `page_table_1`) | still **per layer** (unchanged) |
+
+**So does ATOM "do" them?** Yes — ATOM calls the *same* `get_mla_metadata_v1`,
+but once per step and shared across all 78 layers. It has *no* per-layer
+`get_valid_kv_indices` because its **indexer emits the compacted CSR directly**
+into a buffer shared by every layer.
+
+**Why did SGLang "need" the per-layer versions?** Not a hard requirement — it is
+SGLang's DSA representation. SGLang's sparse selection is a `-1`-padded
+`[bs, topk]` page table (`transform_index_page_table_decode`), the format its
+*other* decode backends (tilelang, flashmla) consume **directly**. The aiter
+kernel instead wants compacted CSR, so `_forward_aiter` runs `get_valid_kv_indices`
+as an adapter — per layer, because each layer's topk selection differs. The
+schedule was *also* rebuilt per layer purely by omission (it was written inside
+`_forward_aiter`); nothing required that, which is why hoisting it to once/step
+(this fix) is safe and matches ATOM. Fully matching ATOM on the compaction too
+would require SGLang's indexer to emit compacted CSR directly (bigger change);
+measured, it is not the bottleneck at the tested batch sizes.
+
+--------------------------------------------------------------------------------
+## Provenance of the "16us@bs4 → 24us@bs64" kernel numbers (NOT a server profile)
+
+These are from the **microbench** `tools/glm52_aiter_decode_microbench.py`, the
+`-- CUDA graph capture test (per-call) --` → `capture kernel-only` line, which
+times `aiter.mla.mla_decode_fwd()` **in isolation** (stage1 asm + `kn_mla_reduce`
+bundled) via `torch.cuda.Event` over 50 CUDA-graph replays at GLM-5.2 decode
+shapes (nhead=16, d=576, v=512, topk=2048, seq≈1400):
+- `--bs 4`  → `capture kernel-only: replay 15.6–16.2 us`
+- `--bs 64` → `capture kernel-only: replay 24.4 us`
+
+This is an isolated-kernel microbench, **not** a torch-profiler trace of the live
+server like the ATOM excel. A real per-kernel profile of the running SGLang
+conc64 decode (via `--profile` + trace parse) has **not** been captured yet; that
+is the correct next step to state per-kernel decode times with excel-level rigor.
