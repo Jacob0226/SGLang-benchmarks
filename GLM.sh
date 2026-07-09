@@ -155,6 +155,14 @@ esac
 export SAFETENSORS_FAST_GPU=1
 export SGLANG_ROCM_FUSED_DECODE_MLA=0
 export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
+# 0708 docker issue: the GLM-5.2 DSA decode path now wires in the topk_v2 JIT
+# kernel (dsa_backend._build_topk_v2_plan -> jit_kernel/dsv4/topk.py), whose
+# topk_impl.cuh #includes <cooperative_groups.h> -- a CUDA header not shipped by
+# ROCm 7.2 -> hipcc "ninja exited with status 1 / cooperative_groups.h not found"
+# during CUDA-graph capture, so the server won't start. Disable topk_v2 until the
+# kernel is hipified. (0628 docker never hit this: its dsa_backend didn't call
+# topk_v2 for GLM-5.2 at all.)
+export SGLANG_OPT_USE_TOPK_V2=0
 # export AITER_ONLINE_TUNE=1
 HOST="localhost"
 # Override with `--port <n>` or `PORT=<n> ./GLM.sh`. Default 8552.
