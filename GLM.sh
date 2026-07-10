@@ -635,9 +635,20 @@ if ! is_rocm_gpu_env; then
     # model card (https://huggingface.co/nvidia/GLM-5.2-NVFP4), upgrade transformers
     # before launching. (--break-system-packages: same PEP 668 override as above.)
     # Gated to GLM-5.2 only so other models (GLM-5 / GLM-5.1) keep the pinned version.
+    #
+    # IMPORTANT: only upgrade if transformers is actually too old (< 5.3.0). Do NOT
+    # blindly `pip install -U`: the purpose-built dev-glm52 image already ships a
+    # compatible transformers (e.g. 5.12.1), and forcing it to the newest (5.13.0)
+    # pulls in a version whose built-in `qwen3_asr` config collides with sglang's
+    # own qwen3_asr registration ("'qwen3_asr' is already used by a Transformers
+    # config"), which kills server startup at import time.
     case "${MODEL_NAME}" in
         *GLM-5.2*)
-            python3 -m pip install -U --break-system-packages "transformers>=5.3.0"
+            if python3 -c "import transformers; from packaging.version import Version; import sys; sys.exit(0 if Version(transformers.__version__) >= Version('5.3.0') else 1)" 2>/dev/null; then
+                echo "[info] transformers $(python3 -c 'import transformers; print(transformers.__version__)') already satisfies >=5.3.0; skipping upgrade."
+            else
+                python3 -m pip install --break-system-packages "transformers>=5.3.0"
+            fi
             ;;
     esac
 fi
