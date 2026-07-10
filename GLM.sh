@@ -206,7 +206,7 @@ if [ "$PROF_ENABLED" == "true" ]; then
 
     # Debug
     in_out_tokens=("1024:16" "8192:16")
-    concurrencies=(4)
+    concurrencies=(4 64)
 fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
 # Layout: results/<model>/<docker-image>/<tags>
