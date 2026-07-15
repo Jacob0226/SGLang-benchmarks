@@ -163,6 +163,16 @@ export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
 # kernel is hipified. (0628 docker never hit this: its dsa_backend didn't call
 # topk_v2 for GLM-5.2 at all.)
 export SGLANG_OPT_USE_TOPK_V2=0
+# Dense-decode "Design A" dual-graph (dense-decode-konly feature): captures BOTH a
+# dense k-only and a sparse decode cuda-graph and dispatches per step on
+# max_kv_len vs index_topk. For short context (kv_len <= index_topk, e.g. i1k) it
+# runs the dense k-only path -- skipping the sparse indexer+topk+gather -> ~5-6%
+# lower TPOT (measured GLM-5.2-MXFP4 i1k conc4: 11.06 vs 11.70 ms, GSM8K 0.931).
+# Correct for mixed lengths (long context still uses sparse). Default ON so it is
+# never forgotten; override with SGLANG_DSA_DECODE_DUAL_GRAPH=0. NOTE: captures 2x
+# decode graphs (more capture time + memory). Only effective on branches that have
+# the dense-decode feature + DSA models (ignored otherwise).
+export SGLANG_DSA_DECODE_DUAL_GRAPH="${SGLANG_DSA_DECODE_DUAL_GRAPH:-1}"
 # export AITER_ONLINE_TUNE=1
 HOST="localhost"
 # Override with `--port <n>` or `PORT=<n> ./GLM.sh`. Default 8552.
@@ -180,10 +190,10 @@ if [ -n "${CONC_OVERRIDE:-}" ]; then read -ra concurrencies <<< "$CONC_OVERRIDE"
 # concurrencies=(32 64)
 PROMPT_MULTIPLIER=5
 if [ "$PROF_COMBINED" == "true" ]; then
-    PROF_CMD=(--profile --profile-num-steps 5)
+    PROF_CMD=(--profile --profile-num-steps 2)
     COMBINED_SUFFIX="_Combined"
 else
-    PROF_CMD=(--profile --profile-num-steps 5 --profile-by-stage)
+    PROF_CMD=(--profile --profile-num-steps 2 --profile-by-stage)
     COMBINED_SUFFIX=""
 fi
 
@@ -207,6 +217,10 @@ if [ "$PROF_ENABLED" == "true" ]; then
     # Debug
     in_out_tokens=("1024:16" "8192:16")
     concurrencies=(4 64)
+    # Optional prof-mode overrides (space-separated), e.g. i1k only:
+    #   PROF_IN_OUT_OVERRIDE="1024:16" PROF_CONC_OVERRIDE="4 64" ./GLM.sh --prof ...
+    if [ -n "${PROF_IN_OUT_OVERRIDE:-}" ]; then read -ra in_out_tokens <<< "$PROF_IN_OUT_OVERRIDE"; fi
+    if [ -n "${PROF_CONC_OVERRIDE:-}" ]; then read -ra concurrencies <<< "$PROF_CONC_OVERRIDE"; fi
 fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
 # Layout: results/<model>/<docker-image>/<tags>
@@ -367,8 +381,8 @@ start_server() {
         # Match InferenceX glm5.1_fp4_mi355x.sh: tilelang NSA backends,
         # tokenizer-worker-num scales with TP.
         cmd+=(
-            --nsa-prefill-backend tilelang
-            --nsa-decode-backend tilelang
+            --dsa-prefill-backend "${DSA_PREFILL_BACKEND:-tilelang}"
+            --dsa-decode-backend "${DSA_DECODE_BACKEND:-tilelang}"
             --tokenizer-worker-num $((TP_SIZE * 2))
         )
         # opt#3: aiter fused allreduce(+residual+rmsnorm) replaces the unfused
@@ -451,6 +465,12 @@ start_server() {
         cmd+=(--disable-shared-experts-fusion)
     fi
 
+    # Optional override of chunked-prefill-size (appended last so it wins in argparse).
+    #   CHUNKED_PREFILL_SIZE=131072 ./GLM.sh ...
+    if [ -n "${CHUNKED_PREFILL_SIZE:-}" ]; then
+        cmd+=(--chunked-prefill-size "$CHUNKED_PREFILL_SIZE")
+    fi
+
     if [ "$MTP_ENABLED" == "true" ]; then
         # EAGLE chain matches InferenceX glm5_fp8_mi355x_mtp.sh: (steps=3, topk=1, draft=4).
         # SGLANG_ENABLE_SPEC_V2=1 enables sglang's new spec scheduler (also set by InferenceX).
@@ -520,6 +540,11 @@ warmup() {
 }
 
 accuracy_test() {
+    # Optional skip (e.g. quick perf-only runs): SKIP_GSM8K=1 ./GLM.sh ...
+    if [ "${SKIP_GSM8K:-0}" = "1" ]; then
+        echo ">>> SKIP_GSM8K=1 set — skipping GSM8K accuracy test."
+        return 0
+    fi
     # GSM8K
     gsm8k_logfile=$LOG_DIR/Accuracy_GSM8K.log
     if ! grep -q "$gsm8k_logfile" "$FINISH_LOG"; then
@@ -688,6 +713,13 @@ for PROF_MODE in "${PROF_SERVER_MODES[@]}"; do
     NOGRAPH_SUFFIX=""
     if [ "$PROF_MODE" == "no-cuda-graph" ]; then
         EXTRA_SERVER_ARGS=(--disable-cuda-graph)
+        # Eager (no-graph) forward allocates transient activation/workspace
+        # memory that the captured-graph path doesn't; at large batch (conc64)
+        # this can OOM/IMA -> segfault. Give ~0.1 more headroom by lowering
+        # mem-fraction-static for the no-graph server only. Later --mem-fraction-static
+        # wins in argparse. Override the delta with NOGRAPH_MEM_FRACTION_DELTA.
+        _nograph_mfs=$(awk "BEGIN{v=$MEM_FRACTION_STATIC-${NOGRAPH_MEM_FRACTION_DELTA:-0.1}; if(v<0.1)v=0.1; printf \"%.2f\", v}")
+        EXTRA_SERVER_ARGS+=(--mem-fraction-static "$_nograph_mfs")
         NOGRAPH_SUFFIX="-NoGraph"
         PROMPT_MULTIPLIER=1
         LOG_DIR="${BASE_LOG_DIR}/no-cuda-graph"
@@ -722,9 +754,12 @@ for PROF_MODE in "${PROF_SERVER_MODES[@]}"; do
     ) || echo "[warn] profiling mode '${PROF_MODE}' aborted (exit $?); continuing to cleanup and next mode."
 
     echo "[${PROF_SERVER_MODES[@]}], now is the end of ${PROF_MODE}"
-    pkill -9 python || true
-    pkill -9 sglang || true
-    sleep 10
+    # Graceful stop (SIGTERM). Do NOT pkill -9 GPU server procs on ROCm: a hard
+    # kill can trigger 100-200GB gpucore dumps that fill the shared disk.
+    pkill -TERM -f sglang.launch_server || true
+    for _i in $(seq 1 40); do pgrep -f sglang.launch_server >/dev/null 2>&1 || break; sleep 3; done
+    pkill -TERM -f "sglang::" || true
+    sleep 8
 done
 
 
