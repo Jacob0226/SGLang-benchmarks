@@ -166,8 +166,16 @@ export SGLANG_ROCM_FUSED_DECODE_MLA=0
 # empirically re-confirmed 2026-07-16 -- even though `from sgl_kernel import
 # fast_topk_v2` imports (that is only the dispatcher), the real kernel is still the
 # JIT topk_impl.cuh and it fails at capture exactly as before. Do NOT remove.
-# Overridable only for re-testing on future images; keep the default at 0.
-export SGLANG_OPT_USE_TOPK_V2="${SGLANG_OPT_USE_TOPK_V2:-0}"
+# Auto default by platform (while still allowing manual override):
+#   ROCm -> 0 (workaround for topk_v2 JIT compile failure)
+#   CUDA -> 1
+if [ -z "${SGLANG_OPT_USE_TOPK_V2+x}" ]; then
+    if [ -e /dev/kfd ] || command -v rocm-smi >/dev/null 2>&1; then
+        export SGLANG_OPT_USE_TOPK_V2=0
+    else
+        export SGLANG_OPT_USE_TOPK_V2=1
+    fi
+fi
 # Dense-decode "Design A" dual-graph (dense-decode-konly feature): captures BOTH a
 # dense k-only and a sparse decode cuda-graph and dispatches per step on
 # max_kv_len vs index_topk. For short context (kv_len <= index_topk, e.g. i1k) it
