@@ -154,15 +154,20 @@ esac
 # InferenceMax tuning (from InferenceX/glm5_fp8_mi355x.sh)
 export SAFETENSORS_FAST_GPU=1
 export SGLANG_ROCM_FUSED_DECODE_MLA=0
-export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
-# 0708 docker issue: the GLM-5.2 DSA decode path now wires in the topk_v2 JIT
-# kernel (dsa_backend._build_topk_v2_plan -> jit_kernel/dsv4/topk.py), whose
-# topk_impl.cuh #includes <cooperative_groups.h> -- a CUDA header not shipped by
-# ROCm 7.2 -> hipcc "ninja exited with status 1 / cooperative_groups.h not found"
-# during CUDA-graph capture, so the server won't start. Disable topk_v2 until the
-# kernel is hipified. (0628 docker never hit this: its dsa_backend didn't call
-# topk_v2 for GLM-5.2 at all.)
-export SGLANG_OPT_USE_TOPK_V2=0
+# export ROCM_QUICK_REDUCE_QUANTIZATION=
+
+# GLM-5.2 DSA decode PAGED top-k routes to the DeepSeek-V4 "topk_v2" kernel, which
+# is JIT-compiled by hipcc at CUDA-graph capture from
+#   python/sglang/jit_kernel/include/sgl_kernel/deepseek_v4/topk_impl.cuh
+# That header #includes <cooperative_groups.h> -- a CUDA header ROCm 7.2 does not
+# ship -> hipcc "ninja exited with status 1 / cooperative_groups.h not found" ->
+# server dies during startup. Disable topk_v2 until the kernel is hipified.
+# STILL REQUIRED on the 0714 docker (v0.5.15.post1-rocm720-mi35x-20260714):
+# empirically re-confirmed 2026-07-16 -- even though `from sgl_kernel import
+# fast_topk_v2` imports (that is only the dispatcher), the real kernel is still the
+# JIT topk_impl.cuh and it fails at capture exactly as before. Do NOT remove.
+# Overridable only for re-testing on future images; keep the default at 0.
+export SGLANG_OPT_USE_TOPK_V2="${SGLANG_OPT_USE_TOPK_V2:-0}"
 # Dense-decode "Design A" dual-graph (dense-decode-konly feature): captures BOTH a
 # dense k-only and a sparse decode cuda-graph and dispatches per step on
 # max_kv_len vs index_topk. For short context (kv_len <= index_topk, e.g. i1k) it
@@ -557,7 +562,7 @@ accuracy_test() {
         gsm8k_cmd=(
             python3 /sgl-workspace/sglang/benchmark/gsm8k/bench_sglang.py 
                 --port "$PORT" 
-                --num-questions 1200 
+                --num-questions "${GSM8K_NUM_QUESTIONS:-1200}" 
                 --parallel "${GSM8K_PARALLEL:-1200}"
         )
         log_command "$gsm8k_logfile" "${gsm8k_cmd[@]}"
