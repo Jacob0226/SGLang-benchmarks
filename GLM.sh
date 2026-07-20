@@ -187,6 +187,21 @@ fi
 # the dense-decode feature + DSA models (ignored otherwise).
 export SGLANG_DSA_DECODE_DUAL_GRAPH="${SGLANG_DSA_DECODE_DUAL_GRAPH:-1}"
 # export AITER_ONLINE_TUNE=1
+
+# Scheduler watchdog timeout (s). The torch-profiler teardown for an eager
+# (no-cuda-graph) high-concurrency trace disposes millions of ProfilerResult
+# objects single-threaded and can block the scheduler thread >20min
+# (ProfilerResult::~ProfilerResult -> _M_dispose), tripping the default 1200s
+# watchdog and killing the server mid-teardown. So default HIGH in --prof mode,
+# but keep the normal 1200s for bench/serving so real hangs still surface fast.
+# Override either way with WATCHDOG_TIMEOUT=<seconds> ./GLM.sh ...
+if [ -z "${WATCHDOG_TIMEOUT:-}" ]; then
+    if [ "$PROF_ENABLED" == "true" ]; then
+        WATCHDOG_TIMEOUT=7200
+    else
+        WATCHDOG_TIMEOUT=1200
+    fi
+fi
 HOST="localhost"
 # Override with `--port <n>` or `PORT=<n> ./GLM.sh`. Default 8552.
 PORT="${PORT:-8234}"
@@ -208,6 +223,21 @@ if [ "$PROF_COMBINED" == "true" ]; then
 else
     PROF_CMD=(--profile --profile-num-steps 2 --profile-by-stage)
     COMBINED_SUFFIX=""
+fi
+# Optional: pass --profile-stages to restrict which stages profile-by-stage
+# captures, e.g. PROF_STAGES_OVERRIDE="decode".
+# WARNING: the 0714 ROCm image (v0.5.15.post1) IGNORES --profile-stages -- its
+# profiler_manager hardcodes profiler_target_prefill_ct = profiler_target_decode_ct
+# = num_steps, so profile-by-stage ALWAYS captures BOTH prefill(EXTEND) and
+# decode(DECODE) regardless of this flag. It is kept here only for builds that
+# do honor it. The real safeguard against the eager (no-cuda-graph) profiler
+# teardown blowing past the watchdog is WATCHDOG_TIMEOUT (defaults to 7200 in
+# --prof mode above); the ~100MB eager prefill trace teardown
+# (ProfilerResult::~ProfilerResult) is nondeterministic and was observed to run
+# anywhere from ~85s to >1200s, so give it headroom rather than relying on this.
+if [ -n "${PROF_STAGES_OVERRIDE:-}" ]; then
+    read -ra _prof_stages <<< "$PROF_STAGES_OVERRIDE"
+    PROF_CMD+=(--profile-stages "${_prof_stages[@]}")
 fi
 
 # Vendor tag inserted into profiler trace filenames (e.g. ..._p8-AMD-TP-0-...).
@@ -380,7 +410,7 @@ start_server() {
             --trust-remote-code
             --tool-call-parser glm47
             --reasoning-parser glm45
-            --watchdog-timeout 1200
+            --watchdog-timeout "${WATCHDOG_TIMEOUT:-1200}"
             --mem-fraction-static "$MEM_FRACTION_STATIC"
             --kv-cache-dtype fp8_e4m3
             --disable-radix-cache
@@ -394,8 +424,8 @@ start_server() {
         # Match InferenceX glm5.1_fp4_mi355x.sh: tilelang NSA backends,
         # tokenizer-worker-num scales with TP.
         cmd+=(
-            --dsa-prefill-backend "${DSA_PREFILL_BACKEND:-tilelang}"
-            --dsa-decode-backend "${DSA_DECODE_BACKEND:-tilelang}"
+            --dsa-prefill-backend "${DSA_PREFILL_BACKEND:-triton}"
+            --dsa-decode-backend "${DSA_DECODE_BACKEND:-triton}"
             --tokenizer-worker-num $((TP_SIZE * 2))
         )
         # opt#3: aiter fused allreduce(+residual+rmsnorm) replaces the unfused
@@ -548,6 +578,7 @@ warmup() {
         --max-concurrency 4 
         --num-prompt 4 
         --output-file /dev/null
+        --ready-check-timeout-sec "${READY_CHECK_TIMEOUT_SEC:-600}"
     )
     log_command "$warmup_log" "${warmup_cmd[@]}"
 }
@@ -600,6 +631,7 @@ run_benchmarks() {
                 --max-concurrency "${c}"
                 --num-prompt "${num_prompts}"
                 --output-file /dev/null
+                --ready-check-timeout-sec "${READY_CHECK_TIMEOUT_SEC:-600}"
             )
             
             # Add profiling args
@@ -626,6 +658,37 @@ run_benchmarks() {
 
             if [ "$skip" == "false" ]; then
                 echo "Running: $logfile"
+                # Per-config JIT warmup (prof mode only): run the SAME
+                # (input,output,conc) shape once WITHOUT --profile so every kernel
+                # for this config is already JIT-compiled/cached. Otherwise a
+                # cold-cache compile (torch.compile/dynamo/triton codegen) can land
+                # INSIDE the profiled window and pollute the trace with millions of
+                # ast/isinstance python_function events (observed: i1k conc64
+                # no-graph EXTEND ballooned to 4.4M events / 64MB vs ~0.5M clean).
+                # That event bloat also inflates the profiler teardown
+                # (ProfilerResult dispose is O(events)) which is what tripped the
+                # 1200s watchdog. Warm cache -> clean small trace + fast teardown.
+                # Disable with PROF_WARMUP=0.
+                local _warm_dur=0
+                if [ "$PROF_ENABLED" == "true" ] && [ "${PROF_WARMUP:-1}" == "1" ]; then
+                    local warmup_cfg_log="${LOG_DIR}/warmup_in${input_tokens}_out${output_tokens}_conc${c}.log"
+                    local warmup_cfg_cmd=(
+                        python3 -m sglang.bench_serving
+                        --host "${HOST}" --port "${PORT}" --model "${MODEL_PATH}"
+                        --dataset-name "${DATASET}"
+                        --random-input "${input_tokens}" --random-output "${output_tokens}"
+                        --random-range-ratio "${random_range_ratio}"
+                        --max-concurrency "${c}" --num-prompt "${num_prompts}"
+                        --output-file /dev/null
+                        --ready-check-timeout-sec "${READY_CHECK_TIMEOUT_SEC:-600}"
+                    )
+                    echo ">>> [warmup] JIT warmup for in${input_tokens}_out${output_tokens}_conc${c} (no --profile)"
+                    local _warm_t0=$(date +%s)
+                    log_command "$warmup_cfg_log" "${warmup_cfg_cmd[@]}" \
+                        || echo "[warn] per-config warmup failed; continuing to profiled run."
+                    _warm_dur=$(( $(date +%s) - _warm_t0 ))
+                fi
+                local _prof_t0=$(date +%s)
                 local profiler_dirs_before=""
                 local profiler_dirs_after=""
                 if [ "$PROF_ENABLED" == "true" ]; then
@@ -640,6 +703,17 @@ run_benchmarks() {
                     echo "[warn] command exited non-zero for ${logfile} (likely profiler teardown crash); traces may still be present — continuing to rename."
                 fi
                 echo "$logfile" >> "$FINISH_LOG"
+
+                # Record per-config timing: warmup (JIT precompile) vs the profiled
+                # run itself (includes capture + profiler teardown). Written to
+                # profile_timing.log next to the traces.
+                if [ "$PROF_ENABLED" == "true" ]; then
+                    local _prof_dur=$(( $(date +%s) - _prof_t0 ))
+                    printf '%-40s warmup=%4ds  profile+teardown=%5ds  total=%5ds\n' \
+                        "in${input_tokens}_out${output_tokens}_conc${c}${NOGRAPH_SUFFIX}" \
+                        "${_warm_dur}" "${_prof_dur}" "$(( _warm_dur + _prof_dur ))" \
+                        | tee -a "${LOG_DIR}/profile_timing.log"
+                fi
 
                 if [ "$PROF_ENABLED" == "true" ]; then
                     profiler_dirs_after=$(list_profiler_dirs) # Get the current folders under $LOG_DIR. This time will have another torch profiler folder
