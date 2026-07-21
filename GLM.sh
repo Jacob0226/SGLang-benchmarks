@@ -497,6 +497,24 @@ start_server() {
         esac
     fi
 
+    # ===== Piecewise CUDA Graph (PCG) prefill backend — NVIDIA/CUDA only =====
+    # The dev-glm52-nvfp4 image launched prefill with tc_piecewise by default,
+    # but the v0.5.15.post1 release auto-disables it for the GLM-5.2 DSA path
+    # (prefill=PhaseConfig(backend='disabled')). That regressed short-input TTFT
+    # badly (i1k conc4: 208ms vs 72ms; ~1.5-3x worse on 1024-token inputs) while
+    # long inputs were unaffected. PCG is on-by-default upstream but GLM-5.2 hits
+    # an auto-disable rule (model-arch blacklist); explicitly selecting the
+    # prefill backend skips the whole auto-disable cascade (this is the current
+    # replacement for the old --enforce-piecewise-cuda-graph).
+    #
+    # CUDA-only on purpose: tc_piecewise is unsupported on ROCm/NPU/CPU/MPS/XPU
+    # (sglang's own is_hip()/is_npu()/... rules disable it), and older images may
+    # not even expose --cuda-graph-backend-prefill. Gate to the non-ROCm path.
+    # Toggle off with ENABLE_PIECEWISE_CUDA_GRAPH=0.
+    if ! is_rocm_gpu_env && [ "${ENABLE_PIECEWISE_CUDA_GRAPH:-1}" = "1" ]; then
+        cmd+=(--cuda-graph-backend-prefill tc_piecewise)
+    fi
+
     # Auto-add --disable-shared-experts-fusion only when ROCm dual-stream is
     # enabled (forces num_fused_shared_experts=0 so MoE.forward takes
     # forward_normal_dual_stream instead of the fused path).
