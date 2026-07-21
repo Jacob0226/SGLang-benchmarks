@@ -218,10 +218,10 @@ if [ -n "${CONC_OVERRIDE:-}" ]; then read -ra concurrencies <<< "$CONC_OVERRIDE"
 # concurrencies=(32 64)
 PROMPT_MULTIPLIER=5
 if [ "$PROF_COMBINED" == "true" ]; then
-    PROF_CMD=(--profile --profile-num-steps 2)
+    PROF_CMD=(--profile --profile-num-steps "${PROF_NUM_STEPS:-2}")
     COMBINED_SUFFIX="_Combined"
 else
-    PROF_CMD=(--profile --profile-num-steps 2 --profile-by-stage)
+    PROF_CMD=(--profile --profile-num-steps "${PROF_NUM_STEPS:-2}" --profile-by-stage)
     COMBINED_SUFFIX=""
 fi
 # Optional: pass --profile-stages to restrict which stages profile-by-stage
@@ -273,6 +273,10 @@ LEAF_TAG="${MTP_TAG}${SPECIAL_TAG}${USER_TAG}"
 LEAF_TAG="${LEAF_TAG#-}"
 LOG_DIR="$HOME/SGLang-benchmarks/results/${MODEL_NAME}/$DOCKER_FILENAME/${LEAF_TAG}"
 FINISH_LOG="$LOG_DIR/Finish.log"
+# Single continuous server log. Exported so log_command() can stamp a banner into
+# it before each client command (warmup / GSM8K / per-config warmup / bench), so
+# the interleaved server log can be sliced back to "which benchmark is this".
+SERVER_LOG="${LOG_DIR}/server_${MODEL_NAME}.log"
 mkdir -p "$LOG_DIR"
 touch "$FINISH_LOG"
 if [ "$PROF_ENABLED" == "true" ]; then
@@ -287,6 +291,18 @@ log_command() {
     echo ">>>Executing command:" | tee -a "$logfile"
     echo "$*" | tee -a "$logfile"  
     echo "---" | tee -a "$logfile"
+
+    # Also stamp a greppable banner into the (continuous) server log so its
+    # interleaved output can be attributed to the client command that drove it.
+    # Grep '##### CLIENT CMD' in server_*.log to find each phase boundary.
+    if [ -n "${SERVER_LOG:-}" ] && [ -f "${SERVER_LOG}" ]; then
+        {
+            echo ""
+            echo "##### CLIENT CMD @ $(date '+%F %T') #####"
+            echo "$*"
+            echo "##########################################"
+        } >> "${SERVER_LOG}"
+    fi
 
     # Execute command
     "$@" 2>&1 | tee -a "$logfile"
@@ -398,7 +414,7 @@ prof_cmd_has_profile_by_stage() {
 }
 
 start_server() {
-    local logfile="${LOG_DIR}/server_${MODEL_NAME}.log"
+    local logfile="${SERVER_LOG}"
     echo ">>> Starting SGLang server" | tee "$logfile"
 
     local cmd=(
@@ -530,6 +546,14 @@ start_server() {
     #   CHUNKED_PREFILL_SIZE=131072 ./GLM.sh ...
     if [ -n "${CHUNKED_PREFILL_SIZE:-}" ]; then
         cmd+=(--chunked-prefill-size "$CHUNKED_PREFILL_SIZE")
+    fi
+
+    # Generic passthrough for extra server args (appended last -> wins in argparse).
+    # Space-separated. e.g. test prefill piecewise cuda graph:
+    #   SERVER_EXTRA_ARGS="--cuda-graph-backend-prefill tc_piecewise --piecewise-cuda-graph-compiler eager" ./GLM.sh ...
+    if [ -n "${SERVER_EXTRA_ARGS:-}" ]; then
+        read -ra _extra_srv <<< "$SERVER_EXTRA_ARGS"
+        cmd+=("${_extra_srv[@]}")
     fi
 
     if [ "$MTP_ENABLED" == "true" ]; then
