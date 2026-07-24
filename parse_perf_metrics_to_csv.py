@@ -40,6 +40,7 @@ SUMMARY_COLUMNS = [
     TPUT_PER_GPU_HDR,
     "TTFT",
     "TPOT",
+    "ITL",
 ]
 
 # 第二份 table 的欄位順序，刻意與
@@ -151,6 +152,29 @@ def detect_spec_method_from_path(input_dir: Path):
         if mtp_pattern.search(part):
             return "mtp"
     return "none"
+
+
+# 從路徑名稱嗅 docker image，例如資料夾
+#   'rocm_sgl-dev-v0.5.15.post1-rocm720-mi35x-20260714'
+# -> 'rocm/sgl-dev:v0.5.15.post1-rocm720-mi35x-20260714'
+image_pattern = re.compile(
+    r"(rocm|lmsysorg|nvcr\.io/[\w./-]+)[_/]sgl(?:ang)?-dev[-:](v[\w.-]+)",
+    re.IGNORECASE,
+)
+
+
+def detect_image_from_path(input_dir: Path):
+    """從 input_dir 或其上層資料夾名稱猜 docker image tag。
+    例如 'rocm_sgl-dev-v0.5.15.post1-rocm720-mi35x-20260714'
+      -> 'rocm/sgl-dev:v0.5.15.post1-rocm720-mi35x-20260714'。
+    找不到則回傳空字串。"""
+    for part in (input_dir.name, *(p.name for p in input_dir.parents)):
+        m = image_pattern.search(part)
+        if m:
+            registry = m.group(1)
+            tag = m.group(2)
+            return f"{registry}/sgl-dev:{tag}"
+    return ""
 
 
 def detect_accuracy_from_dir(input_dir: Path):
@@ -286,6 +310,7 @@ def build_summary_row(record: dict, tp: int):
     TTFT / TPOT 一律取 median (ms)。"""
     median_tpot_ms = _safe_float(record.get("Median TPOT (ms)"))
     median_ttft_ms = _safe_float(record.get("Median TTFT (ms)"))
+    median_itl_ms = _safe_float(record.get("Median ITL (ms)"))
     total_tps = _safe_float(record.get("Total token throughput (tok/s)"))
 
     # Interactivity 顯示到小數第 1 位；Token TPUT per GPU 只取整數部分
@@ -304,6 +329,7 @@ def build_summary_row(record: dict, tp: int):
         TPUT_PER_GPU_HDR: tput_per_gpu,
         "TTFT": int(round(median_ttft_ms)) if median_ttft_ms is not None else "",
         "TPOT": round(median_tpot_ms, 1) if median_tpot_ms is not None else "",
+        "ITL": round(median_itl_ms, 1) if median_itl_ms is not None else "",
     }
 
 
@@ -324,9 +350,10 @@ def _build_side_by_side(records, ordered_columns, tp):
 
 
 def build_meta_block(*, hardware=None, framework=None, precision=None, tp=None,
-                     image=None, commit=None, machine=None, accuracy=None):
+                     image=None, commit=None, machine=None, accuracy=None,
+                     run_date=None):
     """組頂端的 metadata 區塊，layout 與交付表格一致：
-        [Hardware, Framework, PRECISION, "", TPn]
+        [Hardware, Framework, PRECISION, TPn, "Date:", date]
         [Docker, image]
         [Commit, commit_url]
         [Machine, machine, Accuracy, accuracy]
@@ -336,8 +363,9 @@ def build_meta_block(*, hardware=None, framework=None, precision=None, tp=None,
             hardware or "",
             framework or "",
             (precision or "").upper(),
-            "",
             f"TP{tp}" if tp else "",
+            "Date:",
+            run_date or "",
         ],
         ["Docker", image or ""],
         ["Commit", commit or ""],
@@ -350,11 +378,12 @@ def build_geomean_row(summary_rows, group_key):
     """對同一 input/output 群組的 summary_rows 取 geomean，組出一列。
     summary_rows: list of lists，欄位順序 = SUMMARY_COLUMNS。
     對 Interactivity / Token TPUT per GPU / TTFT / TPOT 取幾何平均。"""
-    # 欄位索引: 3=Interactivity, 4=Token TPUT per GPU, 5=TTFT, 6=TPOT
+    # 欄位索引: 3=Interactivity, 4=Token TPUT per GPU, 5=TTFT, 6=TPOT, 7=ITL
     intvty = _geomean(r[3] for r in summary_rows)
     tput = _geomean(r[4] for r in summary_rows)
     ttft = _geomean(r[5] for r in summary_rows)
     tpot = _geomean(r[6] for r in summary_rows)
+    itl = _geomean(r[7] for r in summary_rows)
     return [
         group_key[0],
         group_key[1],
@@ -363,11 +392,12 @@ def build_geomean_row(summary_rows, group_key):
         int(tput) if tput is not None else "",
         round(ttft, 2) if ttft is not None else "",
         round(tpot, 2) if tpot is not None else "",
+        round(itl, 2) if itl is not None else "",
     ]
 
 
 def write_csv(records, column_order, output_csv, *, tp, accuracy=None,
-              meta=None):
+              meta=None, run_date=None):
     """輸出交付格式：
       頂端 metadata 區塊 (Hardware/Framework/Precision/TP、Docker、Commit、
         Machine + Accuracy)，空一列後接 summary 表格。
@@ -395,6 +425,7 @@ def write_csv(records, column_order, output_csv, *, tp, accuracy=None,
         commit=meta.get("commit"),
         machine=meta.get("machine"),
         accuracy=accuracy,
+        run_date=run_date,
     )
 
     with open(output_csv, "w", newline="", encoding="utf-8") as f:
@@ -514,7 +545,8 @@ def main():
     spec_method = args.spec_method or detect_spec_method_from_path(input_path)
     framework = args.framework
     num_decode_gpu = args.num_decode_gpu if args.num_decode_gpu is not None else tp_size
-    image = args.image
+    # Docker image: CLI > 路徑 auto-detect > 空字串
+    image = args.image or detect_image_from_path(input_path)
     run_date = args.date or _date.today().isoformat()
 
     print(f"Local-table variant      : {variant}")
@@ -572,6 +604,7 @@ def main():
         args.output,
         tp=tp_size,
         accuracy=accuracy,
+        run_date=run_date,
         meta=dict(
             hardware=args.hardware,
             image=image,
