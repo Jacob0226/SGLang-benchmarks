@@ -30,6 +30,11 @@ HOST="localhost"; DATASET="random"; RANGE_RATIO=0.8
 VENDOR_TAG="${VENDOR_TAG:-AMD}"   # inserted into GLM.sh-style trace filenames
 
 export SAFETENSORS_FAST_GPU=1
+# Match ROCm ATOM CI (#508) prefill accelerators — the main reason CI hits
+# ~44.8ms TPOT vs ~54 without them: INT4-quantized quick all-reduce and FlyDSL
+# MoE sorting. Override by exporting these before invoking the script.
+export AITER_QUICK_REDUCE_QUANTIZATION="${AITER_QUICK_REDUCE_QUANTIZATION:-INT4}"
+export AITER_USE_FLYDSL_MOE_SORTING="${AITER_USE_FLYDSL_MOE_SORTING:-1}"
 # NOTE: do NOT set PYTORCH_ALLOC_CONF=expandable_segments:True here — it breaks
 # AITER's IPC-based custom all-reduce on multi-GPU TP (hipIpcGetMemHandle fails
 # with "invalid argument"), killing server init. Long-context OOM is instead
@@ -44,7 +49,7 @@ GSM8K_CONCURRENT="${GSM8K_CONCURRENT:-65}"
 #   IN_OUT="512:64" CONC="4" ./ATOM_GLM.sh --prof
 IFS=' ' read -ra in_out <<< "${IN_OUT:-1024:1024 8192:1024 70000:300}"
 IFS=' ' read -ra concurrencies <<< "${CONC:-4 8 16 32 64}"
-MULT=5
+MULT="${MULT:-5}"
 SPECIAL="-bench"
 if [ "$PROF" == "true" ]; then
     SPECIAL="-prof"; MULT=2
@@ -102,14 +107,19 @@ collect_traces() { # args: dst in out c np before
 # rocm-smi is unavailable.
 wait_gpu_free() {
     command -v rocm-smi >/dev/null 2>&1 || { sleep 15; return 0; }
+    # Check the GPUs this run actually uses: HIP_VISIBLE_DEVICES if set (e.g.
+    # running on GPU 4-7 of an 8-GPU box), else the default 0..TP-1. Without
+    # this, a run pinned to 4-7 would spuriously wait on 0-3.
+    local gpus="${HIP_VISIBLE_DEVICES:-}"
+    [ -z "$gpus" ] && gpus=$(seq -s, 0 $((TP-1)))
     local tries=0
     while [ $tries -lt 60 ]; do   # up to ~300s
         local busy
-        busy=$(rocm-smi --showmeminfo vram 2>/dev/null | awk -v n="$TP" '
+        busy=$(rocm-smi --showmeminfo vram 2>/dev/null | awk -v want=",$gpus," '
             /VRAM Total Used Memory/ { g=$1; sub(/.*\[/,"",g); sub(/\].*/,"",g);
-                if (g+0 < n && $NF+0 > m) m=$NF+0 } END { print m+0 }')
-        [ "${busy:-0}" -lt 5000000000 ] && return 0   # < 5 GB on all TP GPUs
-        echo ">>> Waiting for GPU 0-$((TP-1)) to free (max used ${busy} B)..."
+                if (index(want, ","g",") > 0 && $NF+0 > m) m=$NF+0 } END { print m+0 }')
+        [ "${busy:-0}" -lt 5000000000 ] && return 0   # < 5 GB on all target GPUs
+        echo ">>> Waiting for GPU [$gpus] to free (max used ${busy} B)..."
         sleep 5; tries=$((tries + 1))
     done
     echo "[warn] GPUs still busy after wait; proceeding anyway."
@@ -124,11 +134,17 @@ start_server() {
     fi
     local cmd=(python -m atom.entrypoints.openai_server
         --model "$MODEL" -tp "$TP" --kv_cache_dtype fp8 --trust-remote-code
+        --no-enable_prefix_caching
         --host "$HOST" --port "$ENGINE_PORT" --server-port "$SERVER_PORT")
-    # Default 0.85 mirrors SGLang's --mem-fraction-static 0.85 (apples-to-apples)
-    # and leaves ~25 GB/GPU headroom so long-context (70000-token) NSA indexer
-    # allocations don't HIP-OOM. Override with GPU_MEM_UTIL=<x>.
-    cmd+=(--gpu-memory-utilization "${GPU_MEM_UTIL:-0.85}")
+    # Default 0.9 matches the ATOM CI (#508) engine default; override GPU_MEM_UTIL
+    # for long-context (70000-token) runs where the NSA indexer can HIP-OOM.
+    cmd+=(--gpu-memory-utilization "${GPU_MEM_UTIL:-0.9}")
+    # Match CI: PTPC-FP8 online quant on dense/attention linears (experts, gate,
+    # lm_head, embed excluded) — accelerates prefill GEMMs. Disable with
+    # ONLINE_QUANT=off.
+    if [ "${ONLINE_QUANT:-ptpc_fp8}" != "off" ]; then
+        cmd+=(--online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate", "*expert*"]}')
+    fi
     if [ "$PROF" == "true" ]; then
         cmd+=(--torch-profiler-dir "$LOG_DIR" --mark-trace)
         [ "${EAGER:-false}" == "true" ] && cmd+=(--enforce-eager)
@@ -155,6 +171,19 @@ bench_one() {
         --request-rate inf --ignore-eos
         --percentile-metrics "ttft,tpot,itl,e2el")
     [ "$PROF" == "true" ] && cmd+=(--profile)
+    # Per-config JIT warmup before each profiled run (mirrors GLM.sh): run the
+    # SAME (in,out,conc) shape WITHOUT --profile so kernel JIT/autotune is
+    # already compiled and doesn't land inside (and bloat) the profiled trace.
+    # Disable with PROF_WARMUP=0.
+    if [ "$PROF" == "true" ] && [ "${PROF_WARMUP:-1}" == "1" ]; then
+        echo ">>> [warmup] per-config JIT warmup for in${in}_out${out}_conc${c} (no --profile)"
+        python -m atom.benchmarks.benchmark_serving --backend vllm \
+            --base-url "http://${HOST}:${SERVER_PORT}" --model "$MODEL" \
+            --dataset-name "$DATASET" --random-input-len "$in" --random-output-len "$out" \
+            --random-range-ratio "$RANGE_RATIO" --num-prompts "$np" --max-concurrency "$c" \
+            --request-rate inf --ignore-eos >/dev/null 2>&1 \
+            || echo "[warn] per-config warmup failed; continuing to profiled run."
+    fi
     local before=""
     [ "$PROF" == "true" ] && before=$(list_traces)
     local ok=1

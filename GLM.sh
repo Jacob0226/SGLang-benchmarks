@@ -154,7 +154,18 @@ esac
 # InferenceMax tuning (from InferenceX/glm5_fp8_mi355x.sh)
 export SAFETENSORS_FAST_GPU=1
 export SGLANG_ROCM_FUSED_DECODE_MLA=0
-# export ROCM_QUICK_REDUCE_QUANTIZATION=
+# INT4-quantized quick all-reduce. This is the single biggest prefill lever on
+# MI355X: in the ATOM stack it alone cut i8k/conc64 TPOT ~10.7% (53.6->47.9ms) by
+# shrinking the TP all-reduce payload 4x. SGLang's own quick_all_reduce.py reads
+# ROCM_QUICK_REDUCE_QUANTIZATION; aiter's path reads AITER_QUICK_REDUCE_QUANTIZATION
+# -- set both so whichever all-reduce path is active gets quantized. Valid regimes:
+# NONE (off), FP, INT8, INT6, INT4. Measured GLM-5.2-MXFP4 i8k/conc64 on 6PR:
+# INT4 vs the docker's default INT8 -> 53.49->49.83ms TPOT (-6.8%), 1138->1228
+# tok/s (+7.9%). Use a dedicated knob (QUICK_REDUCE_QUANT) so we override the
+# image's baked-in ROCM_QUICK_REDUCE_QUANTIZATION=INT8; set QUICK_REDUCE_QUANT=INT8
+# (or NONE) to compare.
+export ROCM_QUICK_REDUCE_QUANTIZATION="${QUICK_REDUCE_QUANT:-INT4}"
+export AITER_QUICK_REDUCE_QUANTIZATION="${QUICK_REDUCE_QUANT:-INT4}"
 
 # GLM-5.2 DSA decode PAGED top-k routes to the DeepSeek-V4 "topk_v2" kernel, which
 # is JIT-compiled by hipcc at CUDA-graph capture from
@@ -186,6 +197,11 @@ fi
 # decode graphs (more capture time + memory). Only effective on branches that have
 # the dense-decode feature + DSA models (ignored otherwise).
 export SGLANG_DSA_DECODE_DUAL_GRAPH="${SGLANG_DSA_DECODE_DUAL_GRAPH:-1}"
+# DSA indexer query Hadamard + FP8 quant fused into one Triton kernel (PR #30715).
+# Opt-in, shape-guarded (gfx950, head_dim==block_size==128); default OFF in-product,
+# so enable it here to avoid silently benchmarking the two-pass path. Override with
+# SGLANG_DSA_FUSE_HADAMARD_QUANT=0. Ignored on branches without the feature.
+export SGLANG_DSA_FUSE_HADAMARD_QUANT="${SGLANG_DSA_FUSE_HADAMARD_QUANT:-1}"
 # export AITER_ONLINE_TUNE=1
 
 # Scheduler watchdog timeout (s). The torch-profiler teardown for an eager
@@ -448,9 +464,13 @@ start_server() {
         # cross_device_reduce + add_rmsnorm_quant pair (~12us/layer on MI355X,
         # matching ATOM's allreduce_fusion_kernel_1stage). gfx950-only path; enable
         # only for the AMD MXFP4 GLM-5.1/5.2 recipes it was validated against.
+        # DISABLE_AITER_ALLREDUCE_FUSION=1 omits the flag (required for
+        # --enable-prefill-cp, which asserts it's incompatible).
         case "${MODEL_NAME}" in
             amd_GLM-5.1-MXFP4|amd_GLM-5.2-MXFP4)
-                cmd+=(--enable-aiter-allreduce-fusion)
+                if [ "${DISABLE_AITER_ALLREDUCE_FUSION:-0}" != "1" ]; then
+                    cmd+=(--enable-aiter-allreduce-fusion)
+                fi
                 ;;
         esac
         if [ "$DUAL_STREAM_ROCM" == "true" ]; then
