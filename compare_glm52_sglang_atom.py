@@ -55,11 +55,13 @@ BUCKET_RULES = [
         r"reduce_scatter", r"all_?reduce", r"allgather", r"all_gather",
         r"nccl", r"rccl", r"cross_device", r"quick.*reduce", r"custom_all",
     ]),
-    # DSA indexer + top-k selection (paged MQA logits, hadamard, fp8 index quant, topk)
+    # DSA indexer + top-k selection (paged MQA logits, hadamard, fp8 index quant).
+    # NOTE: use SPECIFIC topk names (topk_transform / radix_topk) so we don't
+    # swallow MoE's expert top-k kernels (grouped_topk, moe_reduction_..._topk9).
     ("DSA indexer+topk", [
         r"paged_mqa_logits", r"mqa_logits", r"deepgemm_fp8_paged", r"hadamard",
-        r"topk", r"top_k", r"indexer", r"index_", r"transform_index",
-        r"fused_qk_rmsnorm_group_quant",
+        r"topk_transform", r"radix_topk", r"indexer", r"transform_index",
+        r"convert_req_index", r"fused_qk_rmsnorm_group_quant",
     ]),
     # sparse MLA attention core (triton sparse-mla, aiter mla, tilelang mla)
     ("sparse-MLA attn", [
@@ -74,10 +76,11 @@ BUCKET_RULES = [
     ("MoE down GEMM (moe2)", [
         r"moe2", r"moe_?stage2", r"down_proj_moe",
     ]),
-    # other MoE plumbing (routing/sorting/scatter/gather, generic fused_moe)
+    # other MoE plumbing: routing/sorting, expert top-k, output reduction, gather
     ("MoE routing/other", [
-        r"moe_sort", r"moe_align", r"fused_moe", r"grouped_?gemm", r"group_?gemm",
-        r"\bmoe\b", r"expert",
+        r"moe_sort", r"moe_align", r"moe_sorting", r"fused_moe", r"fused_mx_quant_moe",
+        r"grouped_?gemm", r"group_?gemm", r"grouped_topk", r"moe_reduction",
+        r"append_shared_expert", r"\bmoe\b", r"expert",
     ]),
     # dense / linear GEMM: attention q/kv/o projections + dense MLP (non-MoE)
     ("dense/linear GEMM", [
@@ -225,6 +228,101 @@ def segment_and_sum(kernels, ann, phase, stack):
 BUCKET_ORDER = [name for name, _ in BUCKET_RULES] + ["other"]
 
 
+def write_grouped_xlsx(path, phase, labels, meta, cats, sb, ab, sperk, aperk):
+    """Pretty module-grouped side-by-side workbook (compare_breakdown.py style).
+
+    One block per functional module (bucket): a filled header row with each
+    side's Σ / % / count, then the kernels of both sides listed side by side
+    (rank-aligned by descending duration, shorter side padded)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    LA, LB = labels
+    stot = sum(sb.values()) or 1.0
+    atot = sum(ab.values()) or 1.0
+
+    # per-bucket kernel lists: [(sum_ms, avg_us, count, name), ...] desc
+    def by_bucket(perk):
+        d = {}
+        for b, nm, us, c in perk:
+            d.setdefault(b, []).append((us / 1000.0, us / c if c else 0.0, c, nm))
+        for b in d:
+            d[b].sort(reverse=True)
+        return d
+    sK, aK = by_bucket(sperk), by_bucket(aperk)
+
+    wb = Workbook(); ws = wb.active; ws.title = f"{phase}_by_module"
+    bold = Font(name="Arial", size=10, bold=True)
+    reg = Font(name="Arial", size=9)
+    mono = Font(name="Consolas", size=9)
+    hdr_fill = PatternFill("solid", fgColor="305496")
+    mod_fill = PatternFill("solid", fgColor="D9E1F2")
+    tot_fill = PatternFill("solid", fgColor="FCE4D6")
+    white = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+    thin = Side(style="thin", color="BFBFBF")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center"); left = Alignment(horizontal="left")
+
+    headers = ["Module", f"{LA} Kernel", "Avg_us", "Σ_ms", "Cnt", "",
+               f"{LB} Kernel", "Avg_us", "Σ_ms", "Cnt"]
+    # title + meta
+    ws.cell(1, 1, f"GLM-5.2 {phase} — {LA} vs {LB} (per forward, grouped by module)").font = bold
+    ws.cell(2, 1, meta[0]).font = reg
+    ws.cell(3, 1, meta[1]).font = reg
+    r = 5
+    for c, h in enumerate(headers, 1):
+        cell = ws.cell(r, c, h); cell.font = white if h else reg
+        cell.fill = hdr_fill if h else PatternFill(); cell.alignment = center
+    ws.freeze_panes = f"A{r+1}"
+    r += 1
+
+    for b in cats:
+        s_ms = sb.get(b, 0.0) / 1000.0
+        a_ms = ab.get(b, 0.0) / 1000.0
+        ratio = (s_ms / a_ms) if a_ms > 1e-9 else float("inf")
+        # module header row
+        ws.cell(r, 1, b).font = bold
+        ws.cell(r, 4, round(s_ms, 3)).font = bold
+        ws.cell(r, 3, f"{s_ms/ (stot/1000):.0%}").font = reg
+        ws.cell(r, 9, round(a_ms, 3)).font = bold
+        ws.cell(r, 8, f"{a_ms/ (atot/1000):.0%}").font = reg
+        ws.cell(r, 5, f"A/B={ratio:.2f}").font = bold
+        for c in range(1, 11):
+            ws.cell(r, c).fill = mod_fill; ws.cell(r, c).border = border
+        r += 1
+        # kernel rows
+        sk = sK.get(b, []); ak = aK.get(b, [])
+        for i in range(max(len(sk), len(ak))):
+            if i < len(sk):
+                sm, sa, sc, snm = sk[i]
+                ws.cell(r, 2, snm[:70]).font = mono
+                ws.cell(r, 3, round(sa, 2)).font = reg
+                ws.cell(r, 4, round(sm, 3)).font = reg
+                ws.cell(r, 5, sc).font = reg
+            if i < len(ak):
+                am, aa, ac, anm = ak[i]
+                ws.cell(r, 7, anm[:70]).font = mono
+                ws.cell(r, 8, round(aa, 2)).font = reg
+                ws.cell(r, 9, round(am, 3)).font = reg
+                ws.cell(r, 10, ac).font = reg
+            r += 1
+
+    # total row
+    ws.cell(r, 1, "TOTAL").font = bold
+    ws.cell(r, 4, round(stot / 1000, 3)).font = bold
+    ws.cell(r, 9, round(atot / 1000, 3)).font = bold
+    ws.cell(r, 5, f"A/B={ (stot/atot) if atot else 0:.2f}").font = bold
+    for c in range(1, 11):
+        ws.cell(r, c).fill = tot_fill; ws.cell(r, c).border = border
+
+    widths = [26, 60, 9, 9, 6, 3, 60, 9, 9, 6]
+    for c, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(c)].width = w
+    wb.save(path)
+    print(f"[INFO] grouped xlsx written: {path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -234,6 +332,8 @@ def main():
     ap.add_argument("--atom", required=True, metavar="TRACE",
                     help="ATOM graph-ON trace (combined)")
     ap.add_argument("--out", required=True, metavar="CSV")
+    ap.add_argument("--xlsx", metavar="XLSX", default=None,
+                    help="also write a pretty module-grouped side-by-side workbook")
     ap.add_argument("--labels", nargs=2, default=["SGLANG", "ATOM"])
     ap.add_argument("--top", type=int, default=6,
                     help="top-N kernels per bucket to include in the detail CSV")
@@ -295,6 +395,11 @@ def main():
                 for us, nm, cnt in sorted(by_bucket.get(c, []), reverse=True)[:args.top]:
                     w.writerow([side, c, nm[:80], round(us/1000, 3), cnt])
     print(f"\n[INFO] CSV written: {out}")
+
+    if args.xlsx:
+        meta = (f"{LA}: {slabel}  [{snote}, span={sspan/1000:.1f}ms, Σ={stot/1000:.1f}ms, {snk} kernels]",
+                f"{LB}: {alabel}  [{anote}, span={aspan/1000:.1f}ms, Σ={atot/1000:.1f}ms, {ank} kernels]")
+        write_grouped_xlsx(args.xlsx, args.phase, (LA, LB), meta, cats, sb, ab, sperk, aperk)
 
 
 if __name__ == "__main__":

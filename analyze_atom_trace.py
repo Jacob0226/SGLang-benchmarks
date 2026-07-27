@@ -98,11 +98,30 @@ def extract(trace):
     return kernels, gann
 
 
+PHASE = "decode"   # set from --phase; "prefill" segments by prefill[ wrappers
+
+
 def segment_forwards(gann):
     """Return (segments, method) where segments = [(ts0, ts1), ...] one per
     forward pass. Prefers the `decode[...]` wrapper (cuda-graph traces); falls
     back to the layer-0 first-submodule marker (no-cuda-graph traces, which have
     no decode[] wrapper but repeat model.layers.0.* every forward)."""
+    if PHASE == "prefill":
+        # prefill[ markers are ~point annotations (dur~0), so bound each forward
+        # by the NEXT wrapper (prefill[ or decode[) on the stream. Drop the last
+        # prefill (no following wrapper to close it).
+        wraps = sorted([a for a in gann if a["name"].startswith(("prefill[", "decode["))],
+                       key=lambda a: a["ts"])
+        wts = [a["ts"] for a in wraps]
+        pre = [a for a in wraps if a["name"].startswith("prefill[")]
+        segs = []
+        for a in pre:
+            j = bisect.bisect_right(wts, a["ts"])
+            if j >= len(wts):
+                continue  # last wrapper, no end boundary
+            segs.append((a["ts"], wts[j]))
+        if segs:
+            return segs, "prefill[]"
     dsteps = sorted([a for a in gann if a["name"].startswith("decode[")],
                      key=lambda a: a["ts"])
     if dsteps:
@@ -302,11 +321,16 @@ def main():
     p.add_argument("--struct-trace", metavar="TRACE",
                    help="no-cuda-graph ATOM trace (annotation labels). "
                         "If omitted, kernels are left unlabeled.")
+    p.add_argument("--phase", choices=["decode", "prefill"], default="decode",
+                   help="which forward to isolate: decode step or prefill chunk")
     p.add_argument("--step", type=int, default=None,
                    help="decode step/forward index (default: median-duration one)")
     p.add_argument("--out", metavar="DIR", help="write step3_layer_breakdown xlsx here")
     p.add_argument("--tag", default="_ATOM", help="filename tag (default: _ATOM)")
     args = p.parse_args()
+
+    global PHASE
+    PHASE = args.phase
 
     struct_map = {}
     if args.struct_trace:
