@@ -34,6 +34,7 @@ def read_step3(path):
             "Section": r[h.get("Section")] if "Section" in h else "",
             "Leaf": r[h.get("LeafModule")] if "LeafModule" in h else "",
             "Kernel": kn,
+            "Avg_us": r[h["AvgDuration_us"]] if "AvgDuration_us" in h else "",
             "Sum_ms": (r[h["SumDuration_us"]] or 0) / 1000.0 if "SumDuration_us" in h else 0,
             "Count": r[h.get("Count")] if "Count" in h else "",
             "TrSum_ms": r[h["TraceSum_ms_fwd"]] if "TraceSum_ms_fwd" in h else "",
@@ -43,11 +44,12 @@ def read_step3(path):
     return out
 
 
-# Σ_ms/Cnt are per call site (avg in this forward x layers of that type);
-# TrΣ_ms/TrCnt are the kernel NAME's real totals in the same forward, repeated on
-# every row sharing the name — they expose call sites the structural model missed.
-COLS = ["LayerType", "Section", "LeafModule (caller)", "KernelName", "Σ_ms", "Cnt",
-        "TrΣ_ms", "TrCnt", "CallSite"]
+# Avg_us is the cost of ONE launch; Σ_ms/Cnt are per call site (avg x layers of
+# that type); TrΣ_ms/TrCnt are the kernel NAME's real totals in the same forward,
+# repeated on every row sharing the name — they expose call sites the structural
+# model missed.
+COLS = ["LayerType", "Section", "LeafModule (caller)", "KernelName", "Avg_us",
+        "Σ_ms", "Cnt", "TrΣ_ms", "TrCnt", "CallSite"]
 
 import re
 # functional category rules (first match wins); GLM-5.2 specific
@@ -137,11 +139,11 @@ def main():
                 continue
             d = rows[i]; c0 = 1 + si * (ncol + gap)
             vals = [d["LayerType"], d["Section"], d["Leaf"], d["Kernel"],
-                    round(d["Sum_ms"], 3), d["Count"],
+                    d["Avg_us"], round(d["Sum_ms"], 3), d["Count"],
                     d["TrSum_ms"], d["TrCount"], d["CallSite"]]
             for j, v in enumerate(vals):
                 cell = ws.cell(rr, c0 + j, v)
-                cell.font = mono if j in (3, 8) else reg
+                cell.font = mono if j in (3, 9) else reg
 
     # --- category summary table at the bottom ---
     sr = hr + 1 + maxlen + 2   # leave a gap
@@ -196,7 +198,7 @@ def main():
             cell = ws.cell(sr, 2 + si, round(totals[si], 3)); cell.font = bold; cell.fill = tot_fill
 
     # widths
-    widths = [16, 22, 24, 46, 8, 5, 8, 6, 40]
+    widths = [16, 22, 24, 46, 9, 8, 5, 8, 6, 40]
     for si in range(len(sources)):
         c0 = 1 + si * (ncol + gap)
         for j, w in enumerate(widths):
