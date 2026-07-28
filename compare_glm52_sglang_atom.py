@@ -108,6 +108,8 @@ BUCKET_RULES = [
 ]
 COMPILED = [(name, [re.compile(p) for p in pats]) for name, pats in BUCKET_RULES]
 
+EXCLUDE_TAIL = False  # set from --exclude-tail
+
 
 def classify(kernel_name: str) -> str:
     n = kernel_name.lower()
@@ -214,18 +216,110 @@ def segment_and_sum(kernels, ann, phase, stack):
         note = f"median-of-{len(cands)}" if len(cands) > 1 else "only-1"
 
     tot, label, span, win = chosen
+    if EXCLUDE_TAIL and win:
+        # Drop end-of-step tail (lm_head / sampling / logits allgather / broadcast
+        # / next-token embedding / metadata) that runs after the last decoder layer,
+        # so scope matches SGLang's per-layer breakdown. Boundary = end of the last
+        # per-layer TP all-reduce (reduce_scatter / cross_device / quickreduce twoshot).
+        _ar = re.compile(r"reduce_scatter|cross_device|allreduce_prototype|quickreduce")
+        ends = [k["ts"] + k["dur"] for k in win if _ar.search(k["name"].lower())]
+        if ends:
+            cut = max(ends)
+            win = [k for k in win if k["ts"] < cut + 1]
     buckets = defaultdict(float)
-    perk = defaultdict(lambda: [0.0, 0])
+    perk = defaultdict(lambda: [0.0, 0, float("inf")])  # sum, count, first_ts
     for k in win:
         b = classify(k["name"])
         buckets[b] += k["dur"]
-        perk[(b, k["name"])][0] += k["dur"]
-        perk[(b, k["name"])][1] += 1
-    perk_rows = [(b, nm, us, c) for (b, nm), (us, c) in perk.items()]
-    return label, span, dict(buckets), tot, len(win), perk_rows, note
+        e = perk[(b, k["name"])]
+        e[0] += k["dur"]; e[1] += 1; e[2] = min(e[2], k["ts"])
+    perk_rows = [(b, nm, us, c) for (b, nm), (us, c, _t) in perk.items()]
+    # call-order: aggregated kernels sorted by first-seen timestamp
+    callorder = sorted([(t, b, nm, us, c) for (b, nm), (us, c, t) in perk.items()],
+                       key=lambda x: x[0])
+    return label, span, dict(buckets), tot, len(win), perk_rows, note, callorder
 
 
 BUCKET_ORDER = [name for name, _ in BUCKET_RULES] + ["other"]
+
+
+def write_callorder_xlsx(path, phase, labels, meta, cats, sb, ab, sco, aco):
+    """Single-forward, tail-excluded call-order side-by-side (SGLang | ATOM),
+    each kernel tagged by functional category, + a category summary at the bottom.
+    Both sides come from the SAME segment_and_sum single-forward window, so counts
+    and durations are on the identical scale (no multi-forward aggregation)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    LA, LB = labels
+    wb = Workbook(); ws = wb.active; ws.title = f"{phase}_callorder"
+    bold = Font(name="Arial", size=10, bold=True)
+    reg = Font(name="Arial", size=9)
+    mono = Font(name="Consolas", size=9)
+    white = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+    src_fill = PatternFill("solid", fgColor="305496")
+    hdr_fill = PatternFill("solid", fgColor="8EAADB")
+    tot_fill = PatternFill("solid", fgColor="FCE4D6")
+    center = Alignment(horizontal="center")
+    COLS = ["Category", "KernelName", "Σ_ms", "Cnt"]
+    ncol = len(COLS); gap = 1
+    ws.cell(1, 1, f"GLM-5.2 {phase} — call order (single forward, tail-excluded), "
+                  f"tagged by category. {LA} | {LB}, NOT aligned.").font = bold
+    ws.cell(2, 1, meta[0]).font = reg
+    ws.cell(3, 1, meta[1]).font = reg
+    r0 = 5
+    for si, lab in enumerate((LA, LB)):
+        c0 = 1 + si * (ncol + gap)
+        for j in range(ncol):   # fill the band cells (no merge -> avoids Excel repair prompt)
+            cell = ws.cell(r0, c0 + j, lab if j == 0 else "")
+            cell.font = white; cell.fill = src_fill; cell.alignment = center
+    hr = r0 + 1
+    for si in range(2):
+        c0 = 1 + si * (ncol + gap)
+        for j, h in enumerate(COLS):
+            cell = ws.cell(hr, c0 + j, h); cell.font = bold; cell.fill = hdr_fill
+    ws.freeze_panes = f"A{hr+1}"
+    maxlen = max(len(sco), len(aco))
+    for i in range(maxlen):
+        rr = hr + 1 + i
+        for si, co in enumerate((sco, aco)):
+            if i >= len(co):
+                continue
+            _t, b, nm, us, c = co[i]
+            c0 = 1 + si * (ncol + gap)
+            ws.cell(rr, c0 + 0, b).font = reg
+            ws.cell(rr, c0 + 1, nm[:70]).font = mono
+            ws.cell(rr, c0 + 2, round(us / 1000.0, 3)).font = reg
+            ws.cell(rr, c0 + 3, c).font = reg
+    # category summary
+    sr = hr + 1 + maxlen + 2
+    ws.cell(sr, 1, "=== Category summary (Σ ms per category, same single forward) ===").font = bold
+    sr += 1
+    for j, h in enumerate(["Category", f"{LA}_ms", f"{LB}_ms",
+                           f"Delta_{LA}_minus_{LB}_ms", f"{LA}_over_{LB}"]):
+        cell = ws.cell(sr, 1 + j, h); cell.font = white; cell.fill = src_fill
+    sr += 1
+    for c in cats:
+        a = sb.get(c, 0.0) / 1000.0; b = ab.get(c, 0.0) / 1000.0
+        ws.cell(sr, 1, c).font = bold
+        ws.cell(sr, 2, round(a, 3)).font = reg
+        ws.cell(sr, 3, round(b, 3)).font = reg
+        ws.cell(sr, 4, round(a - b, 3)).font = reg
+        ws.cell(sr, 5, round(a / b, 3) if b > 1e-9 else "").font = reg
+        sr += 1
+    stot = sum(sb.values()) / 1000.0; atot = sum(ab.values()) / 1000.0
+    ws.cell(sr, 1, "TOTAL").font = bold
+    ws.cell(sr, 2, round(stot, 3)).font = bold
+    ws.cell(sr, 3, round(atot, 3)).font = bold
+    ws.cell(sr, 4, round(stot - atot, 3)).font = bold
+    ws.cell(sr, 5, round(stot / atot, 3) if atot else "").font = bold
+    for cc in range(1, 6):
+        ws.cell(sr, cc).fill = tot_fill
+    widths = [22, 60, 9, 6, 3, 22, 60, 9, 6]
+    for c, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(c)].width = w
+    wb.save(path)
+    print(f"[INFO] call-order + summary xlsx written: {path}")
 
 
 def write_grouped_xlsx(path, phase, labels, meta, cats, sb, ab, sperk, aperk):
@@ -337,12 +431,18 @@ def main():
     ap.add_argument("--labels", nargs=2, default=["SGLANG", "ATOM"])
     ap.add_argument("--top", type=int, default=6,
                     help="top-N kernels per bucket to include in the detail CSV")
+    ap.add_argument("--exclude-tail", dest="exclude_tail", action="store_true",
+                    help="drop end-of-step tail (lm_head/sampling/embedding/broadcast/"
+                         "metadata) after the last layer's TP all-reduce, for a fair "
+                         "per-layer scope on both sides")
     args = ap.parse_args()
+    global EXCLUDE_TAIL
+    EXCLUDE_TAIL = args.exclude_tail
 
     sk, sa, sd = collect(load_trace(args.sglang))
     ak, aa, ad = collect(load_trace(args.atom))
-    slabel, sspan, sb, stot, snk, sperk, snote = segment_and_sum(sk, sa, args.phase, "sglang")
-    alabel, aspan, ab, atot, ank, aperk, anote = segment_and_sum(ak, aa, args.phase, "atom")
+    slabel, sspan, sb, stot, snk, sperk, snote, sco = segment_and_sum(sk, sa, args.phase, "sglang")
+    alabel, aspan, ab, atot, ank, aperk, anote, aco = segment_and_sum(ak, aa, args.phase, "atom")
 
     LA, LB = args.labels
     print(f"\n=== GLM-5.2 {args.phase} comparison ({LA} vs {LB}) ===")
@@ -374,7 +474,8 @@ def main():
         w.writerow([f"# {LB} forward", alabel, anote, f"span_ms={aspan/1000:.2f}",
                     f"sigma_ms={atot/1000:.2f}", f"nkernels={ank}"])
         w.writerow([])
-        w.writerow(["Bucket", f"{LA}_ms", f"{LB}_ms", "Delta_A_minus_B_ms", "A_over_B"])
+        w.writerow(["Bucket", f"{LA}_ms", f"{LB}_ms",
+                    f"Delta_{LA}_minus_{LB}_ms", f"{LA}_over_{LB}"])
         for c in cats:
             a = sb.get(c, 0.0) / 1000
             b = ab.get(c, 0.0) / 1000
@@ -399,7 +500,7 @@ def main():
     if args.xlsx:
         meta = (f"{LA}: {slabel}  [{snote}, span={sspan/1000:.1f}ms, Σ={stot/1000:.1f}ms, {snk} kernels]",
                 f"{LB}: {alabel}  [{anote}, span={aspan/1000:.1f}ms, Σ={atot/1000:.1f}ms, {ank} kernels]")
-        write_grouped_xlsx(args.xlsx, args.phase, (LA, LB), meta, cats, sb, ab, sperk, aperk)
+        write_callorder_xlsx(args.xlsx, args.phase, (LA, LB), meta, cats, sb, ab, sco, aco)
 
 
 if __name__ == "__main__":

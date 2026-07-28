@@ -22,6 +22,12 @@ Usage:
 
     # Export step 1 to CSV
     python auto_detect_layer.py --graph-on on.trace.json.gz --csv kernels.csv
+
+    # Restrict to ONE forward pass (per-forward numbers, comparable with
+    # compare_glm52_sglang_atom.py); without it every kernel's Avg is a
+    # whole-trace average that blends forwards of different batch/token sizes
+    python auto_detect_layer.py --graph-on on.trace.json.gz \
+        --graph-off off.trace.json.gz --forward-match "bs=3"
 """
 
 import argparse
@@ -74,6 +80,63 @@ def extract_gpu_kernels(trace: dict | list, stream: int | None = None) -> list[d
         })
     kernels.sort(key=lambda k: k["ts"])
     return kernels
+
+
+FORWARD_PREFIXES = ("step[", "prefill[", "decode[")
+
+
+def find_forward_windows(trace: dict | list, cat: str, match: str,
+                         stream: int | None = None) -> list[tuple[float, float, str]]:
+    """Forward-pass windows from profiler annotations, as [(ts0, ts1, name)].
+
+    `cat` is "gpu_user_annotation" (GPU-side, bounds kernels) or "user_annotation"
+    (CPU-side, bounds nn.Module / python_function events).  Only wrappers whose
+    name starts with a forward prefix (step[ / prefill[ / decode[) and contains
+    `match` are returned.  Annotations without a duration are closed by the next
+    wrapper on the same track.
+    """
+    events = trace if isinstance(trace, list) else trace.get("traceEvents", [])
+    wraps = []
+    for ev in events:
+        if not isinstance(ev, dict) or ev.get("ph") != "X":
+            continue
+        if ev.get("cat") != cat:
+            continue
+        name = ev.get("name", "")
+        if not name.startswith(FORWARD_PREFIXES):
+            continue
+        if cat == "gpu_user_annotation" and stream is not None and ev.get("tid") != stream:
+            continue
+        wraps.append((float(ev.get("ts", 0)), float(ev.get("dur", 0)), name))
+    wraps.sort()
+    out = []
+    for i, (ts, dur, name) in enumerate(wraps):
+        end = ts + dur if dur > 0 else (wraps[i + 1][0] if i + 1 < len(wraps)
+                                        else float("inf"))
+        if match in name:
+            out.append((ts, end, name))
+    return out
+
+
+def select_forward_window(windows: list[tuple[float, float, str]],
+                          kernels: list[dict] | None,
+                          pick: str) -> tuple[float, float, str]:
+    """Choose one window out of the candidates.
+
+    pick=first/last → by time; pick=min/median/max → by Σ kernel duration inside
+    the window (needs `kernels`), which is how compare_glm52_sglang_atom.py picks
+    its representative forward.
+    """
+    if len(windows) == 1 or kernels is None or pick in ("first", "last"):
+        return windows[0] if pick != "last" else windows[-1]
+    scored = sorted(
+        ((sum(k["dur"] for k in kernels if w[0] <= k["ts"] < w[1]), w)
+         for w in windows), key=lambda sw: sw[0])
+    if pick == "min":
+        return scored[0][1]
+    if pick == "max":
+        return scored[-1][1]
+    return scored[len(scored) // 2][1]
 
 
 def auto_detect_stream(trace: dict | list,
@@ -249,7 +312,16 @@ def write_step3(layer_types: list[dict], kernels_off: list[dict],
       Count, SumDuration_us, Percentage,  ← graph-ON stats (empty if not matched)
       MatchMethod,      ← "exact" / "norm" / "none"
       GraphOFF_KernelName, GraphOFF_Duration_us,  ← graph-OFF reference
-      CallSite
+      CallSite,
+      TraceCount_fwd, TraceSum_ms_fwd  ← ground truth for the whole forward:
+          the kernel NAME's real count / Σ from graph-ON (repeated on every row
+          that shares the name, so do NOT sum this column).
+
+    Σ assumes a call site fires once per layer of its type, which is taken from ONE
+    representative layer. Kernels that only run in SOME layers of a type (in
+    GLM-5.2 the DSA indexer chain runs in layers 0-2 and then every 4th layer) are
+    therefore under-counted; the coverage report printed at the end lists every
+    kernel whose structural Σ disagrees with TraceSum_ms_fwd.
     """
     # Build stat lookups (exact + hash-normalized)
     stat_lookup: dict[str, dict] = {}
@@ -266,12 +338,14 @@ def write_step3(layer_types: list[dict], kernels_off: list[dict],
                "Count", "SumDuration_us", "Percentage",
                "MatchMethod",
                "GraphOFF_KernelName", "GraphOFF_Duration_us",
-               "CallSite"]
+               "CallSite",
+               "TraceCount_fwd", "TraceSum_ms_fwd"]
 
     rows = []
+    grand_total = 0.0  # sum of per-callsite graph-ON Σ (one forward), for Percentage
     for i, lt in enumerate(layer_types):
         if i > 0:
-            rows.append([""] * len(headers))
+            rows.append(None)  # placeholder blank row, filled after totals
         label = chr(ord("A") + i)
         sub_mod_str = " + ".join(lt["sub_modules"])
         for pos, (kidx, top_mod, leaf) in enumerate(lt.get("kernel_breakdown", [])):
@@ -286,11 +360,18 @@ def write_step3(layer_types: list[dict], kernels_off: list[dict],
                 s, method = None, "none"
 
             if s:
+                # PER-CALL-SITE attribution: this breakdown entry is ONE kernel launch
+                # in ONE representative layer, so it fires once per layer of this type.
+                # Count  = layers of this type (lt.count) * this position's launches (1)
+                # Σ (ms) = per-launch graph-ON avg (matched by name) * that count.
+                # This avoids the old bug where every call-site of a shared kernel
+                # (e.g. all-reduce) got the WHOLE-trace name total, inflating totals.
                 kernel_name = s["name"]
                 avg_dur = round(s["avg_dur"], 3)
-                count = s["count"]
-                sum_dur = round(s["sum_dur"], 1)
-                pct = round(s["pct"], 2)
+                count = lt["count"]
+                sum_dur = round(s["avg_dur"] * lt["count"], 1)
+                grand_total += sum_dur
+                pct = None  # filled after grand_total is known
             else:
                 kernel_name = off_name
                 avg_dur = off_dur
@@ -305,8 +386,20 @@ def write_step3(layer_types: list[dict], kernels_off: list[dict],
                    count, sum_dur, pct,
                    method,
                    off_name, off_dur,
-                   cs]
+                   cs,
+                   s["count"] if s else "",
+                   round(s["sum_dur"] / 1000.0, 3) if s else ""]
             rows.append(row)
+
+    # second pass: fill blank separator rows and Percentage (row_Σ / grand_total)
+    out_rows = []
+    for r in rows:
+        if r is None:
+            out_rows.append([""] * len(headers)); continue
+        if r[9] is None:  # pct placeholder
+            r[9] = round(100.0 * r[8] / grand_total, 2) if grand_total else 0.0
+        out_rows.append(r)
+    rows = out_rows
 
     _write_xlsx(headers, rows, path)
     n_matched = sum(1 for r in rows if r and r[10] != "none" and r[10] != "")
@@ -314,6 +407,33 @@ def write_step3(layer_types: list[dict], kernels_off: list[dict],
     print(f"[INFO] Step 3 written to: {path} "
           f"({n_total} kernels, {n_matched} matched to graph-ON)",
           file=sys.stderr)
+    _print_coverage(rows, kernel_stats)
+
+
+def _print_coverage(rows: list[list], kernel_stats: list[dict] | None) -> None:
+    """Report kernels whose structural Σ (avg x layers) misses the real per-forward
+    Σ, i.e. call sites that exist in only some layers of a layer type."""
+    if not kernel_stats:
+        return
+    struct: dict[str, float] = {}
+    for r in rows:
+        if not r or not isinstance(r[8], (int, float)):
+            continue
+        struct[r[5]] = struct.get(r[5], 0.0) + r[8]
+    truth = {s["name"]: s["sum_dur"] for s in kernel_stats}
+    covered = sum(struct.values())
+    total = sum(truth.values())
+    off = [(struct.get(n, 0.0) - t, n, struct.get(n, 0.0), t)
+           for n, t in truth.items()
+           if t > 0 and abs(struct.get(n, 0.0) - t) / t > 0.05]
+    print(f"[INFO] Coverage: structural Σ = {fmt_dur(covered)} of the forward's "
+          f"{fmt_dur(total)} ({100*covered/total:.1f}%)", file=sys.stderr)
+    if off:
+        print(f"[WARN] {len(off)} kernels whose per-call-site Σ differs >5% from "
+              f"the real per-forward Σ (see TraceSum_ms_fwd column):", file=sys.stderr)
+        for d, n, s, t in sorted(off, key=lambda x: -abs(x[0]))[:10]:
+            print(f"         {d/1000:+8.2f} ms  struct={s/1000:7.2f} "
+                  f"trace={t/1000:7.2f}  {n[:60]}", file=sys.stderr)
 
 
 # ===================================================================
@@ -350,13 +470,20 @@ def find_decoder_layer_class(trace: dict | list) -> str | None:
     return max(pool, key=lambda c: c[1] * c[2])[0]
 
 
-def get_one_forward_pass(trace: dict | list, cls_name: str) -> list[dict]:
-    """Get nn.Module events for one forward pass (2nd pass to skip warmup)."""
+def get_one_forward_pass(trace: dict | list, cls_name: str,
+                         window: tuple[float, float, str] | None = None) -> list[dict]:
+    """Get nn.Module events for one forward pass (2nd pass to skip warmup).
+
+    With `window` (from find_forward_windows on the CPU-side annotations) only
+    module events inside that forward are considered, so the structure comes from
+    the same batch shape the timing stats were taken from.
+    """
     events = trace if isinstance(trace, list) else trace.get("traceEvents", [])
     all_events = sorted(
         [ev for ev in events
          if isinstance(ev, dict) and ev.get("ph") == "X"
-         and re.sub(r'_\d+$', '', ev.get("name", "").replace("nn.Module: ", "")) == cls_name],
+         and re.sub(r'_\d+$', '', ev.get("name", "").replace("nn.Module: ", "")) == cls_name
+         and (window is None or window[0] <= ev["ts"] < window[1])],
         key=lambda ev: ev["ts"],
     )
     instances = set(ev["name"] for ev in all_events)
@@ -755,7 +882,8 @@ def find_deep_kernel_labels(module_events: list[dict], layer_ev: dict,
     return labels
 
 
-def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
+def analyze_layer_structure(trace: dict | list, kernels: list[dict],
+                            window: tuple[float, float, str] | None = None):
     """
     Step 2: Discover layer structure.
     Returns (cls_name, layer_types, callsite_map) where layer_types is:
@@ -768,7 +896,7 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict]):
     if cls_name is None:
         return None, [], {}
 
-    forward_pass = get_one_forward_pass(trace, cls_name)
+    forward_pass = get_one_forward_pass(trace, cls_name, window)
     if not forward_pass:
         return cls_name, [], {}
 
@@ -1101,6 +1229,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Cuda-graph-OFF trace (for layer structure)")
     p.add_argument("--stream", type=int, default=None,
                    help="GPU stream ID (default: auto-detect)")
+    p.add_argument("--forward-match", metavar="SUBSTR", default=None,
+                   help="restrict statistics to ONE forward pass: the profiler "
+                        "annotation wrapping it must contain SUBSTR, e.g. "
+                        "'bs=3' or 'DECODE bs=64'. Without this, Step 1 averages "
+                        "each kernel over the WHOLE trace, which mixes forwards of "
+                        "different batch/token sizes (a 7.6k-token and a 16.4k-token "
+                        "prefill chunk get blended into one average).")
+    p.add_argument("--forward-pick", choices=["first", "last", "min", "median", "max"],
+                   default="median",
+                   help="which matching forward to use when several match "
+                        "(min/median/max are by Σ kernel duration; default: median)")
     p.add_argument("--out", metavar="DIR",
                    help="Export Excel files to directory (step1_kernel_stats.xlsx, step3_layer_breakdown.xlsx)")
     p.add_argument("--tag", metavar="TAG", default="",
@@ -1134,6 +1273,18 @@ def main() -> None:
         print(f"[INFO] Found {len(kernels_on)} kernels on {stream_desc}",
               file=sys.stderr)
 
+        if args.forward_match:
+            wins = find_forward_windows(trace_on, "gpu_user_annotation",
+                                        args.forward_match, stream_on)
+            if not wins:
+                sys.exit(f"[ERROR] no forward annotation matching "
+                         f"{args.forward_match!r} in {args.graph_on}")
+            w = select_forward_window(wins, kernels_on, args.forward_pick)
+            kernels_on = [k for k in kernels_on if w[0] <= k["ts"] < w[1]]
+            print(f"[INFO] Step 1 restricted to ONE forward: {w[2]} "
+                  f"({args.forward_pick}-of-{len(wins)}) → {len(kernels_on)} kernels, "
+                  f"Σ={fmt_dur(sum(k['dur'] for k in kernels_on))}", file=sys.stderr)
+
         kernel_stats = compute_kernel_stats(kernels_on)
         print_step1(kernel_stats)
         del trace_on, kernels_on  # free memory; stats are all we need
@@ -1152,8 +1303,25 @@ def main() -> None:
         print(f"[INFO] Found {len(kernels_off)} kernels on {stream_desc}",
               file=sys.stderr)
 
+        window_off = None
+        if args.forward_match:
+            # CPU-side annotations bound the nn.Module events; the label differs
+            # slightly from the graph-ON run (e.g. toks=16341 vs toks=16368), so
+            # match on the shared part (e.g. "bs=3").
+            wins_off = find_forward_windows(trace_off, "user_annotation",
+                                            args.forward_match)
+            if wins_off:
+                window_off = wins_off[min(1, len(wins_off) - 1)]
+                print(f"[INFO] Step 2 structure restricted to forward: "
+                      f"{window_off[2]} (of {len(wins_off)} matching)",
+                      file=sys.stderr)
+            else:
+                print(f"[WARN] no CPU-side forward annotation matching "
+                      f"{args.forward_match!r} in the graph-OFF trace; "
+                      f"falling back to the 2nd forward pass", file=sys.stderr)
+
         cls_name, layer_types, callsite_map = analyze_layer_structure(
-            trace_off, kernels_off)
+            trace_off, kernels_off, window_off)
         if cls_name:
             print_step2(cls_name, layer_types)
 

@@ -64,19 +64,65 @@ def fmt(us):
 
 
 # --- annotation name → (section, leaf) ------------------------------------
+# GLM-5.2: map ATOM's annotation names to SGLang's *class* Section names so the
+# two step3 breakdowns align in compare_breakdown.py. ATOM classes are nearly
+# identical to SGLang (DeepseekV2MLAAttention≈DeepseekV2AttentionMLA, DeepseekV2MoE,
+# DeepseekV2MLP, Indexer) but its profiler regions are op/annotation names
+# (self_attn, mla_decode, mlp.experts.fused_moe, ...). This normalises them.
+_ATTN = "DeepseekV2AttentionMLA"
+_MOE = "DeepseekV2MoE"
+_MLP = "DeepseekV2MLP"
+
+
 def classify(name: str):
-    """Map a gpu_user_annotation name to (section, leaf)."""
+    """Map a gpu_user_annotation name to (SGLang-style section, leaf)."""
+    # strip "model.layers.N." if present; keep the remainder for leaf detail
+    rest = name
     if name.startswith("model.layers."):
-        parts = name.split(".")
-        rest = parts[3:]            # drop model / layers / N
-        if not rest:
-            return "layer", ""
-        section = rest[0]           # self_attn | mlp | ...
-        leaf = ".".join(rest[1:])   # fused_qkv_a_proj | indexer.wq_b | gate ...
-        return section, leaf
-    if name.startswith("nccl"):
+        parts = name.split(".", 3)
+        rest = parts[3] if len(parts) > 3 else ""
+    key = (rest or name).lower()
+
+    # ---- MoE / dense MLP (check shared_experts before gate_up so the shared
+    # expert body counts as MoE, not a standalone dense MLP) ----
+    if "shared_expert" in key:
+        return _MOE, "shared_experts"
+    if key.startswith("mlp.gate_up_proj") or key.startswith("mlp.down_proj") \
+       or key == "gate_up_proj" or key == "down_proj":
+        return _MLP, rest.split("mlp.", 1)[-1] if "mlp." in rest else rest
+    if "fused_moe" in key or ".experts" in key or key.startswith("experts") \
+       or "mxfp4_moe" in key or key.endswith("_moe") or "moe_sort" in key:
+        return _MOE, "FusedMoE"
+    if key.startswith("mlp.gate") or key == "gate" or "moegate" in key:
+        return _MOE, "MoEGate"
+
+    # ---- attention (MLA + indexer) ----
+    if "indexer" in key:
+        leaf = "Indexer"
+        if "indexer." in rest:
+            leaf = "Indexer > " + rest.split("indexer.", 1)[1]
+        return _ATTN, leaf
+    if "q_proj_and_k_up" in key:
+        return _ATTN, "q_proj_and_k_up_proj"
+    if "v_up_proj_and_o" in key:
+        return _ATTN, "v_up_proj_and_o_proj"
+    if "mla_decode" in key or "mla_prefill" in key or key == "mla_attn":
+        return _ATTN, "RadixAttention"
+    if "rope_and_kv" in key or "kv_cache" in key or "concat_and_cache" in key:
+        return _ATTN, "rope_and_kv_cache"
+    if "qkv_a_proj_reduce" in key or "rmsnorm_quant" in key or "fused_qk_rmsnorm" in key:
+        return _ATTN, "rmsnorm/quant"
+    if "fused_qkv_a_proj" in key:
+        return _ATTN, "fused_qkv_a_proj"
+    if key.startswith("self_attn") or "q_b_proj" in key or "kv_b_proj" in key \
+       or "o_proj" in key or "q_a_layernorm" in key or "kv_a_layernorm" in key:
+        leaf = rest.split("self_attn.", 1)[-1] if "self_attn." in rest else (rest or "(self)")
+        return _ATTN, leaf or "(self)"
+
+    if name.startswith("nccl") or "reduce_scatter" in key or "all_reduce" in key \
+       or "allreduce" in key or "allgather" in key:
         return "comm", name.split(":", 1)[-1]
-    # op-level regions (rmsnorm, rmsnorm_quant, kv_cache, mxfp4_moe, ...)
+    # step-level / misc op regions (rmsnorm, prepare_*, ...)
     return name, ""
 
 
@@ -99,10 +145,14 @@ def extract(trace):
 
 
 PHASE = "decode"   # set from --phase; "prefill" segments by prefill[ wrappers
+PICK = "median"    # set from --pick; which forward to isolate: min|median|max
+EXCLUDE_TAIL = False  # set from --exclude-tail; drop lm_head/sampling/etc after last layer
+MATCH = None       # set from --forward-match; only forwards whose wrapper label
+                   # contains this substring are candidates (e.g. "bs=3 tok=16384")
 
 
 def segment_forwards(gann):
-    """Return (segments, method) where segments = [(ts0, ts1), ...] one per
+    """Return (segments, method) where segments = [(ts0, ts1, label), ...] one per
     forward pass. Prefers the `decode[...]` wrapper (cuda-graph traces); falls
     back to the layer-0 first-submodule marker (no-cuda-graph traces, which have
     no decode[] wrapper but repeat model.layers.0.* every forward)."""
@@ -119,20 +169,20 @@ def segment_forwards(gann):
             j = bisect.bisect_right(wts, a["ts"])
             if j >= len(wts):
                 continue  # last wrapper, no end boundary
-            segs.append((a["ts"], wts[j]))
+            segs.append((a["ts"], wts[j], a["name"]))
         if segs:
             return segs, "prefill[]"
     dsteps = sorted([a for a in gann if a["name"].startswith("decode[")],
                      key=lambda a: a["ts"])
     if dsteps:
-        return [(a["ts"], a["ts"] + a["dur"]) for a in dsteps], "decode[]"
+        return [(a["ts"], a["ts"] + a["dur"], a["name"]) for a in dsteps], "decode[]"
     l0 = sorted([a for a in gann if a["name"].startswith("model.layers.0.")],
                 key=lambda a: a["ts"])
     if not l0:
         sys.exit("[ERROR] no decode[] or model.layers.0.* annotations found.")
     key = l0[0]["name"]                      # forward-start boundary marker
     starts = sorted(a["ts"] for a in gann if a["name"] == key)
-    segs = [(starts[i], starts[i + 1]) for i in range(len(starts) - 1)]
+    segs = [(starts[i], starts[i + 1], key) for i in range(len(starts) - 1)]
     return segs, key
 
 
@@ -146,18 +196,34 @@ def pick_decode_step(gann, kernels, step_idx):
     def seg_dur(s0, s1):
         lo = bisect.bisect_left(kts, s0); hi = bisect.bisect_left(kts, s1)
         return sum(kdur[t] for t in kts[lo:hi])
-    durs = [seg_dur(*s) for s in segs]
+    durs = [seg_dur(s[0], s[1]) for s in segs]
     print(f"[INFO] segmentation by '{method}': {len(segs)} forward passes; "
           f"kernel-Σdur min/median/max = "
           f"{fmt(min(durs))}/{fmt(sorted(durs)[len(durs)//2])}/{fmt(max(durs))}",
           file=sys.stderr)
+    # candidate forwards: those whose wrapper label matches --forward-match
+    cand = list(range(len(segs)))
+    if MATCH:
+        matched = [i for i in cand if MATCH in segs[i][2]]
+        if matched:
+            cand = matched
+            print(f"[INFO] --forward-match {MATCH!r}: {len(cand)} candidate forwards",
+                  file=sys.stderr)
+        else:
+            print(f"[WARN] --forward-match {MATCH!r} matched no forward wrapper; "
+                  f"using all {len(cand)} forwards", file=sys.stderr)
     if step_idx is None:
-        # steady-state decode ~ the median-duration segment (prefill is the long outlier)
-        step_idx = sorted(range(len(segs)), key=lambda i: durs[i])[len(segs) // 2]
+        order = sorted(cand, key=lambda i: durs[i])
+        if PICK == "min":       # a short decode step (eager combined trace)
+            step_idx = order[max(0, len(order) // 20)]   # ~5th percentile, skip empties
+        elif PICK == "max":     # the long prefill chunk
+            step_idx = order[-1]
+        else:                    # median (steady-state decode on a decode-only trace)
+            step_idx = order[len(order) // 2]
     step_idx = max(0, min(step_idx, len(segs) - 1))
-    s0, s1 = segs[step_idx]
-    print(f"[INFO] using forward #{step_idx} (kernel Σdur {fmt(durs[step_idx])})",
-          file=sys.stderr)
+    s0, s1, label = segs[step_idx]
+    print(f"[INFO] using forward #{step_idx} {label} "
+          f"(kernel Σdur {fmt(durs[step_idx])})", file=sys.stderr)
     return {"ts": s0, "dur": s1 - s0}
 
 
@@ -189,6 +255,22 @@ def _one_step(trace, step_idx):
     step = pick_decode_step(gann, kernels, step_idx)
     s0, s1 = step["ts"], step["ts"] + step["dur"]
     kin = [k for k in kernels if s0 <= k["ts"] < s1]
+    if EXCLUDE_TAIL and kin:
+        # Trim the end-of-step tail (lm_head / sampling / logits allgather /
+        # broadcast / next-token embedding / metadata prep) that runs AFTER the
+        # last decoder layer, so ATOM's range matches SGLang's per-layer scope.
+        # Boundary = end of the LAST per-layer TP all-reduce (reduce_scatter /
+        # cross_device / quickreduce/aiter twoshot). allgather is excluded (tail).
+        import re as _re
+        ar = _re.compile(r"reduce_scatter|cross_device|allreduce_prototype|quickreduce")
+        ends = [k["ts"] + k["dur"] for k in kin if ar.search(k["name"].lower())]
+        if ends:
+            cut = max(ends)
+            before = len(kin)
+            kin = [k for k in kin if k["ts"] < cut + 1]
+            s1 = cut
+            print(f"[INFO] --exclude-tail: trimmed at last TP all-reduce; "
+                  f"kept {len(kin)}/{before} kernels", file=sys.stderr)
     gin = sorted([a for a in gann if s0 <= a["ts"] < s1 and not _is_wrapper(a["name"])],
                  key=lambda a: a["ts"])
     return kin, (s0, s1), gin
@@ -285,7 +367,16 @@ def write_step3_xlsx(rows, path):
     headers = ["LayerType", "LayerCount", "Index", "Section", "LeafModule",
                "KernelName", "AvgDuration_us", "Count", "SumDuration_us",
                "Percentage", "MatchMethod", "GraphOFF_KernelName",
-               "GraphOFF_Duration_us", "CallSite"]
+               "GraphOFF_Duration_us", "CallSite",
+               "TraceCount_fwd", "TraceSum_ms_fwd"]
+    # ATOM rows are aggregated straight from the chosen forward, so the per-name
+    # totals below are just the row sums; they exist so the workbook matches the
+    # schema analyze_trace.py writes (where they are independent ground truth).
+    name_cnt: dict[str, int] = {}
+    name_sum: dict[str, float] = {}
+    for row in rows:
+        name_cnt[row["kernel"]] = name_cnt.get(row["kernel"], 0) + row["count"]
+        name_sum[row["kernel"]] = name_sum.get(row["kernel"], 0.0) + row["sum"]
     wb = Workbook(); ws = wb.active
     bold = Font(name="Arial", size=10, bold=True); reg = Font(name="Arial", size=10)
     fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
@@ -294,11 +385,13 @@ def write_step3_xlsx(rows, path):
         cell.font = bold; cell.fill = fill; cell.alignment = Alignment(horizontal="center")
     ws.freeze_panes = "A2"
     r = 2
-    for i, row in enumerate(sorted(rows, key=lambda r: (r["section"], r["leaf"]))):
-        vals = ["decode: ATOM", 1, i, row["section"], row["leaf"] or "(self)",
+    for i, row in enumerate(rows):   # keep call order (rows come in first-seen order)
+        vals = [f"{PHASE}: ATOM", 1, i, row["section"], row["leaf"] or "(self)",
                 row["kernel"], round(row["avg"], 3), row["count"],
                 round(row["sum"], 1), round(row["pct"], 2), "atom-annotation",
-                row["kernel"], round(row["avg"], 3), ""]
+                row["kernel"], round(row["avg"], 3), "",
+                name_cnt[row["kernel"]],
+                round(name_sum[row["kernel"]] / 1000.0, 3)]
         for c, v in enumerate(vals, 1):
             ws.cell(row=r, column=c, value=v).font = reg
         r += 1
@@ -324,20 +417,39 @@ def main():
     p.add_argument("--phase", choices=["decode", "prefill"], default="decode",
                    help="which forward to isolate: decode step or prefill chunk")
     p.add_argument("--step", type=int, default=None,
-                   help="decode step/forward index (default: median-duration one)")
+                   help="decode step/forward index (default: chosen by --pick)")
+    p.add_argument("--pick", choices=["min", "median", "max"], default="median",
+                   help="which forward to isolate when --step is unset: min=short "
+                        "decode step, max=long prefill chunk, median=steady state")
+    p.add_argument("--forward-match", metavar="SUBSTR", default=None,
+                   help="only forwards whose wrapper label contains SUBSTR are "
+                        "candidates, e.g. 'bs=3 tok=16384' or 'bs=64 tok=64 d=64'. "
+                        "Pin the exact forward used by compare_glm52_sglang_atom.py "
+                        "by passing its full label (e.g. a specific ctx=[...]).")
+    p.add_argument("--struct-forward-match", metavar="SUBSTR", default=None,
+                   help="same, for the no-cuda-graph structure trace (its labels "
+                        "differ from the timing trace; defaults to --forward-match, "
+                        "and falls back to all forwards if nothing matches)")
+    p.add_argument("--exclude-tail", dest="exclude_tail", action="store_true",
+                   help="drop end-of-step tail (lm_head/sampling/embedding/broadcast/"
+                        "metadata) after the last layer so scope matches SGLang per-layer")
     p.add_argument("--out", metavar="DIR", help="write step3_layer_breakdown xlsx here")
     p.add_argument("--tag", default="_ATOM", help="filename tag (default: _ATOM)")
     args = p.parse_args()
 
-    global PHASE
+    global PHASE, PICK, EXCLUDE_TAIL, MATCH
     PHASE = args.phase
+    PICK = args.pick
+    EXCLUDE_TAIL = args.exclude_tail
 
     struct_map = {}
     if args.struct_trace:
         print(f"[INFO] structure trace: {args.struct_trace}", file=sys.stderr)
+        MATCH = args.struct_forward_match or args.forward_match
         struct_map = build_struct_map(load_trace(args.struct_trace), args.step)
 
     print(f"[INFO] timing trace: {args.time_trace}", file=sys.stderr)
+    MATCH = args.forward_match
     rows, total, step_dur, unlabeled, busy = analyze(
         load_trace(args.time_trace), struct_map, args.step)
     print_report(rows, total, step_dur, unlabeled, busy)
