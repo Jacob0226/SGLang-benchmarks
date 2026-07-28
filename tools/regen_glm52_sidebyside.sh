@@ -47,7 +47,7 @@ for v in old new; do
 done
 
 echo "---- ATOM prefill ----"
-python3 analyze_atom_trace.py --phase prefill --pick median \
+python3 ATOM_Trace_helper/analyze_atom_trace.py --phase prefill --pick median \
   --forward-match "$ATOM_PRE_FWD" --struct-forward-match "bs=3 tok=16384" \
   --time-trace   "$ATOM/prof_in8192_out16_conc64_p128/in8192_out16_conc64_p128-AMD-TP-0.trace.json.gz" \
   --struct-trace "$ATOM/no-cuda-graph/prof_in8192_out16_conc64_p128/in8192_out16_conc64_p128-AMD-TP-0-NoGraph.trace.json.gz" \
@@ -69,21 +69,21 @@ done
 # consecutive model.layers.0.* annotations). Timings still come from the decode
 # window of the graph-ON trace; only Section/LeafModule labels come from there.
 echo "---- ATOM decode ----"
-python3 analyze_atom_trace.py --phase decode --pick median \
+python3 ATOM_Trace_helper/analyze_atom_trace.py --phase decode --pick median \
   --forward-match "$ATOM_DEC_FWD" --struct-forward-match "model.layers.0" \
   --time-trace   "$ATOM/prof_in8192_out16_conc64_p128/in8192_out16_conc64_p128-AMD-TP-0.trace.json.gz" \
   --struct-trace "$ATOM/no-cuda-graph/prof_in8192_out16_conc64_p128/in8192_out16_conc64_p128-AMD-TP-0-NoGraph.trace.json.gz" \
   --out "$DEC/sidebyside" --tag _ATOM >/dev/null
 
 echo "################ CALL-ORDER WORKBOOKS ################"
-python3 callorder_sidebyside.py \
+python3 ATOM_Trace_helper/callorder_sidebyside.py \
   --out "$PRE/sidebyside/callorder_prefill_SGLang_vs_ATOM.xlsx" \
   --src SGLANG_old "$PRE/sidebyside/step3_layer_breakdown_SGLANG_old.xlsx" \
   --src ATOM       "$PRE/sidebyside/step3_layer_breakdown_ATOM.xlsx" \
   --summary-csv    "$PRE/cmp_glm52_prefill_OLDvsATOM.csv" \
   --title "GLM-5.2 prefill — call order, ONE forward per side (SGLANG step[EXTEND bs=3 toks=16368] | ATOM prefill[bs=3 tok=16384]); NOT aligned. Σ_ms/Cnt = per-call-site within that single forward, same scope as the compare_glm52 buckets at the bottom. SGLANG_old_30575=711.1ms | ATOM=641.1ms"
 
-python3 callorder_sidebyside.py \
+python3 ATOM_Trace_helper/callorder_sidebyside.py \
   --out "$DEC/sidebyside/callorder_decode_SGLang_vs_ATOM.xlsx" \
   --src SGLANG_old "$DEC/sidebyside/step3_layer_breakdown_SGLANG_old.xlsx" \
   --src ATOM       "$DEC/sidebyside/step3_layer_breakdown_ATOM.xlsx" \
