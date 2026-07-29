@@ -73,11 +73,17 @@ cd ~/SGLang-benchmarks
 bash trace_analysis/regen_glm52_sidebyside.sh
 ```
 
-Two more specialized comparators live in `compare/`:
-`atom_sglang_layer_sidebyside.py` (one decode layer, ATOM | SGLang) and
-`glm52_full_layer_sidebyside.py` (same, but segments the layer positionally so
-GLM-5.2 full vs shared indexer layers can be told apart), plus `compare_mla.py` for
-the MLA/attention section alone.
+One specialized comparator also lives in `compare/`:
+`glm52_full_layer_sidebyside.py` puts **two concrete neighbouring decode layers**
+side by side (a shared-indexer one next to a full-indexer one, ATOM | SGLang) by
+segmenting the step positionally — `fused_qk_rmsnorm` anchors each layer, the TP
+all-reduce before it is the boundary — because neither stack's no-graph decode trace
+has a per-layer module tree. step3 gives you the same numbers averaged per layer type
+for SGLang (330 µs shared vs 426 µs full on MI355X, which this tool reproduces), so
+reach for it when you want the two kernel lists in call order, or anything at all on
+the ATOM side. It warns when kernels of the chosen layer have no timing in the timed
+window: that happens when the no-graph trace only captured a prefill forward (true of
+some ATOM runs), and the subtotals of that column are then an undercount.
 
 ## diagnostics/
 
