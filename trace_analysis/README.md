@@ -52,29 +52,35 @@ as 713 µs/call instead of the real 861 µs/call for the `bs=3` prefill forward.
 | step | script |
 |------|--------|
 | 1 | `sglang/analyze_trace.py` on each run's trace pair |
-| 2 | `compare/compare_step3.py` — LCS-aligns the two step3 workbooks row by row |
+| 2 | `compare/compare_layer_breakdown.py` — LCS-aligns the two step3 workbooks row by row |
 
-`compare_step3.py` does not care what the two workbooks are, as long as the module
-names match: two GPUs, or the same GPU before and after a PR.
+`compare_layer_breakdown.py` does not care what the two workbooks are, as long as the
+module names match: two GPUs, or the same GPU before and after a PR. An ATOM step3
+workbook is readable too (`analyze_atom_trace.py` writes the same schema on purpose),
+but the module names differ, so the rows misalign — that is what Flow B exists for.
 
 ## Flow B — same GPU, two stacks (ROCm SGLang vs ROCm ATOM)
 
 ATOM needs its own analyzer: its traces carry no `nn.Module` tree and mark forwards
 with `prefill[]` / `decode[]` annotations, and the two stacks use different module
-names, which defeats `compare_step3.py`'s row alignment.
+names, which defeats `compare_layer_breakdown.py`'s row alignment.
 
 | step | script | purpose |
 |------|--------|---------|
 | 1 | `sglang/analyze_trace.py` | SGLang step1 + step3 |
 | 2 | `atom/analyze_atom_trace.py` | ATOM step1 + step3, mapped to SGLang's classification |
-| 3 | `compare/sglang_vs_atom_glm52.py` | per-forward bucket comparison, CSV + `--xlsx` call-order workbook (authoritative timing; each kernel counted once) |
-| 4 | `compare/callorder_sidebyside.py` | side-by-side call-order xlsx with module / call-site labels (consumes step3 + the bucket CSV) |
+| 3 | `compare/sglang_vs_atom_glm52.py` | **how much**: reads the raw traces, sorts every kernel of one forward into ~9 GLM-5.2 functional buckets (sparse-MLA attn, DSA indexer+topk, MLA/dense GEMM, MoE up/gate, MoE down, all-reduce, rmsnorm/quant, rope/kv-cache, other), each counted once → CSV |
+| 4 | `compare/callorder_sidebyside.py` | **which kernel, called from where**: reads the two step3 workbooks and lists each side's call sites in its own execution order with `Section > LeafModule`, `CallSite`, `LayerType`, `LaunchCnt`. No cross-side alignment — you match them by eye. `--summary-csv` embeds step 3's buckets at the bottom so detail and totals share one scale |
 | driver | `regen_glm52_sidebyside.sh` | rebuilds everything: prefill + decode, SGLANG old/new + ATOM, both call-order workbooks |
 
 ```bash
 cd ~/SGLang-benchmarks
 bash trace_analysis/regen_glm52_sidebyside.sh
 ```
+
+The driver runs steps 1, 2 and 4. Step 3 is run by hand when the traces change; the
+driver only re-reads the CSV it left behind. `compare/compare_layer_breakdown.py` and
+`compare/glm52_full_layer_sidebyside.py` are hand-run too.
 
 One specialized comparator also lives in `compare/`:
 `glm52_full_layer_sidebyside.py` puts **two concrete neighbouring decode layers**

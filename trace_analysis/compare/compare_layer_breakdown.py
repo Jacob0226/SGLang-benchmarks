@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-compare_step3.py
+compare_layer_breakdown.py
 
 Compare ANY two step3_layer_breakdown workbooks (.xlsx or .csv) side by side.
 Aligns rows by (ParentModule, LeafModule) using LCS sequence alignment,
@@ -12,7 +12,7 @@ workbooks align well because the module names match; for SGLang vs ATOM the name
 differ and the alignment falls apart — use sglang_vs_atom_glm52.py instead.
 
 Usage:
-    python compare_step3.py --file-a MI355X/step3_layer_breakdown.xlsx --file-b B200/step3_layer_breakdown.xlsx --labels MI355X B200 --out comparison.xlsx
+    python compare_layer_breakdown.py --file-a MI355X/step3_layer_breakdown.xlsx --file-b B200/step3_layer_breakdown.xlsx --labels MI355X B200 --out comparison.xlsx
 """
 
 import argparse

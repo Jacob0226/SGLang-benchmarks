@@ -6,7 +6,7 @@ GLM-5.2-specific, apples-to-apples kernel comparison between an SGLang trace and
 an ATOM (rocm/atom-dev) trace for ONE forward pass (prefill chunk or decode step).
 
 Why a bespoke tool: analyze_trace.py (SGLang) and analyze_atom_trace.py (ATOM)
-emit different Section/Kernel taxonomies, so compare_step3.py's row alignment
+emit different Section/Kernel taxonomies, so compare_layer_breakdown.py's row alignment
 falls apart. This script instead maps BOTH stacks' kernels into the SAME GLM-5.2
 functional buckets (sparse-MLA attn, DSA indexer+topk, MLA/dense GEMM, MoE
 up/gate GEMM, MoE down GEMM, all-reduce, rmsnorm/quant, rope/kv-cache, other),
