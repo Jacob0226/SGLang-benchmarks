@@ -20,6 +20,29 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
 
+def read_layer_types(path):
+    """The step3 workbook's LayerTypes sheet, which decodes the LayerType letters
+    into layer types (GLM-5.2: full-indexer + MLP / full-indexer + MoE /
+    shared-indexer + MoE). Absent on sources that do not group by layer (ATOM)."""
+    wb = load_workbook(path, data_only=True)
+    if "LayerTypes" not in wb.sheetnames:
+        return []
+    out = []
+    for r in wb["LayerTypes"].iter_rows(min_row=2, values_only=True):
+        if not r or not r[0] or str(r[0]) == "NOTE":
+            continue
+        out.append((r[0], r[1], r[2], r[3]))
+    return out
+
+
+def _pick(row, h, *names):
+    """First of `names` present in the header (later ones are pre-rename aliases)."""
+    for n in names:
+        if n in h:
+            return row[h[n]]
+    return ""
+
+
 def read_step3(path):
     ws = load_workbook(path, data_only=True).active
     rows = list(ws.iter_rows(values_only=True))
@@ -36,21 +59,22 @@ def read_step3(path):
             "Kernel": kn,
             "Avg_us": r[h["AvgDuration_us"]] if "AvgDuration_us" in h else "",
             "Sum_ms": (r[h["SumDuration_us"]] or 0) / 1000.0 if "SumDuration_us" in h else 0,
-            "Count": r[h.get("Count")] if "Count" in h else "",
-            "TrSum_ms": r[h["TraceSum_ms_fwd"]] if "TraceSum_ms_fwd" in h else "",
-            "TrCount": r[h["TraceCount_fwd"]] if "TraceCount_fwd" in h else "",
+            "Count": _pick(r, h, "LaunchCount", "Count"),
+            "TrSum_ms": _pick(r, h, "KernelSum_ms_fwd", "TraceSum_ms_fwd"),
+            "TrCount": _pick(r, h, "KernelCount_fwd", "TraceCount_fwd"),
             "CallSite": r[h.get("CallSite")] if "CallSite" in h else "",
         })
     return out
 
 
-# Avg_us is the cost of ONE launch; Cnt is how many layers of the forward really
-# reach that call site (SGLang side: measured over all layers, so LayerType tells
-# which layer types those are) and Σ_ms = Avg_us x Cnt; TrΣ_ms/TrCnt are the kernel
-# NAME's totals in the same forward, repeated on every row sharing the name — a gap
-# vs Σ_ms now means the kernel also runs outside the decoder layers.
+# Avg_us is the cost of ONE launch. LaunchCnt is how many launches THIS row's call
+# site made in the forward — on the SGLang side that is one per layer, so it equals
+# the number of layers of the types in LayerType — and Σ_ms = Avg_us x LaunchCnt.
+# KernelΣ_ms/KernelCnt are the kernel NAME's totals in the same forward regardless of
+# call site, repeated on every row sharing the name (so do NOT sum them): Σ LaunchCnt
+# of the same-name rows below KernelCnt means the kernel also runs outside the layers.
 COLS = ["LayerType", "Section", "LeafModule (caller)", "KernelName", "Avg_us",
-        "Σ_ms", "Cnt", "TrΣ_ms", "TrCnt", "CallSite"]
+        "Σ_ms", "LaunchCnt", "KernelΣ_ms", "KernelCnt", "CallSite"]
 
 import re
 # functional category rules (first match wins); GLM-5.2 specific
@@ -117,6 +141,19 @@ def main():
     if args.title:
         ws.cell(1, 1, args.title).font = bold
         r0 = 2
+
+    for lab, path in args.src:
+        legend = read_layer_types(path)
+        if not legend:
+            continue
+        kinds = sorted({name for _l, name, _c, _i in legend})
+        text = (f"{lab} — {len(kinds)} layer types: {' / '.join(kinds)}.  "
+                f"LayerType column: "
+                + " · ".join(f"{l}={name} ({cnt} layer{'' if cnt == 1 else 's'},"
+                             f" idx {idx})" for l, name, cnt, idx in legend)
+                + "   (see the LayerTypes sheet of the step3 workbook)")
+        ws.cell(r0, 1, text).font = reg
+        r0 += 1
 
     # source label band
     for si, (lab, _) in enumerate(sources):

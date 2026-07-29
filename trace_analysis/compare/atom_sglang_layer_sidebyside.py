@@ -150,19 +150,23 @@ def sglang_layer(path, want_full=False):
     # the layer type whose kernels include an MoE GEMM (mfma_moe / moe_sorting).
     # Hardcoding "B" breaks across traces — e.g. the short-output (1024:16) no-graph
     # trace groups dense full-indexer layers as A/B and the MoE layer as C.
-    # step3's LayerType lists the types that reach a call site ("A+B", or "all"),
-    # so one layer of type L = the rows whose list contains L.
+    # step3's LayerType lists the types that reach a call site as comma-separated
+    # tags ("full+MoE, shared+MoE", or "all"), so one layer of type T = the rows
+    # whose list contains T.
     layer_letters=[]
     for row in rows:
-        for L in str(row[ix["LayerType"]] or "").split("+"):
-            if len(L)==1 and L.isalpha() and L not in layer_letters:
-                layer_letters.append(L)
+        lt=str(row[ix["LayerType"]] or "")
+        if lt in ("", "all"):
+            continue
+        for T in lt.split(", "):
+            if T and T not in layer_letters:
+                layer_letters.append(T)
     layer_letters.sort()
     def _rows(L):
         out=[]
         for r in rows:
             lt=str(r[ix["LayerType"]] or "")
-            if lt=="all" or L in lt.split("+"):
+            if lt=="all" or L in lt.split(", "):
                 out.append(r)
         return out
     def _has(L, *subs): return any(any(s in str(r[ix["KernelName"]] or "") for s in subs) for r in _rows(L))

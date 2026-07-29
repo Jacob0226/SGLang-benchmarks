@@ -365,10 +365,10 @@ def write_step3_xlsx(rows, path):
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
     headers = ["LayerType", "LayerCount", "Index", "Section", "LeafModule",
-               "KernelName", "AvgDuration_us", "Count", "SumDuration_us",
+               "KernelName", "AvgDuration_us", "LaunchCount", "SumDuration_us",
                "Percentage", "MatchMethod", "GraphOFF_KernelName",
                "GraphOFF_Duration_us", "CallSite",
-               "TraceCount_fwd", "TraceSum_ms_fwd"]
+               "KernelCount_fwd", "KernelSum_ms_fwd"]
     # ATOM rows are aggregated straight from the chosen forward, so the per-name
     # totals below are just the row sums; they exist so the workbook matches the
     # schema analyze_trace.py writes (where they are independent ground truth).
@@ -386,7 +386,9 @@ def write_step3_xlsx(rows, path):
     ws.freeze_panes = "A2"
     r = 2
     for i, row in enumerate(rows):   # keep call order (rows come in first-seen order)
-        vals = [f"{PHASE}: ATOM", 1, i, row["section"], row["leaf"] or "(self)",
+        # LayerCount is left blank: ATOM traces carry no per-layer module tree, so a
+        # row is every launch of that (annotation, kernel) in the forward, not one layer.
+        vals = [f"{PHASE}: ATOM", "", i, row["section"], row["leaf"] or "(self)",
                 row["kernel"], round(row["avg"], 3), row["count"],
                 round(row["sum"], 1), round(row["pct"], 2), "atom-annotation",
                 row["kernel"], round(row["avg"], 3), "",

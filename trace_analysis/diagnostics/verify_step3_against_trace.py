@@ -102,7 +102,7 @@ def read_step3(path):
         nrows += 1
         e = agg[nm]
         e[0] += s
-        c = r[h["Count"]]
+        c = r[h["LaunchCount" if "LaunchCount" in h else "Count"]]
         e[1] += c if isinstance(c, int) else 0
         a = r[h["AvgDuration_us"]]
         if isinstance(a, (int, float)):

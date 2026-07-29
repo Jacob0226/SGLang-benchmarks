@@ -25,12 +25,11 @@ Usage:
     --sglang-time S.graph.json.gz --sglang-struct S.nograph.json.gz \
     --layer-kind full --out out.xlsx
 """
-import argparse, gzip, json, bisect, re, collections, sys, os
+import argparse, gzip, json, bisect, re, collections
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from atom_sglang_layer_sidebyside import (
+from atom_sglang_layer_sidebyside import (   # same directory
     load, _k, _g, _dom, graph_name_avg, atom_layer, short, canon,
 )
 

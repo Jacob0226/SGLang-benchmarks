@@ -2,12 +2,8 @@
 
 Profiling, analysis, and micro-benchmark scripts for GLM-5 decode-layer optimization on B200 / MI355X.
 
-## Trace analysis
-
-| Script | Description | Example |
-|--------|-------------|---------|
-| `analyze_trace_overlap.py` | Sweep-line analysis of CUDA kernel overlap, bubble time, and stream concurrency from Torch Profiler traces. Supports HTML reports and two-trace comparison. | `python3 analyze_trace_overlap.py --trace1 dual.trace.json.gz --trace2 single.trace.json.gz --html cmp.html` |
-| `extract_stream.py` | Extract and inspect kernels from specific CUDA streams within a trace. List streams, filter by time range, or compare two streams side-by-side. | `python3 extract_stream.py trace.json.gz --list-streams` |
+> Trace analysis moved to [`../trace_analysis/`](../trace_analysis/README.md) — analyzers, comparison workbooks, and the per-window /
+> per-stream diagnostics all live there now.
 
 ## Micro-benchmarks
 

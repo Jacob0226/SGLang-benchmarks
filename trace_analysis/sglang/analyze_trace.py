@@ -220,8 +220,13 @@ def print_step1(stats: list[dict]) -> None:
     print(f"{'='*120}\n")
 
 
-def _write_xlsx(headers: list[str], rows: list[list], path: str) -> None:
-    """Write data to Excel with Arial font and auto-width columns."""
+def _write_xlsx(headers: list[str], rows: list[list], path: str,
+                extra_sheet: tuple[str, list[str], list[list]] | None = None) -> None:
+    """Write data to Excel with Arial font and auto-width columns.
+
+    extra_sheet = (title, headers, rows) adds a second worksheet, used for the
+    layer-type legend that decodes the LayerType column.
+    """
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill
     from openpyxl.utils import get_column_letter
@@ -258,6 +263,24 @@ def _write_xlsx(headers: list[str], rows: list[list], path: str) -> None:
             if val:
                 max_len = max(max_len, min(len(str(val)), 60))
         ws.column_dimensions[get_column_letter(c)].width = max_len + 2
+
+    if extra_sheet:
+        title, xh, xrows = extra_sheet
+        ws2 = wb.create_sheet(title)
+        for c, val in enumerate(xh, 1):
+            cell = ws2.cell(row=1, column=c, value=val)
+            cell.font = arial_bold
+            cell.fill = header_fill
+        for r, row_data in enumerate(xrows, 2):
+            for c, val in enumerate(row_data, 1):
+                ws2.cell(row=r, column=c, value=val).font = arial
+        for c in range(1, len(xh) + 1):
+            max_len = len(str(xh[c - 1]))
+            for r in range(2, len(xrows) + 2):
+                val = ws2.cell(row=r, column=c).value
+                if val:
+                    max_len = max(max_len, min(len(str(val)), 90))
+            ws2.column_dimensions[get_column_letter(c)].width = max_len + 2
 
     wb.save(path)
 
@@ -297,30 +320,34 @@ def _lookup_stat(name: str,
 
 def write_step3(agg_table: list[dict], kernels_off: list[dict],
                 kernel_stats: list[dict] | None, path: str,
-                callsite_map: dict | None = None) -> None:
+                callsite_map: dict | None = None,
+                fine_types: list[dict] | None = None) -> None:
     """Export step 3 breakdown to Excel: one row per call site, aggregated over
     every layer of ONE forward.
 
     Structure (sections, modules, call order, call sites) comes from the graph-OFF
     trace; per-launch timing comes from the graph-ON stats, matched by kernel name
-    (exact or hash-stripped). Count is the number of layers that really run this
-    call site, measured across all layers, so Σ = avg x Count covers the forward
-    without extrapolating from one representative layer.
+    (exact or hash-stripped). LaunchCount is the number of layers that really run
+    this call site, measured across all layers, so Σ = avg x LaunchCount covers the
+    forward without extrapolating from one representative layer.
 
     Output columns:
-      LayerType,        ← which layer types run this call site, e.g. "A+B"
-      LayerCount,       ← how many layers that is
+      LayerType,        ← which layer types run this call site, e.g. "full+MoE"
+      LayerCount,       ← how many layers that is (= LaunchCount here)
       Index, Section, LeafModule,
       KernelName,       ← graph-ON name if matched, else graph-OFF name
       AvgDuration_us,   ← graph-ON avg_dur if matched, else graph-OFF dur
-      Count, SumDuration_us, Percentage,
+      LaunchCount,      ← launches of THIS call site in the forward (one per layer)
+      SumDuration_us, Percentage,
       MatchMethod,      ← "exact" / "norm" / "none"
       GraphOFF_KernelName, GraphOFF_Duration_us,  ← graph-OFF reference
       CallSite,
-      TraceCount_fwd, TraceSum_ms_fwd  ← graph-ON ground truth for the whole
+      KernelCount_fwd, KernelSum_ms_fwd  ← graph-ON ground truth for the whole
           forward, per kernel NAME (repeated on every row sharing the name, so do
           NOT sum this column). Σ of the rows should now match it; the coverage
           report at the end lists any kernel where it does not.
+
+    A second "LayerTypes" worksheet decodes the LayerType tags.
     """
     # Build stat lookups (exact + hash-normalized)
     stat_lookup: dict[str, dict] = {}
@@ -334,11 +361,11 @@ def write_step3(agg_table: list[dict], kernels_off: list[dict],
 
     headers = ["LayerType", "LayerCount", "Index", "Section", "LeafModule",
                "KernelName", "AvgDuration_us",
-               "Count", "SumDuration_us", "Percentage",
+               "LaunchCount", "SumDuration_us", "Percentage",
                "MatchMethod",
                "GraphOFF_KernelName", "GraphOFF_Duration_us",
                "CallSite",
-               "TraceCount_fwd", "TraceSum_ms_fwd"]
+               "KernelCount_fwd", "KernelSum_ms_fwd"]
 
     rows = []
     grand_total = 0.0  # sum of per-callsite graph-ON Σ (one forward), for Percentage
@@ -387,13 +414,33 @@ def write_step3(agg_table: list[dict], kernels_off: list[dict],
         if r[9] is None:  # pct placeholder
             r[9] = round(100.0 * r[8] / grand_total, 2) if grand_total else 0.0
 
-    _write_xlsx(headers, rows, path)
+    _write_xlsx(headers, rows, path, extra_sheet=_layer_type_legend(fine_types))
     n_matched = sum(1 for r in rows if r and r[10] != "none" and r[10] != "")
     n_total = sum(1 for r in rows if r and r[2] != "")
     print(f"[INFO] Step 3 written to: {path} "
           f"({n_total} kernels, {n_matched} matched to graph-ON)",
           file=sys.stderr)
     _print_coverage(rows, kernel_stats)
+
+
+def _layer_type_legend(fine_types: list[dict] | None):
+    """Second sheet decoding the tags used in the main sheet's LayerType column."""
+    if not fine_types:
+        return None
+    rows = [[t["label"], t["name"], t["count"], _index_ranges(t["indices"]),
+             ", ".join(t["diff"][:6])] for t in fine_types]
+    rows.append([])
+    rows.append(["NOTE", f"{len(fine_types)} layer types: "
+                 f"{' / '.join(t['name'] for t in fine_types)}.", "", "", ""])
+    rows.append(["NOTE", "LayerType in the main sheet lists the types that reach a"
+                 " call site (\"all\" = all of them); LayerCount/LaunchCount is how many"
+                 " layers that is. It can be one below the layer count of those types:"
+                 " the all-reduce between two layers is attributed to whichever layer"
+                 " the trace nests it in, so layer 0 has no incoming one and the last"
+                 " layer's outgoing one lands inside itself.", "", "", ""])
+    return ("LayerTypes",
+            ["Tag", "LayerType", "Layers", "LayerIndices", "vs most common type"],
+            rows)
 
 
 def _print_coverage(rows: list[list], kernel_stats: list[dict] | None) -> None:
@@ -419,7 +466,7 @@ def _print_coverage(rows: list[list], kernel_stats: list[dict] | None) -> None:
           f"{fmt_dur(total)} ({100*covered/total:.1f}%)", file=sys.stderr)
     if off:
         print(f"[WARN] {len(off)} kernels whose per-call-site Σ differs from the real "
-              f"per-forward Σ by >5% and >0.1 ms (see TraceSum_ms_fwd):",
+              f"per-forward Σ by >5% and >0.1 ms (see KernelSum_ms_fwd):",
               file=sys.stderr)
         for d, n, s, t in sorted(off, key=lambda x: -abs(x[0]))[:10]:
             print(f"         {d/1000:+8.2f} ms  struct={s/1000:7.2f} "
@@ -1088,12 +1135,14 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict],
             "kernel_breakdown": g["example_breakdown"],
         })
 
-    fine_types, agg_table = _aggregate_call_sites(layer_data, kernels)
-    if len(fine_types) > len(layer_types):
+    fine_types, agg_table, n_raw = _aggregate_call_sites(layer_data, kernels)
+    if len(fine_types) != len(layer_types):
         shape = ", ".join(f"{t['label']}={t['count']}" for t in fine_types)
+        extra = (f" ({n_raw} kernel-distinct groups, merged by type)"
+                 if n_raw > len(fine_types) else "")
         print(f"[INFO] {len(layer_types)} layer types by sub-module signature, "
-              f"{len(fine_types)} once the kernels they run are compared "
-              f"({shape} layers)", file=sys.stderr)
+              f"{len(fine_types)} once the kernels they run are compared{extra}: "
+              f"{shape} layers", file=sys.stderr)
 
     # Build callsite map only for the aggregated call sites (fast)
     target_kidxs = {e["kidx"] for e in agg_table}
@@ -1133,15 +1182,52 @@ def _aggregate_call_sites(layer_data: list[dict], kernels: list[dict]):
                                    for it in ld["kernel_breakdown"]).items()))
         fine.setdefault(sig, []).append(i)
 
+    raw_groups = []
+    for sig, idxs in fine.items():
+        raw_groups.append({"indices": idxs, "keys": {k for k, _c in sig}})
+
+    # Name each group by the two axes that make GLM-5.2/DSA layers differ: whether
+    # the layer computes a fresh indexer top-k (full) or reuses the previous layer's
+    # (`index_topk_freq`), and whether its FFN is dense or MoE
+    # (`first_k_dense_replace`) -> "full-indexer + MLP", "full-indexer + MoE",
+    # "shared-indexer + MoE". Groups sharing a name are the SAME kind of layer and
+    # get merged: otherwise the first and last layer of the stack split off on their
+    # own, because the all-reduce between two layers is attributed to whichever
+    # layer the trace nests it in (nothing reduces into layer 0; layer 77's output
+    # reduce has no next layer to land in). Their call sites stay separate rows with
+    # Count=1, so merging the labels loses nothing.
+    any_indexer = any("indexer" in " ".join(f"{s} {l} {k}" for s, l, k in g["keys"]).lower()
+                      for g in raw_groups)
+    for g in raw_groups:
+        text = " ".join(f"{s} {l} {k}" for s, l, k in g["keys"]).lower()
+        bits = []
+        if any_indexer:
+            bits.append("full" if "indexer" in text else "shared")
+        if "moe" in text or "expert" in text:
+            bits.append("MoE")
+        elif "mlp" in text or "act_and_mul" in text:
+            bits.append("MLP")
+        g["label"] = "+".join(bits) if bits else "(layer)"
+        g["name"] = (" + ".join(b + "-indexer" if b in ("full", "shared") else b
+                                for b in bits) if bits else "(layer)")
+
+    merged: OrderedDict = OrderedDict()
+    for g in raw_groups:
+        m = merged.setdefault(g["label"], {"label": g["label"], "name": g["name"],
+                                           "indices": [], "groups": []})
+        m["indices"] += g["indices"]
+        m["groups"].append(g)
     fine_types = []
-    for n, (sig, idxs) in enumerate(fine.items()):
-        fine_types.append({
-            "label": chr(ord("A") + n),
-            "count": len(idxs),
-            "indices": idxs,
-            "sub_modules": list(layer_data[idxs[0]]["sub_modules"]),
-            "keys": {k for k, _c in sig},
-        })
+    for m in merged.values():
+        m["indices"].sort()
+        m["count"] = len(m["indices"])
+        m["sub_modules"] = list(layer_data[m["indices"][0]]["sub_modules"])
+        # describe the type by its majority group, so the boundary layers (which
+        # differ only in where their all-reduce is attributed) don't pollute it
+        m["keys"] = max(m["groups"], key=lambda g: len(g["indices"]))["keys"]
+        fine_types.append(m)
+    n_raw = len(raw_groups)
+
     # describe each type as a diff against the most common one
     def names(keys):
         return sorted({(leaf or sec) for sec, leaf, _k in keys})
@@ -1172,8 +1258,10 @@ def _aggregate_call_sites(layer_data: list[dict], kernels: list[dict]):
 
     for e in agg.values():
         e["order"] = sum(e["pos"]) / len(e["pos"])
+        # "all" = every layer type reaches this call site; Count says how many layers
+        # that is (77 rather than 78 for the all-reduce layer 0 does not have).
         e["types"] = ("all" if len(e["labels"]) == len(fine_types)
-                      else "+".join(sorted(e["labels"])))
+                      else ", ".join(sorted(e["labels"])))
     # Sort by mean position, but keep each section in one block: a call site that
     # only exists in a few layers (e.g. the dense MLP) would otherwise land in the
     # middle of another section's rows.
@@ -1182,7 +1270,7 @@ def _aggregate_call_sites(layer_data: list[dict], kernels: list[dict]):
         sec_order[e["section"]] = min(sec_order.get(e["section"], 9e9), e["order"])
     agg_table = sorted(agg.values(),
                        key=lambda e: (sec_order[e["section"]], e["order"]))
-    return fine_types, agg_table
+    return fine_types, agg_table, n_raw
 
 
 def print_step2(cls_name: str, layer_types: list[dict],
@@ -1207,21 +1295,21 @@ def print_step2(cls_name: str, layer_types: list[dict],
         print(f"  Layers: {name_str}")
         print(f"  Sub-modules: {' + '.join(lt['sub_modules'])}")
 
-    if fine_types and len(fine_types) > len(layer_types):
+    if fine_types and len(fine_types) != len(layer_types):
         print(f"\n  Sub-modules alone merge layers that run different kernels; "
               f"by what they actually run there are {len(fine_types)} types:")
         for t in fine_types:
             diff = ", ".join(t["diff"][:5])
             if len(t["diff"]) > 5:
                 diff += f", ... (+{len(t['diff']) - 5} more)"
-            print(f"    {t['label']}: {t['count']:>3} layers  "
-                  f"idx {_index_ranges(t['indices'])}  vs {diff}")
+            print(f"    {t['label']:<12} {t['count']:>3} layers  "
+                  f"idx {_index_ranges(t['indices']):<26} vs {diff}")
 
     print(f"\n{'='*100}\n")
 
 
 def _index_ranges(idxs: list[int]) -> str:
-    """Collapse layer indices into ranges/steps, e.g. '0-2' or '6,10,..,74'."""
+    """Collapse layer indices, e.g. '0-2', '6,10,..,74 (every 4)', '3-5,7-9,..,75-77'."""
     if len(idxs) <= 3:
         return ",".join(str(i) for i in idxs)
     steps = {b - a for a, b in zip(idxs, idxs[1:])}
@@ -1229,7 +1317,19 @@ def _index_ranges(idxs: list[int]) -> str:
         return f"{idxs[0]}-{idxs[-1]}"
     if len(steps) == 1:
         return f"{idxs[0]},{idxs[1]},..,{idxs[-1]} (every {steps.pop()})"
-    return f"{idxs[0]},{idxs[1]},..,{idxs[-1]}"
+    runs = []
+    start = prev = idxs[0]
+    for i in idxs[1:]:
+        if i == prev + 1:
+            prev = i
+            continue
+        runs.append((start, prev))
+        start = prev = i
+    runs.append((start, prev))
+    fmt = lambda r: str(r[0]) if r[0] == r[1] else f"{r[0]}-{r[1]}"
+    if len(runs) <= 4:
+        return ",".join(fmt(r) for r in runs)
+    return ",".join(fmt(r) for r in runs[:3]) + ",..," + fmt(runs[-1])
 
 
 # ===================================================================
@@ -1261,9 +1361,9 @@ def print_step3(cls_name: str, agg_table: list[dict],
     sec_sum = 0.0
     total_sum = 0.0
 
-    print(f"  {'#':>3}  {'Types':>9} {'Layers':>6}  {'Detail':<34s}  "
+    print(f"  {'#':>3}  {'Types':>20} {'Layers':>6}  {'Detail':<34s}  "
           f"{'Avg':>9}  {'Sum':>10}  Kernel Name")
-    print(f"  {'-'*3}  {'-'*9} {'-'*6}  {'-'*34}  {'-'*9}  {'-'*10}  {'-'*40}")
+    print(f"  {'-'*3}  {'-'*20} {'-'*6}  {'-'*34}  {'-'*9}  {'-'*10}  {'-'*40}")
 
     for pos, e in enumerate(agg_table):
         k = kernels[e["kidx"]]
@@ -1275,24 +1375,24 @@ def print_step3(cls_name: str, agg_table: list[dict],
 
         if e["section"] != current_sec:
             if current_sec is not None:
-                print(f"  {'':>3}  {'':>16}  {'Subtotal':>34}  {'':>9}  "
+                print(f"  {'':>3}  {'':>27}  {'Subtotal':>34}  {'':>9}  "
                       f"{fmt_dur(sec_sum):>10}\n")
             current_sec = e["section"]
             sec_sum = 0.0
             print(f"  ---- {current_sec} ----")
         sec_sum += row_sum
 
-        print(f"  {pos:>3}  {e['types']:>9} {e['count']:>6}  "
+        print(f"  {pos:>3}  {e['types'][:20]:>20} {e['count']:>6}  "
               f"{(e['leaf'] or '(self)')[:34]:<34s}  {fmt_dur(avg):>9}  "
               f"{fmt_dur(row_sum):>10}  {k['name'][:60]}")
         cs = callsite_map.get(e["kidx"], "") if callsite_map else ""
         if cs:
-            print(f"  {'':>3}  {'':>16}  {'':>34}  {'':>9}  {'':>10}  caller: {cs}")
+            print(f"  {'':>3}  {'':>27}  {'':>34}  {'':>9}  {'':>10}  caller: {cs}")
 
     if current_sec is not None:
-        print(f"  {'':>3}  {'':>16}  {'Subtotal':>34}  {'':>9}  "
+        print(f"  {'':>3}  {'':>27}  {'Subtotal':>34}  {'':>9}  "
               f"{fmt_dur(sec_sum):>10}")
-    print(f"\n  {'':>3}  {'':>16}  {'TOTAL':>34}  {'':>9}  "
+    print(f"\n  {'':>3}  {'':>27}  {'TOTAL':>34}  {'':>9}  "
           f"{fmt_dur(total_sum):>10}  ({len(agg_table)} call sites)")
 
     print(f"\n{'='*100}\n")
@@ -1418,7 +1518,7 @@ def main() -> None:
                 if out_dir:
                     write_step3(agg_table, kernels_off, kernel_stats,
                                 str(out_dir / f"step3_layer_breakdown{args.tag}.xlsx"),
-                                callsite_map)
+                                callsite_map, fine_types)
         else:
             print("[WARN] No nn.Module DecoderLayer events found.", file=sys.stderr)
 

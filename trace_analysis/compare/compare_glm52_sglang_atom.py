@@ -261,7 +261,7 @@ def write_callorder_xlsx(path, phase, labels, meta, cats, sb, ab, sco, aco):
     hdr_fill = PatternFill("solid", fgColor="8EAADB")
     tot_fill = PatternFill("solid", fgColor="FCE4D6")
     center = Alignment(horizontal="center")
-    COLS = ["Category", "KernelName", "Σ_ms", "Cnt"]
+    COLS = ["Category", "KernelName", "Σ_ms", "LaunchCnt"]
     ncol = len(COLS); gap = 1
     ws.cell(1, 1, f"GLM-5.2 {phase} — call order (single forward, tail-excluded), "
                   f"tagged by category. {LA} | {LB}, NOT aligned.").font = bold

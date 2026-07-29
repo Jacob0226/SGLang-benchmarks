@@ -39,7 +39,7 @@ echo "################ PREFILL ################"
 for v in old new; do
   case $v in old) D=$OLD;; new) D=$NEW;; esac
   echo "---- SGLANG_$v prefill ----"
-  python3 analyze_trace.py \
+  python3 trace_analysis/sglang/analyze_trace.py \
     --graph-on  "$D/prof_in8192_out16_conc64_p128/in8192_out16_conc64_p128-AMD-TP-0-EXTEND.trace.json.gz" \
     --graph-off "$D/no-cuda-graph/prof_in8192_out16_conc64_p64/in8192_out16_conc64_p64-AMD-TP-0-EXTEND-NoGraph.trace.json.gz" \
     --forward-match "bs=3" \
@@ -47,7 +47,7 @@ for v in old new; do
 done
 
 echo "---- ATOM prefill ----"
-python3 ATOM_Trace_helper/analyze_atom_trace.py --phase prefill --pick median \
+python3 trace_analysis/atom/analyze_atom_trace.py --phase prefill --pick median \
   --forward-match "$ATOM_PRE_FWD" --struct-forward-match "bs=3 tok=16384" \
   --time-trace   "$ATOM/prof_in8192_out16_conc64_p128/in8192_out16_conc64_p128-AMD-TP-0.trace.json.gz" \
   --struct-trace "$ATOM/no-cuda-graph/prof_in8192_out16_conc64_p128/in8192_out16_conc64_p128-AMD-TP-0-NoGraph.trace.json.gz" \
@@ -57,7 +57,7 @@ echo "################ DECODE ################"
 for v in old new; do
   case $v in old) D=$OLD;; new) D=$NEW;; esac
   echo "---- SGLANG_$v decode ----"
-  python3 analyze_trace.py \
+  python3 trace_analysis/sglang/analyze_trace.py \
     --graph-on  "$D/prof_in8192_out16_conc64_p128/in8192_out16_conc64_p128-AMD-TP-0-DECODE.trace.json.gz" \
     --graph-off "$D/no-cuda-graph/prof_in8192_out16_conc64_p64/in8192_out16_conc64_p64-AMD-TP-0-DECODE-NoGraph.trace.json.gz" \
     --forward-match "DECODE bs=64" \
@@ -69,25 +69,25 @@ done
 # consecutive model.layers.0.* annotations). Timings still come from the decode
 # window of the graph-ON trace; only Section/LeafModule labels come from there.
 echo "---- ATOM decode ----"
-python3 ATOM_Trace_helper/analyze_atom_trace.py --phase decode --pick median \
+python3 trace_analysis/atom/analyze_atom_trace.py --phase decode --pick median \
   --forward-match "$ATOM_DEC_FWD" --struct-forward-match "model.layers.0" \
   --time-trace   "$ATOM/prof_in8192_out16_conc64_p128/in8192_out16_conc64_p128-AMD-TP-0.trace.json.gz" \
   --struct-trace "$ATOM/no-cuda-graph/prof_in8192_out16_conc64_p128/in8192_out16_conc64_p128-AMD-TP-0-NoGraph.trace.json.gz" \
   --out "$DEC/sidebyside" --tag _ATOM >/dev/null
 
 echo "################ CALL-ORDER WORKBOOKS ################"
-python3 ATOM_Trace_helper/callorder_sidebyside.py \
+python3 trace_analysis/compare/callorder_sidebyside.py \
   --out "$PRE/sidebyside/callorder_prefill_SGLang_vs_ATOM.xlsx" \
   --src SGLANG_old "$PRE/sidebyside/step3_layer_breakdown_SGLANG_old.xlsx" \
   --src ATOM       "$PRE/sidebyside/step3_layer_breakdown_ATOM.xlsx" \
   --summary-csv    "$PRE/cmp_glm52_prefill_OLDvsATOM.csv" \
-  --title "GLM-5.2 prefill — call order, ONE forward per side (SGLANG step[EXTEND bs=3 toks=16368] | ATOM prefill[bs=3 tok=16384]); NOT aligned. Avg_us = one launch; Cnt = layers of that forward really running the call site (LayerType = which layer types); Σ_ms = Avg_us x Cnt; TrΣ_ms/TrCnt = that kernel name's totals in the same forward. SGLANG_old_30575=711.1ms | ATOM=641.1ms"
+  --title "GLM-5.2 prefill — call order, ONE forward per side (SGLANG step[EXTEND bs=3 toks=16368] | ATOM prefill[bs=3 tok=16384]); NOT aligned. Avg_us = one launch; LaunchCnt = launches of that call site in the forward (SGLANG: one per layer, so it equals the layers of the types in LayerType); Σ_ms = Avg_us x LaunchCnt; KernelΣ_ms/KernelCnt = that kernel name's totals in the same forward, repeated on every row sharing the name (do not sum). SGLANG_old_30575=711.1ms | ATOM=641.1ms"
 
-python3 ATOM_Trace_helper/callorder_sidebyside.py \
+python3 trace_analysis/compare/callorder_sidebyside.py \
   --out "$DEC/sidebyside/callorder_decode_SGLang_vs_ATOM.xlsx" \
   --src SGLANG_old "$DEC/sidebyside/step3_layer_breakdown_SGLANG_old.xlsx" \
   --src ATOM       "$DEC/sidebyside/step3_layer_breakdown_ATOM.xlsx" \
   --summary-csv    "$DEC/cmp_glm52_decode_OLDvsATOM.csv" \
-  --title "GLM-5.2 decode — call order, ONE forward per side (SGLANG step[DECODE bs=64] | ATOM decode[bs=64 tok=64 d=64]); NOT aligned. Avg_us = one launch; Cnt = layers of that forward really running the call site (LayerType = which layer types); Σ_ms = Avg_us x Cnt; TrΣ_ms/TrCnt = that kernel name's totals in the same forward. SGLANG_old_30575=27.8ms | ATOM=25.0ms"
+  --title "GLM-5.2 decode — call order, ONE forward per side (SGLANG step[DECODE bs=64] | ATOM decode[bs=64 tok=64 d=64]); NOT aligned. Avg_us = one launch; LaunchCnt = launches of that call site in the forward (SGLANG: one per layer, so it equals the layers of the types in LayerType); Σ_ms = Avg_us x LaunchCnt; KernelΣ_ms/KernelCnt = that kernel name's totals in the same forward, repeated on every row sharing the name (do not sum). SGLANG_old_30575=27.8ms | ATOM=25.0ms"
 
 echo "done."

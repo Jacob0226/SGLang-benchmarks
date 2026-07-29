@@ -8,7 +8,6 @@ results/
 B200_GLM5_FP8_Analysis/
 MI355X_GLM5_FP8_Analysis/
 GLM5_FP8_Analysis_test/
-trace_analysis/
 *.xlsx
 *.pkl
 
