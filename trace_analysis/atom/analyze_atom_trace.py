@@ -16,7 +16,7 @@ kernels:
 
 This tool isolates ONE decode step and assigns every GPU kernel to its innermost
 enclosing annotation, then aggregates by (Section, LeafModule, KernelName). Output
-matches analyze_trace.py's step3 schema so compare_breakdown.py can consume it.
+matches analyze_trace.py's step3 schema so compare_step3.py can consume it.
 
 Usage:
   python analyze_atom_trace.py --trace ATOM.trace.json.gz            # print
@@ -65,7 +65,7 @@ def fmt(us):
 
 # --- annotation name → (section, leaf) ------------------------------------
 # GLM-5.2: map ATOM's annotation names to SGLang's *class* Section names so the
-# two step3 breakdowns align in compare_breakdown.py. ATOM classes are nearly
+# two step3 breakdowns align in compare_step3.py. ATOM classes are nearly
 # identical to SGLang (DeepseekV2MLAAttention≈DeepseekV2AttentionMLA, DeepseekV2MoE,
 # DeepseekV2MLP, Indexer) but its profiler regions are op/annotation names
 # (self_attn, mla_decode, mlp.experts.fused_moe, ...). This normalises them.
@@ -360,7 +360,7 @@ def print_report(rows, total, step_dur, unlabeled, busy):
 
 
 def write_step3_xlsx(rows, path):
-    """Write analyze_trace.py step3-compatible schema so compare_breakdown.py works."""
+    """Write analyze_trace.py step3-compatible schema so compare_step3.py works."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
@@ -426,7 +426,7 @@ def main():
     p.add_argument("--forward-match", metavar="SUBSTR", default=None,
                    help="only forwards whose wrapper label contains SUBSTR are "
                         "candidates, e.g. 'bs=3 tok=16384' or 'bs=64 tok=64 d=64'. "
-                        "Pin the exact forward used by compare_glm52_sglang_atom.py "
+                        "Pin the exact forward used by sglang_vs_atom_glm52.py "
                         "by passing its full label (e.g. a specific ctx=[...]).")
     p.add_argument("--struct-forward-match", metavar="SUBSTR", default=None,
                    help="same, for the no-cuda-graph structure trace (its labels "

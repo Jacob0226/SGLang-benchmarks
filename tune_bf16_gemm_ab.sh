@@ -76,7 +76,7 @@ profile() {
       || echo "[warn] tuned prof exited non-zero (profiler teardown is ok)."
 
   echo ">>> [profile] done. Compare the two prof dirs with trace_analysis/sglang/analyze_trace.py /"
-  echo "    trace_analysis/compare/compare_breakdown.py (look at the hgemm_bf16 / Cijk kernel us before vs after,"
+  echo "    trace_analysis/compare/compare_step3.py (look at the hgemm_bf16 / Cijk kernel us before vs after,"
   echo "    and confirm the 'not found tuned config ... torch solution:0' log is gone)."
 }
 

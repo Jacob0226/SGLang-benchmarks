@@ -118,7 +118,7 @@ def main():
                     required=True, help="repeatable: LABEL path/to/step3.xlsx")
     ap.add_argument("--title", default="")
     ap.add_argument("--summary-csv", dest="summary_csv", default=None,
-                    help="compare_glm52 3-way CSV to use for the (clean, per-forward) "
+                    help="sglang_vs_atom_glm52 3-way CSV to use for the (clean, per-forward) "
                          "category summary instead of recomputing from step3")
     args = ap.parse_args()
     summary_csv = args.summary_csv
@@ -186,13 +186,13 @@ def main():
     # --- category summary table at the bottom ---
     sr = hr + 1 + maxlen + 2   # leave a gap
     if summary_csv:
-        # Use the clean per-forward category numbers from a compare_glm52 3-way CSV
+        # Use the clean per-forward category numbers from a sglang_vs_atom_glm52 3-way CSV
         # (each side isolates ONE forward -> directly comparable, unlike step3).
         import csv as _csv
         with open(summary_csv) as f:
             crows = [r for r in _csv.reader(f) if r]
         ws.cell(sr, 1, "Category summary — per ONE forward, Σ ms "
-                       "(from compare_glm52; directly comparable)").font = bold
+                       "(from sglang_vs_atom_glm52; directly comparable)").font = bold
         sr += 1
         for r in crows:
             if r[0].startswith("#"):

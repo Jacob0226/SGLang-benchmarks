@@ -47,24 +47,27 @@ See the `glm5.2-dsa-layer-structure` skill for the architecture behind that.
 trace, which blends different batch/token sizes: the GLM-5.2 TP all-reduce came out
 as 713 µs/call instead of the real 861 µs/call for the `bs=3` prefill forward.
 
-## Flow A — same stack, two GPUs (MI355X vs B200)
+## Flow A — two SGLang runs (MI355X vs B200, or before vs after a change)
 
 | step | script |
 |------|--------|
-| 1 | `sglang/analyze_trace.py` on each machine's trace pair |
-| 2 | `compare/compare_breakdown.py` — LCS-aligns the two step3 workbooks row by row |
+| 1 | `sglang/analyze_trace.py` on each run's trace pair |
+| 2 | `compare/compare_step3.py` — LCS-aligns the two step3 workbooks row by row |
 
-## Flow B — same GPU, two stacks (SGLang vs ATOM)
+`compare_step3.py` does not care what the two workbooks are, as long as the module
+names match: two GPUs, or the same GPU before and after a PR.
+
+## Flow B — same GPU, two stacks (ROCm SGLang vs ROCm ATOM)
 
 ATOM needs its own analyzer: its traces carry no `nn.Module` tree and mark forwards
 with `prefill[]` / `decode[]` annotations, and the two stacks use different module
-names, which defeats `compare_breakdown.py`'s row alignment.
+names, which defeats `compare_step3.py`'s row alignment.
 
 | step | script | purpose |
 |------|--------|---------|
 | 1 | `sglang/analyze_trace.py` | SGLang step1 + step3 |
 | 2 | `atom/analyze_atom_trace.py` | ATOM step1 + step3, mapped to SGLang's classification |
-| 3 | `compare/compare_glm52_sglang_atom.py` | per-forward bucket comparison, CSV + `--xlsx` call-order workbook (authoritative timing; each kernel counted once) |
+| 3 | `compare/sglang_vs_atom_glm52.py` | per-forward bucket comparison, CSV + `--xlsx` call-order workbook (authoritative timing; each kernel counted once) |
 | 4 | `compare/callorder_sidebyside.py` | side-by-side call-order xlsx with module / call-site labels (consumes step3 + the bucket CSV) |
 | driver | `regen_glm52_sidebyside.sh` | rebuilds everything: prefill + decode, SGLANG old/new + ATOM, both call-order workbooks |
 

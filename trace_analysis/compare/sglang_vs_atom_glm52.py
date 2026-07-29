@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-compare_glm52_sglang_atom.py
+sglang_vs_atom_glm52.py
 
 GLM-5.2-specific, apples-to-apples kernel comparison between an SGLang trace and
 an ATOM (rocm/atom-dev) trace for ONE forward pass (prefill chunk or decode step).
 
 Why a bespoke tool: analyze_trace.py (SGLang) and analyze_atom_trace.py (ATOM)
-emit different Section/Kernel taxonomies, so compare_breakdown.py's row alignment
+emit different Section/Kernel taxonomies, so compare_step3.py's row alignment
 falls apart. This script instead maps BOTH stacks' kernels into the SAME GLM-5.2
 functional buckets (sparse-MLA attn, DSA indexer+topk, MLA/dense GEMM, MoE
 up/gate GEMM, MoE down GEMM, all-reduce, rmsnorm/quant, rope/kv-cache, other),
@@ -25,10 +25,10 @@ occurrence; when several qualifying forwards exist we take the FASTEST (min
 Sigma) as the steady-state estimate and warn if only one is available.
 
 Usage:
-  python compare_glm52_sglang_atom.py --phase prefill \
+  python sglang_vs_atom_glm52.py --phase prefill \
       --sglang TRACE_SGLANG_EXTEND.json.gz --atom TRACE_ATOM.json.gz \
       --out cmp_prefill.csv
-  python compare_glm52_sglang_atom.py --phase decode \
+  python sglang_vs_atom_glm52.py --phase decode \
       --sglang TRACE_SGLANG_DECODE.json.gz --atom TRACE_ATOM.json.gz \
       --out cmp_decode.csv
 """

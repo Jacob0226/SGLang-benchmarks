@@ -3,11 +3,11 @@
 #
 # Every step1/step3 is now restricted to ONE forward pass via --forward-match, so
 # the call-order table at the top of the callorder workbook is on the same scale
-# as the compare_glm52 per-forward bucket summary at the bottom:
+# as the sglang_vs_atom_glm52 per-forward bucket summary at the bottom:
 #
 #   SGLANG  prefill : step[EXTEND bs=3 toks=16368] (old) / toks=16332 (new)
 #   ATOM    prefill : prefill[bs=3 tok=16384 ctx=[8063, 7153, 1168]]  (same forward
-#                     compare_glm52 picked as median-of-55)
+#                     sglang_vs_atom_glm52 picked as median-of-55)
 #   SGLANG  decode  : step[DECODE bs=64]
 #   ATOM    decode  : decode[bs=64 tok=64 d=64]                        (median)
 #
@@ -28,7 +28,7 @@ ATOM=$RES/$ATOM_TAG/prof-TP4_CIcfg
 PRE=$BENCH/analysis_GLM5.2/SGLang_vs_ATOM_i8k_conc64_prefill
 DEC=$BENCH/analysis_GLM5.2/SGLang_vs_ATOM_i8k_conc64_decode
 
-# ATOM prefill forward pinned to the exact label compare_glm52 reported, so both
+# ATOM prefill forward pinned to the exact label sglang_vs_atom_glm52 reported, so both
 # halves of the workbook describe the same forward.
 ATOM_PRE_FWD=${ATOM_PRE_FWD:-"ctx=[8063, 7153, 1168]"}
 ATOM_DEC_FWD=${ATOM_DEC_FWD:-"bs=64 tok=64 d=64"}
