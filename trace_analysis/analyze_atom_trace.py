@@ -6,7 +6,7 @@ analyze_atom_trace.py
 Decode-step kernel breakdown for ATOM (rocm/atom-dev) torch-profiler traces.
 
 ATOM traces differ from SGLang traces: they have NO `nn.Module:` / `python_function`
-events, so analyze_trace.py's layer detection does not apply. Instead ATOM's
+events, so analyze_sglang_trace.py's layer detection does not apply. Instead ATOM's
 `--mark-trace` emits `gpu_user_annotation` events on the SAME GPU stream as the
 kernels:
   - `decode[bs=.. tok=.. d=..]`      → one whole decode step (forward pass)
@@ -16,7 +16,7 @@ kernels:
 
 This tool isolates ONE decode step and assigns every GPU kernel to its innermost
 enclosing annotation, then aggregates by (Section, LeafModule, KernelName). Output
-matches analyze_trace.py's step3 schema so compare_layer_breakdown.py can consume it.
+matches analyze_sglang_trace.py's step3 schema so side_by_side.py can consume it.
 
 Usage:
   python analyze_atom_trace.py --trace ATOM.trace.json.gz            # print
@@ -65,7 +65,7 @@ def fmt(us):
 
 # --- annotation name → (section, leaf) ------------------------------------
 # GLM-5.2: map ATOM's annotation names to SGLang's *class* Section names so the
-# two step3 breakdowns align in compare_layer_breakdown.py. ATOM classes are nearly
+# two step3 breakdowns align in side_by_side.py --align lcs. ATOM classes are nearly
 # identical to SGLang (DeepseekV2MLAAttention≈DeepseekV2AttentionMLA, DeepseekV2MoE,
 # DeepseekV2MLP, Indexer) but its profiler regions are op/annotation names
 # (self_attn, mla_decode, mlp.experts.fused_moe, ...). This normalises them.
@@ -360,7 +360,7 @@ def print_report(rows, total, step_dur, unlabeled, busy):
 
 
 def write_step3_xlsx(rows, path):
-    """Write analyze_trace.py step3-compatible schema so compare_layer_breakdown.py works."""
+    """Write analyze_sglang_trace.py step3-compatible schema so side_by_side.py works."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
@@ -371,7 +371,7 @@ def write_step3_xlsx(rows, path):
                "KernelCount_fwd", "KernelSum_ms_fwd"]
     # ATOM rows are aggregated straight from the chosen forward, so the per-name
     # totals below are just the row sums; they exist so the workbook matches the
-    # schema analyze_trace.py writes (where they are independent ground truth).
+    # schema analyze_sglang_trace.py writes (where they are independent ground truth).
     name_cnt: dict[str, int] = {}
     name_sum: dict[str, float] = {}
     for row in rows:
@@ -426,8 +426,8 @@ def main():
     p.add_argument("--forward-match", metavar="SUBSTR", default=None,
                    help="only forwards whose wrapper label contains SUBSTR are "
                         "candidates, e.g. 'bs=3 tok=16384' or 'bs=64 tok=64 d=64'. "
-                        "Pin the exact forward used by sglang_vs_atom_glm52.py "
-                        "by passing its full label (e.g. a specific ctx=[...]).")
+                        "Pin one exact forward by passing its full label (e.g. a "
+                        "specific ctx=[...]), so the SGLang side can be matched to it.")
     p.add_argument("--struct-forward-match", metavar="SUBSTR", default=None,
                    help="same, for the no-cuda-graph structure trace (its labels "
                         "differ from the timing trace; defaults to --forward-match, "

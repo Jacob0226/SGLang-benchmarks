@@ -5,7 +5,7 @@ GLM-5.2-SPECIALIZED full/shared decode-layer side-by-side (ATOM | SGLang).
 Why specialized: neither side has a usable per-layer module tree in its decode
 no-graph trace. SGLang's has only `step[DECODE bs=N]` + torch.compile FX-graph call
 markers, and ATOM torch.compiles the whole model, so nothing marks where one decoder
-layer ends. (analyze_trace.py's step3 does separate full+MoE from shared+MoE on the
+layer ends. (analyze_sglang_trace.py's step3 does separate full+MoE from shared+MoE on the
 SGLang side, since it groups layers by the kernels they run — but that gives you a
 per-type average, not two concrete neighbouring layers, and it gives you nothing at
 all for ATOM.)

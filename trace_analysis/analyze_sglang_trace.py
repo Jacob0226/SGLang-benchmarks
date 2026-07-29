@@ -24,9 +24,9 @@ Usage:
     # Export step 1 to CSV
     python auto_detect_layer.py --graph-on on.trace.json.gz --csv kernels.csv
 
-    # Restrict to ONE forward pass (per-forward numbers, comparable with
-    # sglang_vs_atom_glm52.py); without it every kernel's Avg is a
-    # whole-trace average that blends forwards of different batch/token sizes
+    # Restrict to ONE forward pass, so every number is per-forward and comparable
+    # across runs; without it each kernel's Avg is a whole-trace average that
+    # blends forwards of different batch/token sizes
     python auto_detect_layer.py --graph-on on.trace.json.gz \
         --graph-off off.trace.json.gz --forward-match "bs=3"
 """
@@ -125,8 +125,8 @@ def select_forward_window(windows: list[tuple[float, float, str]],
     """Choose one window out of the candidates.
 
     pick=first/last → by time; pick=min/median/max → by Σ kernel duration inside
-    the window (needs `kernels`), which is how sglang_vs_atom_glm52.py picks
-    its representative forward.
+    the window (needs `kernels`). min guards against a JIT-inflated first forward,
+    median is the usual steady-state choice.
     """
     if len(windows) == 1 or kernels is None or pick in ("first", "last"):
         return windows[0] if pick != "last" else windows[-1]

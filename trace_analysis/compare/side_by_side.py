@@ -1,24 +1,42 @@
 #!/usr/bin/env python3
 """
-compare_layer_breakdown.py
+side_by_side.py
 
-Compare ANY two step3_layer_breakdown workbooks (.xlsx or .csv) side by side.
-Aligns rows by (ParentModule, LeafModule) using LCS sequence alignment,
-preserving execution order and padding the shorter side with empty rows.
+Put step3_layer_breakdown workbooks (.xlsx or .csv) side by side in one sheet.
+Two alignment modes, because the two comparisons we run need different ones:
 
-Whatever the two files describe is up to you: same stack on two GPUs (MI355X vs
-B200), or the same GPU before and after a change (PR old vs new). Two SGLang
-workbooks align well because the module names match; for SGLang vs ATOM the names
-differ and the alignment falls apart — use sglang_vs_atom_glm52.py instead.
+  --align lcs   Align rows by (ParentModule, LeafModule) with LCS sequence
+                alignment, preserving execution order and padding the shorter
+                side with empty rows. Needs exactly two sources whose module
+                names match: same stack on two GPUs (MI355X vs B200), or the
+                same GPU before and after a change (PR old vs new). Adds Δ / ratio
+                columns and per-block subtotals.
+
+  --align none  Keep every source in its OWN call order, no cross-source
+                matching (default). For sources whose module names do NOT
+                correspond — SGLang vs ATOM — where LCS would produce
+                meaningless pairings. Takes any number of sources; every kernel
+                row still carries its caller (Section > LeafModule) and call
+                site so you can match the stacks by eye, and a functional-bucket
+                summary is appended at the bottom.
 
 Usage:
-    python compare_layer_breakdown.py --file-a MI355X/step3_layer_breakdown.xlsx --file-b B200/step3_layer_breakdown.xlsx --labels MI355X B200 --out comparison.xlsx
+    python side_by_side.py --align lcs --out comparison.xlsx \\
+        --src MI355X MI355X/step3_layer_breakdown.xlsx \\
+        --src B200   B200/step3_layer_breakdown.xlsx
+
+    python side_by_side.py --out callorder.xlsx --title "GLM-5.2 prefill" \\
+        --src SGLANG step3_layer_breakdown_SGLANG.xlsx \\
+        --src ATOM   step3_layer_breakdown_ATOM.xlsx \\
+        --summary-csv cmp_glm52_prefill.csv
 """
 
 import argparse
 import csv  # for reading input CSVs
 import os
 import sys
+
+from glm52_buckets import BUCKET_ORDER, classify
 
 
 def _trace_busy(path: str):
@@ -678,55 +696,262 @@ def write_xlsx(header, rows, section_meta, label_a, label_b, path, meta_info=Non
     wb.save(path)
 
 
+# --------------------------------------------------------------------------- #
+# --align none: every source in its own call order, tagged with its caller.
+# --------------------------------------------------------------------------- #
+# Avg_us is the cost of ONE launch. LaunchCnt is how many launches THIS row's call
+# site made in the forward — on the SGLang side that is one per layer, so it equals
+# the number of layers of the types in LayerType — and Σ_ms = Avg_us x LaunchCnt.
+# KernelΣ_ms/KernelCnt are the kernel NAME's totals in the same forward regardless of
+# call site, repeated on every row sharing the name (so do NOT sum them): Σ LaunchCnt
+# of the same-name rows below KernelCnt means the kernel also runs outside the layers.
+CALLORDER_COLS = ["LayerType", "Section", "LeafModule (caller)", "KernelName", "Avg_us",
+                  "Σ_ms", "LaunchCnt", "KernelΣ_ms", "KernelCnt", "CallSite"]
+
+
+def read_layer_types(path):
+    """The step3 workbook's LayerTypes sheet, which decodes the LayerType letters
+    into layer types (GLM-5.2: full-indexer + MLP / full-indexer + MoE /
+    shared-indexer + MoE). Absent on sources that do not group by layer (ATOM)."""
+    if not path.endswith(".xlsx"):
+        return []
+    from openpyxl import load_workbook
+    wb = load_workbook(path, data_only=True)
+    if "LayerTypes" not in wb.sheetnames:
+        return []
+    out = []
+    for r in wb["LayerTypes"].iter_rows(min_row=2, values_only=True):
+        if not r or not r[0] or str(r[0]) == "NOTE":
+            continue
+        out.append((r[0], r[1], r[2], r[3]))
+    return out
+
+
+def _callorder_rows(path):
+    """step3 file -> the display rows, in the file's own order."""
+    def pick(row, *names):
+        for n in names:
+            if n in row and row[n] not in (None, ""):
+                return _num(row[n])
+        return ""
+
+    def _num(v):
+        """load_breakdown stringifies every cell; put numbers back as numbers so
+        Excel does not show them as text."""
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return v
+        return int(f) if f.is_integer() and "." not in str(v) else f
+
+    out = []
+    for r in load_breakdown(path):
+        sum_us = r.get("SumDuration_us") or 0
+        out.append({
+            "LayerType": r.get("LayerType", ""),
+            "Section": r.get("Section", ""),
+            "Leaf": r.get("LeafModule", ""),
+            "Kernel": r.get("KernelName", ""),
+            "Avg_us": _num(r.get("AvgDuration_us", "")),
+            "Sum_ms": float(sum_us) / 1000.0 if sum_us else 0.0,
+            "Count": pick(r, "LaunchCount", "Count"),
+            "TrSum_ms": pick(r, "KernelSum_ms_fwd", "TraceSum_ms_fwd"),
+            "TrCount": pick(r, "KernelCount_fwd", "TraceCount_fwd"),
+            "CallSite": r.get("CallSite", ""),
+        })
+    return out
+
+
+def write_callorder_xlsx(src, out_path, title="", summary_csv=None):
+    """src = [(label, path)]; no cross-source alignment."""
+    from collections import defaultdict
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    sources = [(lab, _callorder_rows(path)) for lab, path in src]
+
+    wb = Workbook(); ws = wb.active; ws.title = "call_order_side_by_side"
+    bold = Font(name="Arial", size=10, bold=True)
+    white = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+    reg = Font(name="Arial", size=9)
+    mono = Font(name="Consolas", size=9)
+    src_fill = PatternFill("solid", fgColor="305496")
+    hdr_fill = PatternFill("solid", fgColor="8EAADB")
+    tot_fill = PatternFill("solid", fgColor="FCE4D6")
+    center = Alignment(horizontal="center")
+
+    ncol = len(CALLORDER_COLS)
+    gap = 1
+    r0 = 1
+    if title:
+        ws.cell(1, 1, title).font = bold
+        r0 = 2
+
+    for lab, path in src:
+        legend = read_layer_types(path)
+        if not legend:
+            continue
+        kinds = sorted({name for _l, name, _c, _i in legend})
+        text = (f"{lab} — {len(kinds)} layer types: {' / '.join(kinds)}.  "
+                f"LayerType column: "
+                + " · ".join(f"{l}={name} ({cnt} layer{'' if cnt == 1 else 's'},"
+                             f" idx {idx})" for l, name, cnt, idx in legend)
+                + "   (see the LayerTypes sheet of the step3 workbook)")
+        ws.cell(r0, 1, text).font = reg
+        r0 += 1
+
+    # source label band
+    for si, (lab, _) in enumerate(sources):
+        c0 = 1 + si * (ncol + gap)
+        cell = ws.cell(r0, c0, lab); cell.font = white; cell.fill = src_fill
+        ws.merge_cells(start_row=r0, start_column=c0, end_row=r0, end_column=c0 + ncol - 1)
+        cell.alignment = center
+    # header
+    hr = r0 + 1
+    for si, _ in enumerate(sources):
+        c0 = 1 + si * (ncol + gap)
+        for j, cname in enumerate(CALLORDER_COLS):
+            cell = ws.cell(hr, c0 + j, cname); cell.font = bold; cell.fill = hdr_fill
+    ws.freeze_panes = f"A{hr+1}"
+
+    maxlen = max(len(rows) for _, rows in sources)
+    for i in range(maxlen):
+        rr = hr + 1 + i
+        for si, (_, rows) in enumerate(sources):
+            if i >= len(rows):
+                continue
+            d = rows[i]; c0 = 1 + si * (ncol + gap)
+            vals = [d["LayerType"], d["Section"], d["Leaf"], d["Kernel"],
+                    d["Avg_us"], round(d["Sum_ms"], 3), d["Count"],
+                    d["TrSum_ms"], d["TrCount"], d["CallSite"]]
+            for j, v in enumerate(vals):
+                cell = ws.cell(rr, c0 + j, v)
+                cell.font = mono if j in (3, 9) else reg
+
+    # --- functional-bucket summary at the bottom ---
+    sr = hr + 1 + maxlen + 2   # leave a gap
+    if summary_csv:
+        # Numbers computed by glm52_buckets.py, which states its own scope.
+        import csv as _csv
+        with open(summary_csv) as f:
+            crows = [r for r in _csv.reader(f) if r]
+        ws.cell(sr, 1, "Bucket summary — per ONE forward, Σ ms (from glm52_buckets.py)").font = bold
+        sr += 1
+        for r in crows:
+            if r[0].startswith("#"):
+                ws.cell(sr, 1, ", ".join(r)).font = reg; sr += 1; continue
+            is_hdr = (r[0] == "Bucket")
+            is_tot = (r[0] == "TOTAL")
+            for j, v in enumerate(r):
+                try:
+                    v = float(v)
+                except (ValueError, TypeError):
+                    pass
+                cell = ws.cell(sr, 1 + j, v)
+                cell.font = white if is_hdr else (bold if is_tot else reg)
+                if is_hdr:
+                    cell.fill = src_fill
+                elif is_tot:
+                    cell.fill = tot_fill
+            sr += 1
+    else:
+        cat_sum = [defaultdict(float) for _ in sources]
+        for si, (_, rows) in enumerate(sources):
+            for d in rows:
+                cat_sum[si][classify(str(d["Kernel"]))] += d["Sum_ms"]
+        cats = [c for c in BUCKET_ORDER if any(c in cs for cs in cat_sum)]
+        ws.cell(sr, 1, "Bucket summary (Σ ms per bucket, this sheet's rows only)").font = bold
+        sr += 1
+        for j, h in enumerate(["Bucket"] + [lab for lab, _ in sources]):
+            cell = ws.cell(sr, 1 + j, h); cell.font = white; cell.fill = src_fill
+        sr += 1
+        totals = [0.0] * len(sources)
+        for c in cats:
+            ws.cell(sr, 1, c).font = bold
+            for si in range(len(sources)):
+                v = cat_sum[si].get(c, 0.0)
+                totals[si] += v
+                ws.cell(sr, 2 + si, round(v, 3)).font = reg
+            sr += 1
+        ws.cell(sr, 1, "TOTAL").font = bold
+        for si in range(len(sources)):
+            cell = ws.cell(sr, 2 + si, round(totals[si], 3)); cell.font = bold; cell.fill = tot_fill
+
+    widths = [16, 22, 24, 46, 9, 8, 5, 8, 6, 40]
+    for si in range(len(sources)):
+        c0 = 1 + si * (ncol + gap)
+        for j, w in enumerate(widths):
+            ws.column_dimensions[get_column_letter(c0 + j)].width = w
+        if si < len(sources) - 1:
+            ws.column_dimensions[get_column_letter(c0 + ncol)].width = 2
+    wb.save(out_path)
+    print(f"[INFO] written {out_path}  "
+          f"({', '.join(f'{lab}:{len(rows)}' for lab, rows in sources)})", file=sys.stderr)
+
+
 def main():
     p = argparse.ArgumentParser(
-        description="Compare two step3_layer_breakdown.csv files side by side.")
-    p.add_argument("--file-a", required=True, metavar="FILE",
-                   help="First breakdown file (.xlsx or .csv)")
-    p.add_argument("--file-b", required=True, metavar="FILE",
-                   help="Second breakdown file (.xlsx or .csv)")
-    p.add_argument("--labels", nargs=2, default=["A", "B"],
-                   metavar=("A_LABEL", "B_LABEL"),
-                   help="Labels for the two platforms (default: A B)")
-    p.add_argument("--out", required=True, metavar="XLSX",
-                   help="Output Excel path (e.g. comparison.xlsx)")
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--src", nargs=2, action="append", metavar=("LABEL", "FILE"),
+                   required=True,
+                   help="repeatable: LABEL path/to/step3_layer_breakdown.{xlsx,csv}")
+    p.add_argument("--align", choices=["none", "lcs"], default="none",
+                   help="none (default): each source in its own call order, any "
+                        "number of sources. lcs: align two sources by "
+                        "(ParentModule, LeafModule)")
+    p.add_argument("--out", required=True, metavar="XLSX", help="output Excel path")
     p.add_argument("--title", default="",
-                   help="Profile description written in the first row of the output")
-    p.add_argument("--trace-a", default="", metavar="TRACE",
-                   help="Source graph-ON trace for label A; its name is shown and "
-                        "its overlap-factor / union-busy are computed")
-    p.add_argument("--trace-b", default="", metavar="TRACE",
-                   help="Source graph-ON trace for label B (name + overlap/union-busy)")
+                   help="description written in the first row of the output")
+    p.add_argument("--summary-csv", dest="summary_csv", default=None,
+                   help="--align none only: glm52_buckets.py CSV to embed as the "
+                        "bucket summary instead of recomputing from this sheet")
+    p.add_argument("--trace", nargs=2, action="append", metavar=("LABEL", "TRACE"),
+                   default=[], help="--align lcs only: source graph-ON trace for a "
+                                    "label; its name is shown and its overlap-factor "
+                                    "/ union-busy are computed")
     args = p.parse_args()
 
-    rows_a = load_breakdown(args.file_a)
-    rows_b = load_breakdown(args.file_b)
+    if args.align == "none":
+        if args.trace:
+            p.error("--trace only applies to --align lcs")
+        write_callorder_xlsx(args.src, args.out, args.title, args.summary_csv)
+        return
 
+    if len(args.src) != 2:
+        p.error("--align lcs needs exactly two --src (got "
+                f"{len(args.src)}); use --align none for more")
+    if args.summary_csv:
+        p.error("--summary-csv only applies to --align none")
+    (label_a, file_a), (label_b, file_b) = args.src
+    traces = dict((lab, t) for lab, t in args.trace)
+    unknown = set(traces) - {label_a, label_b}
+    if unknown:
+        p.error(f"--trace label(s) {sorted(unknown)} do not match any --src label")
+
+    rows_a = load_breakdown(file_a)
+    rows_b = load_breakdown(file_b)
     if not rows_a:
-        sys.exit(f"[ERROR] No data in {args.file_a}")
+        sys.exit(f"[ERROR] No data in {file_a}")
     if not rows_b:
-        sys.exit(f"[ERROR] No data in {args.file_b}")
+        sys.exit(f"[ERROR] No data in {file_b}")
 
-    blocks_a = build_blocks(rows_a)
-    blocks_b = build_blocks(rows_b)
-    print(f"[INFO] {args.labels[0]}: {len(rows_a)} kernels, "
-          f"{len(blocks_a)} blocks", file=sys.stderr)
-    print(f"[INFO] {args.labels[1]}: {len(rows_b)} kernels, "
-          f"{len(blocks_b)} blocks", file=sys.stderr)
+    print(f"[INFO] {label_a}: {len(rows_a)} kernels, "
+          f"{len(build_blocks(rows_a))} blocks", file=sys.stderr)
+    print(f"[INFO] {label_b}: {len(rows_b)} kernels, "
+          f"{len(build_blocks(rows_b))} blocks", file=sys.stderr)
 
-    header, output, section_meta = build_comparison(
-        rows_a, rows_b, args.labels[0], args.labels[1])
+    header, output, section_meta = build_comparison(rows_a, rows_b, label_a, label_b)
 
+    trace_a, trace_b = traces.get(label_a, ""), traces.get(label_b, "")
     meta_info = {
         "title": args.title,
-        "a_name": os.path.basename(args.trace_a) if args.trace_a else os.path.basename(args.file_a),
-        "b_name": os.path.basename(args.trace_b) if args.trace_b else os.path.basename(args.file_b),
-        "a_busy": _trace_busy(args.trace_a) if args.trace_a else None,
-        "b_busy": _trace_busy(args.trace_b) if args.trace_b else None,
+        "a_name": os.path.basename(trace_a or file_a),
+        "b_name": os.path.basename(trace_b or file_b),
+        "a_busy": _trace_busy(trace_a) if trace_a else None,
+        "b_busy": _trace_busy(trace_b) if trace_b else None,
     }
-
-    write_xlsx(header, output, section_meta,
-               args.labels[0], args.labels[1], args.out, meta_info)
+    write_xlsx(header, output, section_meta, label_a, label_b, args.out, meta_info)
     print(f"[INFO] Written to {args.out}", file=sys.stderr)
 
 
