@@ -8,7 +8,8 @@ Analyze PyTorch profiler traces to discover model layer structure and kernel bre
 Three-step analysis:
   Step 1: Parse cuda-graph-ON trace → kernel statistics (count, sum, avg, percentage)
   Step 2: Parse cuda-graph-OFF trace → layer structure (types, sub-modules)
-  Step 3: Combine → per-layer kernel breakdown with sub-module labels
+  Step 3: Combine → one row per call site of ONE forward, with the layer types that
+          run it and how many layers that is (so Σ covers the whole forward)
 
 Usage:
     # Full analysis (both traces)
@@ -294,34 +295,32 @@ def _lookup_stat(name: str,
     return None, ""
 
 
-def write_step3(layer_types: list[dict], kernels_off: list[dict],
+def write_step3(agg_table: list[dict], kernels_off: list[dict],
                 kernel_stats: list[dict] | None, path: str,
                 callsite_map: dict | None = None) -> None:
-    """Export step 3 breakdown to Excel.
+    """Export step 3 breakdown to Excel: one row per call site, aggregated over
+    every layer of ONE forward.
 
-    Structure comes from graph-OFF trace (layer types, kernel order, sections,
-    modules, call sites).  When graph-ON stats are available and a kernel name
-    can be matched (exact or hash-stripped), the graph-ON kernel name and
-    avg_dur are used as primary values; the graph-OFF name and single-pass
-    duration are kept as reference columns.
+    Structure (sections, modules, call order, call sites) comes from the graph-OFF
+    trace; per-launch timing comes from the graph-ON stats, matched by kernel name
+    (exact or hash-stripped). Count is the number of layers that really run this
+    call site, measured across all layers, so Σ = avg x Count covers the forward
+    without extrapolating from one representative layer.
 
     Output columns:
-      LayerType, LayerCount, Index, Section, LeafModule,
+      LayerType,        ← which layer types run this call site, e.g. "A+B"
+      LayerCount,       ← how many layers that is
+      Index, Section, LeafModule,
       KernelName,       ← graph-ON name if matched, else graph-OFF name
       AvgDuration_us,   ← graph-ON avg_dur if matched, else graph-OFF dur
-      Count, SumDuration_us, Percentage,  ← graph-ON stats (empty if not matched)
+      Count, SumDuration_us, Percentage,
       MatchMethod,      ← "exact" / "norm" / "none"
       GraphOFF_KernelName, GraphOFF_Duration_us,  ← graph-OFF reference
       CallSite,
-      TraceCount_fwd, TraceSum_ms_fwd  ← ground truth for the whole forward:
-          the kernel NAME's real count / Σ from graph-ON (repeated on every row
-          that shares the name, so do NOT sum this column).
-
-    Σ assumes a call site fires once per layer of its type, which is taken from ONE
-    representative layer. Kernels that only run in SOME layers of a type (in
-    GLM-5.2 the DSA indexer chain runs in layers 0-2 and then every 4th layer) are
-    therefore under-counted; the coverage report printed at the end lists every
-    kernel whose structural Σ disagrees with TraceSum_ms_fwd.
+      TraceCount_fwd, TraceSum_ms_fwd  ← graph-ON ground truth for the whole
+          forward, per kernel NAME (repeated on every row sharing the name, so do
+          NOT sum this column). Σ of the rows should now match it; the coverage
+          report at the end lists any kernel where it does not.
     """
     # Build stat lookups (exact + hash-normalized)
     stat_lookup: dict[str, dict] = {}
@@ -343,63 +342,50 @@ def write_step3(layer_types: list[dict], kernels_off: list[dict],
 
     rows = []
     grand_total = 0.0  # sum of per-callsite graph-ON Σ (one forward), for Percentage
-    for i, lt in enumerate(layer_types):
-        if i > 0:
-            rows.append(None)  # placeholder blank row, filled after totals
-        label = chr(ord("A") + i)
-        sub_mod_str = " + ".join(lt["sub_modules"])
-        for pos, (kidx, top_mod, leaf) in enumerate(lt.get("kernel_breakdown", [])):
-            k = kernels_off[kidx]
-            off_name = k["name"]
-            off_dur = round(k["dur"], 1)
-            cs = (callsite_map or {}).get(kidx, "")
+    for pos, e in enumerate(agg_table):
+        kidx = e["kidx"]
+        k = kernels_off[kidx]
+        off_name = k["name"]
+        off_dur = round(k["dur"], 1)
+        cs = (callsite_map or {}).get(kidx, "")
 
-            if kernel_stats:
-                s, method = _lookup_stat(off_name, stat_lookup, stat_lookup_norm)
-            else:
-                s, method = None, "none"
+        if kernel_stats:
+            s, method = _lookup_stat(off_name, stat_lookup, stat_lookup_norm)
+        else:
+            s, method = None, "none"
 
-            if s:
-                # PER-CALL-SITE attribution: this breakdown entry is ONE kernel launch
-                # in ONE representative layer, so it fires once per layer of this type.
-                # Count  = layers of this type (lt.count) * this position's launches (1)
-                # Σ (ms) = per-launch graph-ON avg (matched by name) * that count.
-                # This avoids the old bug where every call-site of a shared kernel
-                # (e.g. all-reduce) got the WHOLE-trace name total, inflating totals.
-                kernel_name = s["name"]
-                avg_dur = round(s["avg_dur"], 3)
-                count = lt["count"]
-                sum_dur = round(s["avg_dur"] * lt["count"], 1)
-                grand_total += sum_dur
-                pct = None  # filled after grand_total is known
-            else:
-                kernel_name = off_name
-                avg_dur = off_dur
-                count = ""
-                sum_dur = ""
-                pct = ""
-                method = "none"
+        if s:
+            # This row is ONE call site; e["count"] is how many layers of the forward
+            # actually reach it, so avg (per launch, graph-ON) x count is its share of
+            # the forward. Nothing is extrapolated from a representative layer.
+            kernel_name = s["name"]
+            avg_dur = round(s["avg_dur"], 3)
+            count = e["count"]
+            sum_dur = round(s["avg_dur"] * e["count"], 1)
+            grand_total += sum_dur
+            pct = None  # filled after grand_total is known
+        else:
+            kernel_name = off_name
+            avg_dur = off_dur
+            count = ""
+            sum_dur = ""
+            pct = ""
+            method = "none"
 
-            row = [f"{label}: {sub_mod_str}", lt["count"], pos,
-                   top_mod, leaf or "(self)",
-                   kernel_name, avg_dur,
-                   count, sum_dur, pct,
-                   method,
-                   off_name, off_dur,
-                   cs,
-                   s["count"] if s else "",
-                   round(s["sum_dur"] / 1000.0, 3) if s else ""]
-            rows.append(row)
+        row = [e["types"], e["count"], pos,
+               e["section"], e["leaf"] or "(self)",
+               kernel_name, avg_dur,
+               count, sum_dur, pct,
+               method,
+               off_name, off_dur,
+               cs,
+               s["count"] if s else "",
+               round(s["sum_dur"] / 1000.0, 3) if s else ""]
+        rows.append(row)
 
-    # second pass: fill blank separator rows and Percentage (row_Σ / grand_total)
-    out_rows = []
     for r in rows:
-        if r is None:
-            out_rows.append([""] * len(headers)); continue
         if r[9] is None:  # pct placeholder
             r[9] = round(100.0 * r[8] / grand_total, 2) if grand_total else 0.0
-        out_rows.append(r)
-    rows = out_rows
 
     _write_xlsx(headers, rows, path)
     n_matched = sum(1 for r in rows if r and r[10] != "none" and r[10] != "")
@@ -411,8 +397,8 @@ def write_step3(layer_types: list[dict], kernels_off: list[dict],
 
 
 def _print_coverage(rows: list[list], kernel_stats: list[dict] | None) -> None:
-    """Report kernels whose structural Σ (avg x layers) misses the real per-forward
-    Σ, i.e. call sites that exist in only some layers of a layer type."""
+    """Report kernels whose per-call-site Σ misses the real per-forward Σ, which now
+    only happens for kernels that also run OUTSIDE the decoder layers."""
     if not kernel_stats:
         return
     struct: dict[str, float] = {}
@@ -423,14 +409,18 @@ def _print_coverage(rows: list[list], kernel_stats: list[dict] | None) -> None:
     truth = {s["name"]: s["sum_dur"] for s in kernel_stats}
     covered = sum(struct.values())
     total = sum(truth.values())
+    # noise floor: sub-0.1 ms kernels (aranges, fills, cat) drift by a launch or two
+    # without saying anything about the forward's cost
     off = [(struct.get(n, 0.0) - t, n, struct.get(n, 0.0), t)
            for n, t in truth.items()
-           if t > 0 and abs(struct.get(n, 0.0) - t) / t > 0.05]
+           if t > 0 and abs(struct.get(n, 0.0) - t) / t > 0.05
+           and abs(struct.get(n, 0.0) - t) > 100.0]
     print(f"[INFO] Coverage: structural Σ = {fmt_dur(covered)} of the forward's "
           f"{fmt_dur(total)} ({100*covered/total:.1f}%)", file=sys.stderr)
     if off:
-        print(f"[WARN] {len(off)} kernels whose per-call-site Σ differs >5% from "
-              f"the real per-forward Σ (see TraceSum_ms_fwd column):", file=sys.stderr)
+        print(f"[WARN] {len(off)} kernels whose per-call-site Σ differs from the real "
+              f"per-forward Σ by >5% and >0.1 ms (see TraceSum_ms_fwd):",
+              file=sys.stderr)
         for d, n, s, t in sorted(off, key=lambda x: -abs(x[0]))[:10]:
             print(f"         {d/1000:+8.2f} ms  struct={s/1000:7.2f} "
                   f"trace={t/1000:7.2f}  {n[:60]}", file=sys.stderr)
@@ -886,19 +876,21 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict],
                             window: tuple[float, float, str] | None = None):
     """
     Step 2: Discover layer structure.
-    Returns (cls_name, layer_types, callsite_map) where layer_types is:
-      [ { 'name': str, 'count': int, 'layers': [name, ...],
-          'sub_modules': [cls, ...],
-          'kernel_breakdown': [ (kernel_idx, top_module, leaf_detail), ... ] }, ... ]
-    and callsite_map is { kernel_idx: "file.py(line): func_name" }
+    Returns (cls_name, layer_types, callsite_map, fine_types, agg_table):
+      layer_types: layers grouped by sub-module signature (what the model looks
+        like), [ { 'count': int, 'layers': [name, ...], 'sub_modules': [cls, ...],
+                  'kernel_breakdown': [ (kernel_idx, section, leaf), ... ] }, ... ]
+      callsite_map: { kernel_idx: "file.py(line): func_name" }
+      fine_types, agg_table: layers grouped by what they actually run, and every
+        call site aggregated over all layers — see _aggregate_call_sites()
     """
     cls_name = find_decoder_layer_class(trace)
     if cls_name is None:
-        return None, [], {}
+        return None, [], {}, [], []
 
     forward_pass = get_one_forward_pass(trace, cls_name, window)
     if not forward_pass:
-        return cls_name, [], {}
+        return cls_name, [], {}, [], []
 
     ext_to_kidx, corr_to_kidx, runtime, rt_ts = build_ext_id_map(trace, kernels)
 
@@ -1096,20 +1088,105 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict],
             "kernel_breakdown": g["example_breakdown"],
         })
 
-    # Build callsite map only for kernels in breakdowns (fast)
-    target_kidxs = set()
-    for lt in layer_types:
-        for item in lt.get("kernel_breakdown", []):
-            target_kidxs.add(item[0])
+    fine_types, agg_table = _aggregate_call_sites(layer_data, kernels)
+    if len(fine_types) > len(layer_types):
+        shape = ", ".join(f"{t['label']}={t['count']}" for t in fine_types)
+        print(f"[INFO] {len(layer_types)} layer types by sub-module signature, "
+              f"{len(fine_types)} once the kernels they run are compared "
+              f"({shape} layers)", file=sys.stderr)
+
+    # Build callsite map only for the aggregated call sites (fast)
+    target_kidxs = {e["kidx"] for e in agg_table}
     print(f"[INFO] Resolving call sites for {len(target_kidxs)} kernels...",
           file=sys.stderr)
     callsite_map = build_callsite_map(trace, kernels, ext_to_kidx, runtime,
                                       target_kidxs)
 
-    return cls_name, layer_types, callsite_map
+    return cls_name, layer_types, callsite_map, fine_types, agg_table
 
 
-def print_step2(cls_name: str, layer_types: list[dict]) -> None:
+def _aggregate_call_sites(layer_data: list[dict], kernels: list[dict]):
+    """Group layers by what they actually run, and aggregate every call site over
+    ALL layers of the forward.
+
+    The sub-module signature used above only sees a layer's direct children, so
+    layers differing deeper collapse together: in GLM-5.2 one layer's DSA top-k is
+    shared by the next three (`index_topk_freq`), and those three never run the
+    indexer, yet all 75 MoE layers look identical from the outside. Grouping by the
+    (section, leaf, kernel) multiset separates them.
+
+    Aggregating over every layer also means Count is MEASURED (the indexer chain
+    really runs in 21 of 78 layers) instead of extrapolated from one layer, so a
+    call site is listed once with the number of layers that run it.
+
+    Returns (fine_types, agg_table) where agg_table entries are ordered by their
+    mean relative position inside a layer:
+        {section, leaf, kernel, kidx (a representative launch), count, labels}
+    """
+    def key_of(item):
+        kidx, section, leaf = item
+        return (section, leaf, kernels[kidx]["name"])
+
+    fine: OrderedDict = OrderedDict()
+    for i, ld in enumerate(layer_data):
+        sig = tuple(sorted(Counter(key_of(it)
+                                   for it in ld["kernel_breakdown"]).items()))
+        fine.setdefault(sig, []).append(i)
+
+    fine_types = []
+    for n, (sig, idxs) in enumerate(fine.items()):
+        fine_types.append({
+            "label": chr(ord("A") + n),
+            "count": len(idxs),
+            "indices": idxs,
+            "sub_modules": list(layer_data[idxs[0]]["sub_modules"]),
+            "keys": {k for k, _c in sig},
+        })
+    # describe each type as a diff against the most common one
+    def names(keys):
+        return sorted({(leaf or sec) for sec, leaf, _k in keys})
+
+    baseline = max(fine_types, key=lambda t: t["count"]) if fine_types else None
+    for t in fine_types:
+        if t is baseline:
+            t["diff"] = ["(most common)"]
+            continue
+        t["diff"] = ([f"+{n}" for n in names(t["keys"] - baseline["keys"])]
+                     + [f"-{n}" for n in names(baseline["keys"] - t["keys"])])
+    label_of = {i: t["label"] for t in fine_types for i in t["indices"]}
+
+    agg: dict = {}
+    for i, ld in enumerate(layer_data):
+        seen: Counter = Counter()
+        n = max(len(ld["kernel_breakdown"]), 1)
+        for pos, item in enumerate(ld["kernel_breakdown"]):
+            k = key_of(item)
+            nth = seen[k]
+            seen[k] += 1
+            e = agg.setdefault((k, nth), {
+                "section": k[0], "leaf": k[1], "kernel": k[2],
+                "kidx": item[0], "count": 0, "labels": set(), "pos": []})
+            e["count"] += 1
+            e["labels"].add(label_of[i])
+            e["pos"].append(pos / n)
+
+    for e in agg.values():
+        e["order"] = sum(e["pos"]) / len(e["pos"])
+        e["types"] = ("all" if len(e["labels"]) == len(fine_types)
+                      else "+".join(sorted(e["labels"])))
+    # Sort by mean position, but keep each section in one block: a call site that
+    # only exists in a few layers (e.g. the dense MLP) would otherwise land in the
+    # middle of another section's rows.
+    sec_order: dict = {}
+    for e in agg.values():
+        sec_order[e["section"]] = min(sec_order.get(e["section"], 9e9), e["order"])
+    agg_table = sorted(agg.values(),
+                       key=lambda e: (sec_order[e["section"]], e["order"]))
+    return fine_types, agg_table
+
+
+def print_step2(cls_name: str, layer_types: list[dict],
+                fine_types: list[dict] | None = None) -> None:
     total_layers = sum(lt["count"] for lt in layer_types)
     print(f"\n{'='*100}")
     print(f" Step 2: Layer Structure (cuda-graph-OFF)")
@@ -1130,85 +1207,93 @@ def print_step2(cls_name: str, layer_types: list[dict]) -> None:
         print(f"  Layers: {name_str}")
         print(f"  Sub-modules: {' + '.join(lt['sub_modules'])}")
 
+    if fine_types and len(fine_types) > len(layer_types):
+        print(f"\n  Sub-modules alone merge layers that run different kernels; "
+              f"by what they actually run there are {len(fine_types)} types:")
+        for t in fine_types:
+            diff = ", ".join(t["diff"][:5])
+            if len(t["diff"]) > 5:
+                diff += f", ... (+{len(t['diff']) - 5} more)"
+            print(f"    {t['label']}: {t['count']:>3} layers  "
+                  f"idx {_index_ranges(t['indices'])}  vs {diff}")
+
     print(f"\n{'='*100}\n")
+
+
+def _index_ranges(idxs: list[int]) -> str:
+    """Collapse layer indices into ranges/steps, e.g. '0-2' or '6,10,..,74'."""
+    if len(idxs) <= 3:
+        return ",".join(str(i) for i in idxs)
+    steps = {b - a for a, b in zip(idxs, idxs[1:])}
+    if steps == {1}:
+        return f"{idxs[0]}-{idxs[-1]}"
+    if len(steps) == 1:
+        return f"{idxs[0]},{idxs[1]},..,{idxs[-1]} (every {steps.pop()})"
+    return f"{idxs[0]},{idxs[1]},..,{idxs[-1]}"
 
 
 # ===================================================================
 # Step 3: Per-layer kernel breakdown with sub-module labels
 # ===================================================================
 
-def print_step3(cls_name: str, layer_types: list[dict],
+def print_step3(cls_name: str, agg_table: list[dict],
                 kernels: list[dict], kernel_stats: list[dict] | None,
                 callsite_map: dict | None = None) -> None:
     """
-    Print kernel breakdown for each layer type.
-    Uses graph-OFF kernel data with sub-module labels.
-    If kernel_stats (from graph-ON step 1) is provided, also shows
-    the graph-ON avg duration for cross-reference.
+    Print the call-site breakdown of one forward: sections in call order, each
+    call site once, with the layer types that run it and its share of the forward.
+    Structure comes from the graph-OFF trace; per-launch avg from graph-ON step 1
+    when the kernel name matches.
     """
-    # Build name->avg lookup from step 1
-    stat_lookup = {}
+    stat_lookup: dict[str, dict] = {}
+    stat_lookup_norm: dict[str, dict] = {}
     if kernel_stats:
         for s in kernel_stats:
             stat_lookup[s["name"]] = s
+            norm = _strip_jit_hash(s["name"])
+            stat_lookup_norm.setdefault(norm, s)
 
     print(f"\n{'='*100}")
-    print(f" Step 3: Layer Kernel Breakdown")
+    print(f" Step 3: Call-site Breakdown of One Forward ({cls_name})")
     print(f"{'='*100}")
 
-    for i, lt in enumerate(layer_types):
-        label = chr(ord("A") + i)
-        breakdown = lt["kernel_breakdown"]
-        if not breakdown:
-            continue
+    current_sec = None
+    sec_sum = 0.0
+    total_sum = 0.0
 
-        print(f"\n  Type {label} ({lt['count']} layers): "
-              f"{' + '.join(lt['sub_modules'])}")
-        print(f"  {'-'*90}")
+    print(f"  {'#':>3}  {'Types':>9} {'Layers':>6}  {'Detail':<34s}  "
+          f"{'Avg':>9}  {'Sum':>10}  Kernel Name")
+    print(f"  {'-'*3}  {'-'*9} {'-'*6}  {'-'*34}  {'-'*9}  {'-'*10}  {'-'*40}")
 
-        current_top = None
-        top_dur = 0.0
-        total_dur = 0.0
+    for pos, e in enumerate(agg_table):
+        k = kernels[e["kidx"]]
+        s, _m = (_lookup_stat(k["name"], stat_lookup, stat_lookup_norm)
+                 if kernel_stats else (None, "none"))
+        avg = s["avg_dur"] if s else k["dur"]
+        row_sum = avg * e["count"]
+        total_sum += row_sum
 
-        header = f"  {'#':>3}  {'Detail':<40s}  {'Duration':>10}  {'Kernel Name'}"
-        if kernel_stats:
-            header += f"  {'(graph-ON avg)':>14}"
-        print(header)
-        print(f"  {'-'*3}  {'-'*40}  {'-'*10}  {'-'*50}")
+        if e["section"] != current_sec:
+            if current_sec is not None:
+                print(f"  {'':>3}  {'':>16}  {'Subtotal':>34}  {'':>9}  "
+                      f"{fmt_dur(sec_sum):>10}\n")
+            current_sec = e["section"]
+            sec_sum = 0.0
+            print(f"  ---- {current_sec} ----")
+        sec_sum += row_sum
 
-        for pos, (kidx, top_mod, leaf) in enumerate(breakdown):
-            k = kernels[kidx]
-            dur = k["dur"]
-            total_dur += dur
+        print(f"  {pos:>3}  {e['types']:>9} {e['count']:>6}  "
+              f"{(e['leaf'] or '(self)')[:34]:<34s}  {fmt_dur(avg):>9}  "
+              f"{fmt_dur(row_sum):>10}  {k['name'][:60]}")
+        cs = callsite_map.get(e["kidx"], "") if callsite_map else ""
+        if cs:
+            print(f"  {'':>3}  {'':>16}  {'':>34}  {'':>9}  {'':>10}  caller: {cs}")
 
-            if top_mod != current_top:
-                if current_top is not None:
-                    print(f"  {'':>3}  {'Subtotal':>40}  {fmt_dur(top_dur):>10}")
-                    print()
-                current_top = top_mod
-                top_dur = 0.0
-                print(f"  ---- {top_mod} ----")
-
-            top_dur += dur
-            detail = leaf if leaf else "(self)"
-            name_display = k["name"][:60]
-            cs = callsite_map.get(kidx, "") if callsite_map else ""
-            line = f"  {pos:>3}  {detail:<40s}  {fmt_dur(dur):>10}  {name_display}"
-
-            if kernel_stats and k["name"] in stat_lookup:
-                avg = stat_lookup[k["name"]]["avg_dur"]
-                line += f"  {fmt_dur(avg):>14}"
-
-            print(line)
-            if cs:
-                print(f"  {'':>3}  {'':>40}  {'':>10}  caller: {cs}")
-
-        # Last module subtotal
-        if current_top is not None:
-            print(f"  {'':>3}  {'Subtotal':>40}  {fmt_dur(top_dur):>10}")
-
-        print(f"\n  {'':>3}  {'TOTAL':>40}  {fmt_dur(total_dur):>10}  "
-              f"({len(breakdown)} kernels)")
+    if current_sec is not None:
+        print(f"  {'':>3}  {'':>16}  {'Subtotal':>34}  {'':>9}  "
+              f"{fmt_dur(sec_sum):>10}")
+    print(f"\n  {'':>3}  {'':>16}  {'TOTAL':>34}  {'':>9}  "
+          f"{fmt_dur(total_sum):>10}  ({len(agg_table)} call sites)")
 
     print(f"\n{'='*100}\n")
 
@@ -1320,17 +1405,18 @@ def main() -> None:
                       f"{args.forward_match!r} in the graph-OFF trace; "
                       f"falling back to the 2nd forward pass", file=sys.stderr)
 
-        cls_name, layer_types, callsite_map = analyze_layer_structure(
+        (cls_name, layer_types, callsite_map,
+         fine_types, agg_table) = analyze_layer_structure(
             trace_off, kernels_off, window_off)
         if cls_name:
-            print_step2(cls_name, layer_types)
+            print_step2(cls_name, layer_types, fine_types)
 
             # --- Step 3: Combined breakdown ---
-            if layer_types:
-                print_step3(cls_name, layer_types, kernels_off, kernel_stats,
+            if agg_table:
+                print_step3(cls_name, agg_table, kernels_off, kernel_stats,
                             callsite_map)
                 if out_dir:
-                    write_step3(layer_types, kernels_off, kernel_stats,
+                    write_step3(agg_table, kernels_off, kernel_stats,
                                 str(out_dir / f"step3_layer_breakdown{args.tag}.xlsx"),
                                 callsite_map)
         else:

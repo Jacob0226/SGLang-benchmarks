@@ -5,8 +5,8 @@ verify_step3_against_trace.py
 Independently re-derive, straight from the raw trace, what a
 step3_layer_breakdown workbook claims, and diff the two.
 
-The workbook is built as  Σ = (per-call avg inside ONE forward) x (call sites x
-layers), so for every kernel name we check:
+The workbook is built as  Σ = (per-call avg inside ONE forward) x (the layers that
+really run that call site), so for every kernel name we check:
   * AvgDuration_us  == the kernel's mean duration inside that same forward
   * Σ SumDuration_us == the kernel's total inside that forward
     (a gap here is legitimate only when the kernel also runs OUTSIDE the decoder

@@ -26,6 +26,16 @@ Steps 1 and 2 **must** be given `--forward-match` so every number describes ONE
 forward; without it each kernel is averaged over the whole trace, which mixes
 different batch/token sizes.
 
+Both step3 workbooks list each call site once and aggregate it over the whole
+forward, so `Count` is measured, not extrapolated: on the SGLang side `LayerType`
+names the layer types that reach the call site and `LayerCount`/`Count` is how many
+layers that is. Layer types come from what a layer actually runs, not from its
+sub-module signature, which is why GLM-5.2 shows 5 (dense layer 0 / dense 1-2 /
+MoE reusing the DSA top-k / MoE computing it every 4th layer / last layer) instead
+of the 2 that `DeepseekV2MLP` vs `DeepseekV2MoE` would suggest. `Σ` therefore covers
+~99.8% of the forward; the rest is kernels outside the decoder layers (lm_head,
+sampling), which `TrΣ_ms`/`TrCnt` still expose.
+
 ## Example
 
 ```bash

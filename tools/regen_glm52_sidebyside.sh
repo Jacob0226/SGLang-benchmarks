@@ -81,13 +81,13 @@ python3 ATOM_Trace_helper/callorder_sidebyside.py \
   --src SGLANG_old "$PRE/sidebyside/step3_layer_breakdown_SGLANG_old.xlsx" \
   --src ATOM       "$PRE/sidebyside/step3_layer_breakdown_ATOM.xlsx" \
   --summary-csv    "$PRE/cmp_glm52_prefill_OLDvsATOM.csv" \
-  --title "GLM-5.2 prefill — call order, ONE forward per side (SGLANG step[EXTEND bs=3 toks=16368] | ATOM prefill[bs=3 tok=16384]); NOT aligned. Avg_us = one launch; Σ_ms/Cnt = per call site within that single forward; TrΣ_ms/TrCnt = that kernel name's real totals in the same forward. SGLANG_old_30575=711.1ms | ATOM=641.1ms"
+  --title "GLM-5.2 prefill — call order, ONE forward per side (SGLANG step[EXTEND bs=3 toks=16368] | ATOM prefill[bs=3 tok=16384]); NOT aligned. Avg_us = one launch; Cnt = layers of that forward really running the call site (LayerType = which layer types); Σ_ms = Avg_us x Cnt; TrΣ_ms/TrCnt = that kernel name's totals in the same forward. SGLANG_old_30575=711.1ms | ATOM=641.1ms"
 
 python3 ATOM_Trace_helper/callorder_sidebyside.py \
   --out "$DEC/sidebyside/callorder_decode_SGLang_vs_ATOM.xlsx" \
   --src SGLANG_old "$DEC/sidebyside/step3_layer_breakdown_SGLANG_old.xlsx" \
   --src ATOM       "$DEC/sidebyside/step3_layer_breakdown_ATOM.xlsx" \
   --summary-csv    "$DEC/cmp_glm52_decode_OLDvsATOM.csv" \
-  --title "GLM-5.2 decode — call order, ONE forward per side (SGLANG step[DECODE bs=64] | ATOM decode[bs=64 tok=64 d=64]); NOT aligned. Avg_us = one launch; Σ_ms/Cnt = per call site within that single forward; TrΣ_ms/TrCnt = that kernel name's real totals in the same forward. SGLANG_old_30575=27.8ms | ATOM=25.0ms"
+  --title "GLM-5.2 decode — call order, ONE forward per side (SGLANG step[DECODE bs=64] | ATOM decode[bs=64 tok=64 d=64]); NOT aligned. Avg_us = one launch; Cnt = layers of that forward really running the call site (LayerType = which layer types); Σ_ms = Avg_us x Cnt; TrΣ_ms/TrCnt = that kernel name's totals in the same forward. SGLANG_old_30575=27.8ms | ATOM=25.0ms"
 
 echo "done."

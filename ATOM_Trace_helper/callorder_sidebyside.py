@@ -44,10 +44,11 @@ def read_step3(path):
     return out
 
 
-# Avg_us is the cost of ONE launch; Σ_ms/Cnt are per call site (avg x layers of
-# that type); TrΣ_ms/TrCnt are the kernel NAME's real totals in the same forward,
-# repeated on every row sharing the name — they expose call sites the structural
-# model missed.
+# Avg_us is the cost of ONE launch; Cnt is how many layers of the forward really
+# reach that call site (SGLang side: measured over all layers, so LayerType tells
+# which layer types those are) and Σ_ms = Avg_us x Cnt; TrΣ_ms/TrCnt are the kernel
+# NAME's totals in the same forward, repeated on every row sharing the name — a gap
+# vs Σ_ms now means the kernel also runs outside the decoder layers.
 COLS = ["LayerType", "Section", "LeafModule (caller)", "KernelName", "Avg_us",
         "Σ_ms", "Cnt", "TrΣ_ms", "TrCnt", "CallSite"]
 
