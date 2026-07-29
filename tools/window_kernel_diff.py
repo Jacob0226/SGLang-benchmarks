@@ -7,9 +7,13 @@ TP ranks of the same run, or SGLang vs ATOM). Used to locate rank skew: if the
 all-reduce kernel is much cheaper on one rank, that rank must be spending the
 time somewhere else (it arrives last), and this tool says where.
 
+--show-args additionally groups the matching kernels by launch config
+(grid/block/registers/shared memory), which is how you tell "the two stacks call
+the same kernel differently" apart from "the same launch is just slower".
+
 Usage:
   python window_kernel_diff.py --a T0.json.gz --b T1.json.gz --stack sglang \
-      --match "bs=3" [--top 25]
+      --match "bs=3" [--top 25] [--stats quickreduce] [--show-args quickreduce]
 """
 from __future__ import annotations
 
@@ -28,24 +32,13 @@ def load(path):
     return t if isinstance(t, list) else t.get("traceEvents", [])
 
 
-def window_calls(path, stack, match, phase, pick=0):
-    """Same window selection as window(), but keep every individual call."""
-    _lab, _tot, agg, calls = _window(path, stack, match, phase, pick)
-    return _lab, _tot, calls
-
-
-def window(path, stack, match, phase, pick=0):
-    _lab, _tot, agg, _calls = _window(path, stack, match, phase, pick)
-    return _lab, _tot, agg
-
-
 def _window(path, stack, match, phase, pick=0):
     evs = load(path)
     kern = [e for e in evs if isinstance(e, dict) and e.get("ph") == "X"
             and str(e.get("cat", "")).lower() == "kernel"]
     dom = Counter((k["pid"], k["tid"]) for k in kern).most_common(1)[0][0]
     kern = [{"name": k.get("name", "?"), "ts": float(k["ts"]),
-             "dur": float(k.get("dur", 0.0))}
+             "dur": float(k.get("dur", 0.0)), "args": k.get("args") or {}}
             for k in kern if (k["pid"], k["tid"]) == dom]
     kern.sort(key=lambda k: k["ts"])
     pref = ("step[",) if stack == "sglang" else ("prefill[", "decode[")
@@ -69,11 +62,16 @@ def _window(path, stack, match, phase, pick=0):
     win = kern[lo:hi]
     agg = defaultdict(lambda: [0.0, 0])
     calls = defaultdict(list)
+    cfg = defaultdict(list)
     for k in win:
         e = agg[k["name"]]
         e[0] += k["dur"]; e[1] += 1
         calls[k["name"]].append(k["dur"])
-    return ann[i]["name"], sum(k["dur"] for k in win), dict(agg), dict(calls)
+        a = k["args"]
+        cfg[(k["name"], tuple(a.get("grid", [])), tuple(a.get("block", [])),
+             a.get("registers per thread"), a.get("shared memory"))].append(k["dur"])
+    return (ann[i]["name"], sum(k["dur"] for k in win), dict(agg), dict(calls),
+            dict(cfg))
 
 
 def main():
@@ -93,12 +91,17 @@ def main():
                     help="per-call stats (n/mean/median/min/max) for kernels whose "
                          "name contains SUBSTR; distinguishes 'more work' from "
                          "'same work, slower clocks'")
+    ap.add_argument("--show-args", metavar="SUBSTR", action="append", default=None,
+                    dest="show_args",
+                    help="launch config (grid/block/regs/shmem) of kernels whose "
+                         "name contains SUBSTR, grouped per config")
     args = ap.parse_args()
 
-    la, ta, ka, ca = _window(args.a, args.stack, args.match, args.phase, args.pick)
-    lb, tb, kb, cb = _window(args.b, args.stack_b or args.stack,
-                             args.match_b or args.match, args.phase,
-                             args.pick if args.pick_b is None else args.pick_b)
+    la, ta, ka, ca, ga = _window(args.a, args.stack, args.match, args.phase,
+                                 args.pick)
+    lb, tb, kb, cb, gb = _window(args.b, args.stack_b or args.stack,
+                                 args.match_b or args.match, args.phase,
+                                 args.pick if args.pick_b is None else args.pick_b)
     LA, LB = args.labels
     print(f"{LA}: {la}  Sigma={ta/1e3:.2f}ms  ({len(ka)} distinct kernels)")
     print(f"{LB}: {lb}  Sigma={tb/1e3:.2f}ms  ({len(kb)} distinct kernels)")
@@ -125,6 +128,21 @@ def main():
                     continue
                 print(f"{lab:<10} {len(v):>5} {st.mean(v):>9.1f} {st.median(v):>9.1f} "
                       f"{min(v):>9.1f} {max(v):>9.1f}")
+
+    for sub in (args.show_args or []):
+        print(f"\nlaunch configs for kernels matching {sub!r}")
+        for lab, g in ((LA, ga), (LB, gb)):
+            keys = [k for k in g if sub in k[0]]
+            if not keys:
+                print(f"  {lab}: (none)")
+                continue
+            for key in sorted(keys, key=lambda k: -sum(g[k])):
+                nm, grid, block, regs, shm = key
+                ds = g[key]
+                print(f"  {lab}: n={len(ds):<4} sum_ms={sum(ds)/1e3:>8.2f} "
+                      f"median_us={st.median(ds):>8.1f}  grid={grid} block={block} "
+                      f"regs={regs} shmem={shm}")
+                print(f"        {nm[:88]}")
 
 
 if __name__ == "__main__":
