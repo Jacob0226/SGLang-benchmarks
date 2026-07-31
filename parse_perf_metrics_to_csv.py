@@ -32,15 +32,18 @@ GAP_COLS = 5
 
 INTERACTIVITY_HDR = "Interactivity \n(tok/s/user) "
 TPUT_PER_GPU_HDR = "Token TPUT per GPU"
+MEDIAN_TTFT_HDR = "Median\nTTFT"
+MEDIAN_TPOT_HDR = "Median\nTPOT"
+MEDIAN_ITL_HDR = "Median\nITL"
 SUMMARY_COLUMNS = [
     "input_len",
     "output_len",
     "concurrency",
     INTERACTIVITY_HDR,
     TPUT_PER_GPU_HDR,
-    "TTFT",
-    "TPOT",
-    "ITL",
+    MEDIAN_TTFT_HDR,
+    MEDIAN_TPOT_HDR,
+    MEDIAN_ITL_HDR,
 ]
 
 # 第二份 table 的欄位順序，刻意與
@@ -327,9 +330,9 @@ def build_summary_row(record: dict, tp: int):
         "concurrency": record.get("concurrency", ""),
         INTERACTIVITY_HDR: interactivity,
         TPUT_PER_GPU_HDR: tput_per_gpu,
-        "TTFT": int(round(median_ttft_ms)) if median_ttft_ms is not None else "",
-        "TPOT": round(median_tpot_ms, 1) if median_tpot_ms is not None else "",
-        "ITL": round(median_itl_ms, 1) if median_itl_ms is not None else "",
+        MEDIAN_TTFT_HDR: int(round(median_ttft_ms)) if median_ttft_ms is not None else "",
+        MEDIAN_TPOT_HDR: round(median_tpot_ms, 1) if median_tpot_ms is not None else "",
+        MEDIAN_ITL_HDR: round(median_itl_ms, 1) if median_itl_ms is not None else "",
     }
 
 
