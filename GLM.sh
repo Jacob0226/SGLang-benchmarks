@@ -9,6 +9,7 @@
 # ./GLM.sh --tp 4 --tag 0507_TP4    # tensor parallel size (auto: TP=4 for FP4 models, TP=8 for FP8)
 # ./GLM.sh --docker rocm/sgl-dev:v0.5.10rc0-rocm720-mi35x-20260412   # tag results dir with docker image
 # ./GLM.sh --port 8600              # change server port (default 8552; also: PORT=8600 ./GLM.sh)
+# ALLOW_LOCKED_CLOCKS=1 ./GLM.sh    # skip the GPU application-clock check (see check_gpu_clocks)
 #
 # GLM-5 / GLM-5.1 FP4 examples (auto-detects quant scheme from model name;
 # mirrors InferenceX recipes — see SemiAnalysisAI/InferenceX benchmarks/
@@ -828,6 +829,42 @@ if ! is_rocm_gpu_env; then
 fi
 
 
+
+# ===================== GPU clock sanity check (NVIDIA only) =====================
+# A locked application clock silently invalidates every number this script
+# produces, and nothing else in the logs reveals it. Measured on dgx-029
+# 2026-07-31: all 8 B200 pinned to 1005 MHz vs a 1965 MHz driver default cost
+# 30-60% (GLM-5.2-NVFP4 TP4 i8k/conc64 1586 -> 1082 output tok/s) while drawing
+# only ~575W of a 1000W budget at 45-52C -- so SW Power Cap / HW Slowdown /
+# Thermal all read "Not Active" and the run looks like a software regression.
+# Memory clock stays at default, which is why decode (bandwidth-bound) loses
+# ~30% but prefill (compute-bound) loses ~60%.
+# Abort rather than emit bad data. Reset the clocks with `nvidia-smi -rac`
+# (needs root / privileged container); note that reset does NOT persist across
+# driver reload or reboot. Bypass this check with ALLOW_LOCKED_CLOCKS=1.
+check_gpu_clocks() {
+    is_rocm_gpu_env && return 0
+    command -v nvidia-smi >/dev/null 2>&1 || return 0
+
+    local gpu_list locked
+    gpu_list=$(seq -s, 0 $((TP_SIZE - 1)))
+    # Compare per-GPU application clock against the driver default. Skip rows
+    # where either value is non-numeric ("[N/A]" on GPUs that don't expose it).
+    locked=$(nvidia-smi --query-gpu=index,clocks.applications.graphics,clocks.default_applications.graphics \
+        --format=csv,noheader,nounits -i "$gpu_list" 2>/dev/null \
+        | awk -F', ' '$2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $2 < $3 {print $1" "$2" "$3}') || true
+    [ -z "$locked" ] && return 0
+
+    echo "!!! ERROR: GPU application clocks are locked below the driver default:"
+    echo "$locked" | awk '{printf "      GPU %s: %s MHz  (default %s MHz)\n", $1, $2, $3}'
+    echo "    Throughput would come out 30-60% low with no throttle flag set."
+    echo "    Fix: nvidia-smi -rac    (root / privileged container)"
+    echo "    Override: ALLOW_LOCKED_CLOCKS=1 ./GLM.sh ..."
+    return 1
+}
+if [ "${ALLOW_LOCKED_CLOCKS:-0}" != "1" ]; then
+    check_gpu_clocks || exit 1
+fi
 
 prof_mode_complete() {
     # True (0) if every expected profile output for the CURRENT mode (LOG_DIR +
