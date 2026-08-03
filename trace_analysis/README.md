@@ -8,7 +8,7 @@ analyze/sglang_trace.py       SGLang-side analyzer (the core; everything else co
 analyze/atom_trace.py         ATOM-side analyzer, mapped onto the same step3 schema
 compare/                      cross-run / cross-stack comparison workbooks
 diagnostics/                  verify a workbook, or dig into one window / one kernel / one stream
-run_glm52_vs_atom.sh          driver: SGLang vs ATOM on one GPU (Flow B)
+run_glm52_sglang_vs_atom.sh   driver: SGLang vs ATOM on one GPU (Flow B)
 run_glm52_sglang_vs_sglang.sh driver: same stack on two GPUs (Flow A)
 ```
 
@@ -105,13 +105,13 @@ names, which defeats `--align lcs`'s row alignment.
 | 2 | `analyze/atom_trace.py` | ATOM step1 + step3, mapped to SGLang's classification |
 | 3 | `compare/glm52_buckets.py` | **how much**: sorts both sides' kernels into ~9 GLM-5.2 functional buckets (sparse-MLA attn, DSA indexer+topk, dense GEMM, MoE up/gate, MoE down, MoE routing, all-reduce, rmsnorm/quant, rope/kv-cache, other) → CSV |
 | 4 | `compare/side_by_side.py --align none` | **which kernel, called from where**: lists each side's call sites in its own execution order with `Section > LeafModule`, `CallSite`, `LayerType`, `LaunchCnt`. No cross-side alignment — you match them by eye. `--summary-csv` embeds step 3's buckets at the bottom so detail and totals share one scale |
-| driver | `run_glm52_vs_atom.sh` | rebuilds all of it, one run per SGLang variant: prefill + decode, buckets, call-order workbooks |
+| driver | `run_glm52_sglang_vs_atom.sh` | rebuilds all of it, one run per SGLang variant: prefill + decode, buckets, call-order workbooks |
 
 ```bash
 cd ~/SGLang-benchmarks
-bash trace_analysis/run_glm52_vs_atom.sh                  # every variant
-bash trace_analysis/run_glm52_vs_atom.sh Docker0729_8PR   # just one
-FORCE_ATOM=1 bash trace_analysis/run_glm52_vs_atom.sh     # re-derive the ATOM reference
+bash trace_analysis/run_glm52_sglang_vs_atom.sh                  # every variant
+bash trace_analysis/run_glm52_sglang_vs_atom.sh Docker0729_8PR   # just one
+FORCE_ATOM=1 bash trace_analysis/run_glm52_sglang_vs_atom.sh     # re-derive the ATOM reference
 ```
 
 The ATOM side is derived once into `analysis_GLM5.2/.atom_reference_i8k_conc64/`

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # GLM-5.2 SGLang-vs-ATOM side-by-side workbooks, i8k conc64, one run per variant.
 #
-#   ./run_glm52_vs_atom.sh                     # every variant
-#   ./run_glm52_vs_atom.sh Docker0729_8PR      # just one
-#   FORCE_ATOM=1 ./run_glm52_vs_atom.sh        # re-derive the ATOM reference
+#   ./run_glm52_sglang_vs_atom.sh                     # every variant
+#   ./run_glm52_sglang_vs_atom.sh Docker0729_8PR      # just one
+#   FORCE_ATOM=1 ./run_glm52_sglang_vs_atom.sh        # re-derive the ATOM reference
 #
 # The ATOM side is derived ONCE into a cache and copied into every variant, so
 # the reference column is byte-identical across all of them. Deriving it per
