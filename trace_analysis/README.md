@@ -4,10 +4,12 @@ Kernel-level PyTorch-profiler trace analysis for SGLang, and the two comparison
 flows built on it. All scripts are run from the `SGLang-benchmarks/` root.
 
 ```
-analyze_sglang_trace.py   SGLang-side analyzer (the core; everything else consumes its step3 xlsx)
-analyze_atom_trace.py     ATOM-side analyzer, mapped onto the same step3 schema
-compare/                  cross-run / cross-stack comparison workbooks
-diagnostics/              verify a workbook, or dig into one window / one kernel / one stream
+analyze/sglang_trace.py       SGLang-side analyzer (the core; everything else consumes its step3 xlsx)
+analyze/atom_trace.py         ATOM-side analyzer, mapped onto the same step3 schema
+compare/                      cross-run / cross-stack comparison workbooks
+diagnostics/                  verify a workbook, or dig into one window / one kernel / one stream
+run_glm52_vs_atom.sh          driver: SGLang vs ATOM on one GPU (Flow B)
+run_glm52_sglang_vs_sglang.sh driver: same stack on two GPUs (Flow A)
 ```
 
 Only the two analyzers read raw traces. Every comparison below reads their
@@ -16,7 +18,7 @@ describe exactly the forward the analyzer isolated.
 
 ## The step3 workbook is the interface
 
-`analyze_sglang_trace.py` needs two traces of the same run: the **graph-ON** one for
+`analyze/sglang_trace.py` needs two traces of the same run: the **graph-ON** one for
 timing (CUDA graph is how the model really runs) and the **graph-OFF** one for
 structure (only that one carries the `nn.Module` python_function tree). It emits
 
@@ -38,7 +40,7 @@ Every consumer below reads step3, so its columns are worth knowing:
 - `KernelCount_fwd` / `KernelSum_ms_fwd` (`KernelCnt` / `KernelΣ_ms`) — the kernel
   **name**'s totals in the same forward regardless of call site, repeated on every row
   sharing the name, so never sum them. They are independent ground truth from the
-  graph-ON trace: `Σ` of the rows should match, and `analyze_sglang_trace.py` prints a
+  graph-ON trace: `Σ` of the rows should match, and `analyze/sglang_trace.py` prints a
   coverage report listing any kernel where it does not. GLM-5.2 lands at ~99.8% of a
   prefill forward; the gap is kernels outside the decoder layers (lm_head, sampling).
 
@@ -55,7 +57,7 @@ as 713 µs/call instead of the real 861 µs/call for the `bs=3` prefill forward.
 
 | step | script |
 |------|--------|
-| 1 | `analyze_sglang_trace.py` on each run's trace pair |
+| 1 | `analyze/sglang_trace.py` on each run's trace pair |
 | 2 | `compare/side_by_side.py --align lcs` — LCS-aligns the two step3 workbooks row by row |
 
 ```bash
@@ -68,8 +70,28 @@ python3 trace_analysis/compare/side_by_side.py --align lcs \
 `--align lcs` does not care what the two workbooks are, as long as the module names
 match: two GPUs, or the same GPU before and after a PR. Add `--trace LABEL trace.gz`
 to also report that side's union-busy time and overlap factor. An ATOM step3 workbook
-is readable too (`analyze_atom_trace.py` writes the same schema on purpose), but the
+is readable too (`analyze/atom_trace.py` writes the same schema on purpose), but the
 module names differ, so the rows misalign — that is what Flow B exists for.
+
+`run_glm52_sglang_vs_sglang.sh` is the worked example: MI355X 8PR vs B200
+stock at conc4 and conc64, prefill and decode, into
+`analysis_GLM5.2/Docker0729_8PR_SGLang_i8k_conc{4,64}/`. Two things it does that
+a bucket table alone cannot, and that any cross-GPU comparison wants:
+
+- `diagnostics/forward_overlap.py` per forward, because Σ kernel does not say
+  whether a forward is slow from slow kernels or from serialised ones. GLM-5.2
+  conc64 decode is the case in point — the two GPUs' Σ kernel are within 2%
+  while wall time differs by 25%, all of it B200's 45-stream overlap.
+- `diagnostics/comm_skew_split.py`, since all-reduce is prefill's largest gap
+  and a collective's duration includes waiting for the slowest rank.
+
+It also emits the buckets at **both** scopes. step3 matches graph-ON kernels to
+the graph-OFF module tree by name, which fails when the two runs used different
+batch sizes and the library picks shape-specialised kernels (B200's conc64
+no-graph decode ran at bs=40, so its bs=64 nvjet GEMMs found no call site and
+step3 reported 1.11 ms against MI355X's 5.73 ms; step1 needs no attribution and
+says 6.05 vs 5.83 ms). Where the scopes agree, either is fine; where they do
+not, step1 is ground truth.
 
 ## Flow B — same GPU, two stacks (ROCm SGLang vs ROCm ATOM)
 
@@ -79,16 +101,30 @@ names, which defeats `--align lcs`'s row alignment.
 
 | step | script | purpose |
 |------|--------|---------|
-| 1 | `analyze_sglang_trace.py` | SGLang step1 + step3 |
-| 2 | `analyze_atom_trace.py` | ATOM step1 + step3, mapped to SGLang's classification |
+| 1 | `analyze/sglang_trace.py` | SGLang step1 + step3 |
+| 2 | `analyze/atom_trace.py` | ATOM step1 + step3, mapped to SGLang's classification |
 | 3 | `compare/glm52_buckets.py` | **how much**: sorts both sides' kernels into ~9 GLM-5.2 functional buckets (sparse-MLA attn, DSA indexer+topk, dense GEMM, MoE up/gate, MoE down, MoE routing, all-reduce, rmsnorm/quant, rope/kv-cache, other) → CSV |
 | 4 | `compare/side_by_side.py --align none` | **which kernel, called from where**: lists each side's call sites in its own execution order with `Section > LeafModule`, `CallSite`, `LayerType`, `LaunchCnt`. No cross-side alignment — you match them by eye. `--summary-csv` embeds step 3's buckets at the bottom so detail and totals share one scale |
-| driver | `regen_glm52_sidebyside.sh` | rebuilds all of it: prefill + decode, SGLANG old/new + ATOM, buckets, both call-order workbooks |
+| driver | `run_glm52_vs_atom.sh` | rebuilds all of it, one run per SGLang variant: prefill + decode, buckets, call-order workbooks |
 
 ```bash
 cd ~/SGLang-benchmarks
-bash trace_analysis/regen_glm52_sidebyside.sh
+bash trace_analysis/run_glm52_vs_atom.sh                  # every variant
+bash trace_analysis/run_glm52_vs_atom.sh Docker0729_8PR   # just one
+FORCE_ATOM=1 bash trace_analysis/run_glm52_vs_atom.sh     # re-derive the ATOM reference
 ```
+
+The ATOM side is derived once into `analysis_GLM5.2/.atom_reference_i8k_conc64/`
+and copied into every variant, so the reference column is identical across all of
+them. Its forward is selected by shape and then by median rather than pinned to a
+label: an ATOM prefill is labelled with its context lengths (`prefill[bs=3
+tok=16384 ctx=[8063, 7153, 1168]]`), which no other profile reproduces, so a
+pinned label silently stops matching. Matching `bs=3 tok=16384` leaves 44
+candidates whose middle 50% sit in 640.4–643.4 ms and `--pick median` takes
+642.1 ms. `--forward-pick mean` would report 629.8 ms here, dragged down by a
+single 128.5 ms fragment at a trace boundary — averaging only helps when the
+matched forwards really are the same shape, which is why the SGLang analyzer
+prints their Σ spread and warns when it is wide.
 
 Bucket scope is whichever workbook you hand `glm52_buckets.py`, and it prints which
 one it got: a **step3** file means decoder layers only, a **step1** file means the
@@ -120,3 +156,4 @@ some ATOM runs), and the subtotals of that column are then an undercount.
 | `trace_kernel_summary.py` | quick per-kernel totals of one trace, no structure needed |
 | `extract_stream.py` | inspect kernels of a specific CUDA stream, or compare two streams |
 | `analyze_trace_overlap.py` | measure stream concurrency / bubble time, e.g. dual-stream MoE |
+| `forward_overlap.py` | one forward is slower than the other but its kernels are not: splits wall into Σ kernel, union-busy, overlap factor and idle. Unlike `per_forward_wall.py` it takes kernels by timestamp rather than correlation id, so it works on graph-ON traces |

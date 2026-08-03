@@ -23,7 +23,14 @@ import re
 import statistics as st
 from collections import Counter
 
-COMM_RE = re.compile(r"allreduce_prototype|quickreduce|reduce_scatter_cross_device", re.I)
+# ROCm names first, then the NVIDIA ones: plain NCCL, and the trtllm MNNVL
+# all-reduce SGLang uses on B200 -- including rmsNormLamport, which is the
+# allreduce+rmsnorm fusion and so is part of the collective, not a norm.
+COMM_RE = re.compile(
+    r"allreduce_prototype|quickreduce|reduce_scatter_cross_device"
+    r"|nccldevkernel|mnnvl_allreduce|shotallreduce|rmsnormlamport",
+    re.I,
+)
 
 
 def load(path):

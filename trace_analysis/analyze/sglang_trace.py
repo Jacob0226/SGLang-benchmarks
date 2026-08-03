@@ -93,8 +93,16 @@ def find_forward_windows(trace: dict | list, cat: str, match: str,
     `cat` is "gpu_user_annotation" (GPU-side, bounds kernels) or "user_annotation"
     (CPU-side, bounds nn.Module / python_function events).  Only wrappers whose
     name starts with a forward prefix (step[ / prefill[ / decode[) and contains
-    `match` are returned.  Annotations without a duration are closed by the next
+    `match` are returned.      Annotations without a duration are closed by the next
     wrapper on the same track.
+
+    The profiler projects one GPU-side annotation onto EVERY stream that has work
+    in the window, so a multi-stream model reports the same forward many times --
+    GLM-5.2 decode on B200 runs on 45 streams and yields 44 projections of each
+    forward, spanning 0.03 ms to 20.8 ms while the forward itself is 20.8 ms.
+    Treated as separate forwards they make --forward-pick median select a 0.17 ms
+    sliver of one stream. Projections of one forward necessarily overlap in time,
+    and two real forwards never do, so overlapping same-name windows are merged.
     """
     events = trace if isinstance(trace, list) else trace.get("traceEvents", [])
     wraps = []
@@ -115,7 +123,10 @@ def find_forward_windows(trace: dict | list, cat: str, match: str,
         end = ts + dur if dur > 0 else (wraps[i + 1][0] if i + 1 < len(wraps)
                                         else float("inf"))
         if match in name:
-            out.append((ts, end, name))
+            if out and name == out[-1][2] and ts < out[-1][1]:
+                out[-1] = (out[-1][0], max(out[-1][1], end), name)
+            else:
+                out.append((ts, end, name))
     return out
 
 
@@ -138,6 +149,41 @@ def select_forward_window(windows: list[tuple[float, float, str]],
     if pick == "max":
         return scored[-1][1]
     return scored[len(scored) // 2][1]
+
+
+def mean_over_forwards(windows: list[tuple], kernels: list[dict],
+                       spread_warn: float = 1.25) -> tuple[list[dict], int]:
+    """Keep the kernels of EVERY matching forward and report how many there were.
+
+    Averaging beats pinning one forward when the exact label is not stable across
+    profiles -- an ATOM prefill is labelled with its context lengths, e.g.
+    ctx=[7769, 7586, 2197], which no other run reproduces, so a pinned label
+    silently stops matching and the analysis drifts to whatever forward is left.
+
+    The average is only meaningful over forwards of the same shape. A match loose
+    enough to mix a 7.6k-token and a 16.4k-token prefill chunk blends both into
+    one number, which is what --forward-match exists to prevent, so warn when the
+    per-forward Σ kernel duration spreads wider than spread_warn.
+    """
+    per_win = [sum(k["dur"] for k in kernels if w[0] <= k["ts"] < w[1])
+               for w in windows]
+    keep = [i for i, d in enumerate(per_win) if d > 0]
+    if not keep:
+        sys.exit("[ERROR] every matching forward window is empty of kernels")
+    durs = sorted(per_win[i] for i in keep)
+    lo, hi = durs[0], durs[-1]
+    print(f"[INFO] Step 1 averaged over {len(keep)} forwards matching the filter; "
+          f"per-forward Σ min/median/max = "
+          f"{fmt_dur(lo)}/{fmt_dur(durs[len(durs) // 2])}/{fmt_dur(hi)}",
+          file=sys.stderr)
+    if lo > 0 and hi / lo > spread_warn:
+        print(f"[WARN] those forwards differ by {hi / lo:.2f}x, so they are "
+              f"probably not the same shape -- tighten --forward-match (add the "
+              f"token count) or the mean mixes different work per forward",
+              file=sys.stderr)
+    wins = [windows[i] for i in keep]
+    return ([k for k in kernels if any(w[0] <= k["ts"] < w[1] for w in wins)],
+            len(keep))
 
 
 def auto_detect_stream(trace: dict | list,
@@ -179,8 +225,14 @@ def fmt_dur(us: float) -> str:
 # Step 1: Kernel statistics from cuda-graph-ON trace
 # ===================================================================
 
-def compute_kernel_stats(kernels: list[dict]) -> list[dict]:
-    """Aggregate kernel statistics: count, sum, avg, percentage."""
+def compute_kernel_stats(kernels: list[dict], n_forwards: int = 1) -> list[dict]:
+    """Aggregate kernel statistics: count, sum, avg, percentage.
+
+    n_forwards > 1 means `kernels` spans that many forward passes (--forward-pick
+    mean). count and sum_dur are then divided by it so every consumer still reads
+    per-forward figures, while avg_dur -- sum over count -- is the mean per launch
+    across all of them and needs no scaling.
+    """
     stats: dict[str, dict] = {}
     total_dur = 0.0
     for k in kernels:
@@ -195,6 +247,9 @@ def compute_kernel_stats(kernels: list[dict]) -> list[dict]:
     for s in stats.values():
         s["avg_dur"] = s["sum_dur"] / s["count"] if s["count"] > 0 else 0
         s["pct"] = s["sum_dur"] / total_dur * 100 if total_dur > 0 else 0
+        if n_forwards > 1:
+            s["count"] /= n_forwards
+            s["sum_dur"] /= n_forwards
         result.append(s)
 
     result.sort(key=lambda s: s["sum_dur"], reverse=True)
@@ -207,14 +262,14 @@ def print_step1(stats: list[dict]) -> None:
 
     print(f"\n{'='*120}")
     print(f" Step 1: Kernel Statistics (cuda-graph-ON)")
-    print(f" Total: {total_count} kernel calls, {fmt_dur(total_dur)}")
+    print(f" Total: {total_count:g} kernel calls, {fmt_dur(total_dur)}")
     print(f"{'='*120}")
     print(f"  {'Kernel Name':<80s} {'Count':>6} {'Sum(us)':>10} {'Avg(us)':>10} {'Pct':>6}")
     print(f"  {'-'*80} {'-'*6} {'-'*10} {'-'*10} {'-'*6}")
 
     for s in stats:
         name = s["name"][:80]
-        print(f"  {name:<80s} {s['count']:>6} {s['sum_dur']:>10.1f} "
+        print(f"  {name:<80s} {s['count']:>6g} {s['sum_dur']:>10.1f} "
               f"{s['avg_dur']:>10.1f} {s['pct']:>5.1f}%")
 
     print(f"{'='*120}\n")
@@ -287,7 +342,10 @@ def _write_xlsx(headers: list[str], rows: list[list], path: str,
 
 def write_step1(stats: list[dict], path: str) -> None:
     headers = ["Name", "Count", "SumDuration_us", "AvgDuration_us", "Percentage"]
-    rows = [[s["name"], s["count"], round(s["sum_dur"], 1),
+    # Count is fractional under --forward-pick mean (launches per forward, so a
+    # kernel issued 155 times across 2 forwards reads 77.5); keep the fraction
+    # rather than rounding it away, it is the sign that the forwards differed.
+    rows = [[s["name"], round(s["count"], 2), round(s["sum_dur"], 1),
              round(s["avg_dur"], 3), round(s["pct"], 2)] for s in stats]
     _write_xlsx(headers, rows, path)
     print(f"[INFO] Step 1 written to: {path}", file=sys.stderr)
@@ -1421,10 +1479,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "each kernel over the WHOLE trace, which mixes forwards of "
                         "different batch/token sizes (a 7.6k-token and a 16.4k-token "
                         "prefill chunk get blended into one average).")
-    p.add_argument("--forward-pick", choices=["first", "last", "min", "median", "max"],
+    p.add_argument("--forward-pick",
+                   choices=["first", "last", "min", "median", "max", "mean"],
                    default="median",
                    help="which matching forward to use when several match "
-                        "(min/median/max are by Σ kernel duration; default: median)")
+                        "(min/median/max are by Σ kernel duration; default: median). "
+                        "mean averages over every matching forward instead of "
+                        "picking one, which is the reproducible choice when the "
+                        "exact per-forward label varies between profiles -- but "
+                        "only if --forward-match selects one shape, so pass the "
+                        "token count too (e.g. 'EXTEND bs=3 toks=16384')")
     p.add_argument("--out", metavar="DIR",
                    help="Export Excel files to directory (step1_kernel_stats.xlsx, step3_layer_breakdown.xlsx)")
     p.add_argument("--tag", metavar="TAG", default="",
@@ -1458,19 +1522,24 @@ def main() -> None:
         print(f"[INFO] Found {len(kernels_on)} kernels on {stream_desc}",
               file=sys.stderr)
 
+        n_forwards = 1
         if args.forward_match:
             wins = find_forward_windows(trace_on, "gpu_user_annotation",
                                         args.forward_match, stream_on)
             if not wins:
                 sys.exit(f"[ERROR] no forward annotation matching "
                          f"{args.forward_match!r} in {args.graph_on}")
-            w = select_forward_window(wins, kernels_on, args.forward_pick)
-            kernels_on = [k for k in kernels_on if w[0] <= k["ts"] < w[1]]
-            print(f"[INFO] Step 1 restricted to ONE forward: {w[2]} "
-                  f"({args.forward_pick}-of-{len(wins)}) → {len(kernels_on)} kernels, "
-                  f"Σ={fmt_dur(sum(k['dur'] for k in kernels_on))}", file=sys.stderr)
+            if args.forward_pick == "mean":
+                kernels_on, n_forwards = mean_over_forwards(wins, kernels_on)
+            else:
+                w = select_forward_window(wins, kernels_on, args.forward_pick)
+                kernels_on = [k for k in kernels_on if w[0] <= k["ts"] < w[1]]
+                n_forwards = 1
+                print(f"[INFO] Step 1 restricted to ONE forward: {w[2]} "
+                      f"({args.forward_pick}-of-{len(wins)}) → {len(kernels_on)} kernels, "
+                      f"Σ={fmt_dur(sum(k['dur'] for k in kernels_on))}", file=sys.stderr)
 
-        kernel_stats = compute_kernel_stats(kernels_on)
+        kernel_stats = compute_kernel_stats(kernels_on, n_forwards)
         print_step1(kernel_stats)
         del trace_on, kernels_on  # free memory; stats are all we need
 

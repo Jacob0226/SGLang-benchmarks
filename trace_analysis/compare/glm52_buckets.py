@@ -6,8 +6,8 @@ GLM-5.2 functional-bucket comparison of two (or more) already-analyzed runs, and
 the single source of truth for the bucket rules themselves (imported by
 side_by_side.py).
 
-It consumes the workbooks written by analyze_sglang_trace.py /
-analyze_atom_trace.py instead of re-parsing the raw traces, so both sides are
+It consumes the workbooks written by analyze/sglang_trace.py /
+analyze/atom_trace.py instead of re-parsing the raw traces, so both sides are
 compared over the SAME one forward those tools already isolated
 (--forward-match / --forward-pick), with no second segmentation policy here:
 
@@ -51,40 +51,76 @@ BUCKET_RULES = [
         r"paged_mqa_logits", r"mqa_logits", r"deepgemm_fp8_paged", r"hadamard",
         r"topk_transform", r"radix_topk", r"indexer", r"transform_index",
         r"convert_req_index", r"fused_qk_rmsnorm_group_quant",
+        r"dsa_decode_metadata",
+        # sgl-kernel's topk family, which B200 uses for the indexer: the module
+        # tree puts every one of them under DeepseekV2AttentionMLA > Indexer,
+        # opposite MI355X's topk_transform_decode_kernel. Named specifically so
+        # they still do not swallow MoE's grouped_topk.
+        r"topk_main_kernel", r"topk_persistent_cluster", r"topk_small_batch",
+        r"topk_plan",
     ]),
-    # sparse MLA attention core (triton sparse-mla, aiter mla, tilelang mla)
+    # sparse MLA attention core (triton sparse-mla, aiter mla, tilelang mla).
+    # B200/trtllm names it after the head dims instead: HQk576 (512 nope + 64
+    # rope) and HV512 are MLA's, and TokenSparse is the DSA path. Confirmed by
+    # the module tree -- it is the only kernel DeepseekV2AttentionMLA (self)
+    # launches at that size.
     ("sparse-MLA attn", [
         r"sparse_mla", r"_mla_", r"\bmla\b", r"mla_decode", r"mla_fwd",
         r"flash.*mla", r"aiter\d*::mla", r"mla_a8w8",
+        r"fmhasm100", r"hqk576",
     ]),
-    # MoE experts up/gate projection GEMM (moe1 / silu-mul fused)
+    # MoE experts up/gate projection GEMM (moe1 / silu-mul fused).
+    # gemm1_a4w4_port_* / mxmoe_g1 are the FlyDSL MoE stage-1 kernels the aiter in
+    # rocm/sgl-dev:v0.5.16-...-20260729 picks up from glm5_fp4_tuned_fmoe.csv; the
+    # older mfma_moe1_* path is what images without that tuned CSV run.
+    # bmm_E2m1_* is B200's: the two trtllm NVFP4 grouped GEMMs both sit under
+    # DeepseekV2MoE (self) so the module tree cannot split them, but execution
+    # order (Index 27 then 28) and output dtype do -- stage 1 emits E2m1 to feed
+    # stage 2, stage 2 emits Bfloat16 into the residual.
     ("MoE up/gate GEMM (moe1)", [
         r"moe1", r"moe_?stage1", r"gate_?up", r"silu_mul", r"silu_and_mul",
+        r"gemm1_a4w4", r"mxmoe_g1", r"bmm_e2m1_",
     ]),
     # MoE experts down projection GEMM (moe2)
     ("MoE down GEMM (moe2)", [
         r"moe2", r"moe_?stage2", r"down_proj_moe",
+        r"gemm2_a4w4", r"mxmoe_g2", r"bmm_bfloat16_e2m1",
     ]),
-    # other MoE plumbing: routing/sorting, expert top-k, output reduction, gather
+    # other MoE plumbing: routing/sorting, expert top-k, output reduction, gather.
+    # mxfp4_moe:: covers the FlyDSL path's separate scatter-reduce and 3-stage sort,
+    # whose work the mfma moe2 kernel folds into its own epilogue.
     ("MoE routing/other", [
         r"moe_sort", r"moe_align", r"moe_sorting", r"fused_moe", r"fused_mx_quant_moe",
         r"grouped_?gemm", r"group_?gemm", r"grouped_topk", r"moe_reduction",
-        r"append_shared_expert", r"\bmoe\b", r"expert",
+        r"append_shared_expert", r"mxfp4_moe", r"\bmoe\b", r"expert",
+        # B200's router projection, under DeepseekV2MoE > MoEGate -- the same
+        # place MI355X's grouped_topk_kernel sits, so routing on both sides.
+        r"router_gemm",
     ]),
-    # dense / linear GEMM: attention q/kv/o projections + dense MLP (non-MoE)
+    # dense / linear GEMM: attention q/kv/o projections + dense MLP (non-MoE).
+    # nvjet_sm100_* is cuBLAS on Blackwell; the module tree puts every one of
+    # them under a Linear (attention projections, prepare_mlp, the MoE shared
+    # expert), same call sites as MI355X's Cijk/bf16gemm. bf16gemm has no word
+    # boundary before "gemm", so \bgemm\b missed it and 83 ms of MI355X
+    # ColumnParallelLinear was landing in "other".
     ("dense/linear GEMM", [
         r"cijk", r"hgemm", r"\bgemm\b", r"cshuffle", r"gemm_xdl", r"tensile",
         r"matmul", r"wgrad", r"a8w8", r"f8_.*gemm", r"gemm_a8", r"gemm_afp4",
+        r"bf16gemm", r"nvjet", r"cublas", r"splitkreduce", r"fused_a_gemm",
+    ]),
+    # rope + kv-cache writes. Ahead of rmsnorm/quant because B200 fuses the two:
+    # flashinfer's RopeQuantizeKernel would otherwise be caught by "quant" and
+    # counted against MI355X, whose rope (aiter kn_entry_2c_sbhd_cached, under
+    # Indexer > RotaryEmbedding) is a separate kernel. No ROCm kernel matches
+    # both sets, so the reorder leaves that side's classification unchanged.
+    ("rope/kv-cache", [
+        r"rope", r"kv_?cache", r"cache_flat", r"set_kv", r"store_kv",
+        r"reshape_and_cache", r"append_kv", r"sbhd_cached",
     ]),
     # rmsnorm / quant / activation (non-indexer)
     ("rmsnorm/quant/act", [
         r"rmsnorm", r"\bnorm\b", r"layernorm", r"quant", r"dequant", r"silu",
         r"gelu", r"activation", r"scaled_",
-    ]),
-    # rope + kv-cache writes
-    ("rope/kv-cache", [
-        r"rope", r"kv_?cache", r"cache_flat", r"set_kv", r"store_kv",
-        r"reshape_and_cache", r"append_kv",
     ]),
     # embedding
     ("embedding", [r"embed"]),

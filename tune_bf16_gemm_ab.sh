@@ -75,7 +75,7 @@ profile() {
       "${GLM}" --prof --model "${MODEL}" --tp "${TP}" --tag gemmTUNED \
       || echo "[warn] tuned prof exited non-zero (profiler teardown is ok)."
 
-  echo ">>> [profile] done. Compare the two prof dirs with trace_analysis/analyze_sglang_trace.py /"
+  echo ">>> [profile] done. Compare the two prof dirs with trace_analysis/analyze/sglang_trace.py /"
   echo "    trace_analysis/compare/side_by_side.py (look at the hgemm_bf16 / Cijk kernel us before vs after,"
   echo "    and confirm the 'not found tuned config ... torch solution:0' log is gone)."
 }

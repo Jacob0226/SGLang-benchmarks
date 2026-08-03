@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 """
-analyze_atom_trace.py
+analyze/atom_trace.py
 
 Decode-step kernel breakdown for ATOM (rocm/atom-dev) torch-profiler traces.
 
 ATOM traces differ from SGLang traces: they have NO `nn.Module:` / `python_function`
-events, so analyze_sglang_trace.py's layer detection does not apply. Instead ATOM's
+events, so analyze/sglang_trace.py's layer detection does not apply. Instead ATOM's
 `--mark-trace` emits `gpu_user_annotation` events on the SAME GPU stream as the
 kernels:
   - `decode[bs=.. tok=.. d=..]`      → one whole decode step (forward pass)
@@ -16,12 +16,13 @@ kernels:
 
 This tool isolates ONE decode step and assigns every GPU kernel to its innermost
 enclosing annotation, then aggregates by (Section, LeafModule, KernelName). Output
-matches analyze_sglang_trace.py's step3 schema so side_by_side.py can consume it.
+matches analyze/sglang_trace.py's step3 schema so side_by_side.py can consume it.
 
-Usage:
-  python analyze_atom_trace.py --trace ATOM.trace.json.gz            # print
-  python analyze_atom_trace.py --trace ATOM.trace.json.gz --out DIR --tag _ATOM
-  python analyze_atom_trace.py --trace ATOM.trace.json.gz --step 5   # pick step index
+Usage (from the repo root):
+  python3 trace_analysis/analyze/atom_trace.py --time-trace ATOM.trace.json.gz
+  python3 trace_analysis/analyze/atom_trace.py --time-trace ATOM.trace.json.gz \
+      --struct-trace ATOM-NoGraph.trace.json.gz --out DIR --tag _ATOM
+  python3 trace_analysis/analyze/atom_trace.py --time-trace ATOM.trace.json.gz --step 5
 """
 import argparse
 import bisect
@@ -360,7 +361,7 @@ def print_report(rows, total, step_dur, unlabeled, busy):
 
 
 def write_step3_xlsx(rows, path):
-    """Write analyze_sglang_trace.py step3-compatible schema so side_by_side.py works."""
+    """Write analyze/sglang_trace.py step3-compatible schema so side_by_side.py works."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
@@ -371,7 +372,7 @@ def write_step3_xlsx(rows, path):
                "KernelCount_fwd", "KernelSum_ms_fwd"]
     # ATOM rows are aggregated straight from the chosen forward, so the per-name
     # totals below are just the row sums; they exist so the workbook matches the
-    # schema analyze_sglang_trace.py writes (where they are independent ground truth).
+    # schema analyze/sglang_trace.py writes (where they are independent ground truth).
     name_cnt: dict[str, int] = {}
     name_sum: dict[str, float] = {}
     for row in rows:
