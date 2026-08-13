@@ -234,6 +234,25 @@ if [ -n "${CONC_OVERRIDE:-}" ]; then read -ra concurrencies <<< "$CONC_OVERRIDE"
 # in_out_tokens=("1024:1024")
 # concurrencies=(32 64)
 PROMPT_MULTIPLIER=5
+
+# Per-shape server args. --max-running-requests is a startup-only arg, so a
+# shape listed here gets its own server launch (+~4 min model load); every
+# shape without an entry shares one server as before.
+#
+# 70000:300 caps the running batch because that is what lines MI355X up with
+# B200's operating point. Uncapped, MI355X admits ~37 of these requests at once
+# and median TPOT at conc64 is 444 ms vs B200's 98 ms; at cap 8 it is ~90 ms,
+# paid for with ~12% output throughput. B200 is not choosing this — its KV pool
+# only fits ~8 such requests — so matching the cap is what makes the two
+# comparable. Short shapes must NOT be capped: at 1024:1024/conc64 a cap of 8
+# just serialises the run.
+#
+#   I70K_MAX_RUNNING_REQUESTS=16 ./GLM.sh   # different cap
+#   I70K_MAX_RUNNING_REQUESTS=0  ./GLM.sh   # off -> single shared server (pre-08/13 behaviour)
+declare -A SHAPE_SERVER_ARGS=()
+if [ "${I70K_MAX_RUNNING_REQUESTS:-8}" != "0" ]; then
+    SHAPE_SERVER_ARGS["70000:300"]="--max-running-requests ${I70K_MAX_RUNNING_REQUESTS:-8}"
+fi
 if [ "$PROF_COMBINED" == "true" ]; then
     PROF_CMD=(--profile --profile-num-steps "${PROF_NUM_STEPS:-2}")
     COMBINED_SUFFIX="_Combined"
@@ -569,6 +588,14 @@ start_server() {
         cmd+=(--chunked-prefill-size "$CHUNKED_PREFILL_SIZE")
     fi
 
+    # Args for the shape group this server is being launched for (see
+    # SHAPE_SERVER_ARGS). Placed before SERVER_EXTRA_ARGS so an explicit
+    # SERVER_EXTRA_ARGS from the caller still wins in argparse.
+    if [ -n "${SHAPE_EXTRA_SERVER_ARGS:-}" ]; then
+        read -ra _shape_srv <<< "$SHAPE_EXTRA_SERVER_ARGS"
+        cmd+=("${_shape_srv[@]}")
+    fi
+
     # Generic passthrough for extra server args (appended last -> wins in argparse).
     # Space-separated. e.g. test prefill piecewise cuda graph:
     #   SERVER_EXTRA_ARGS="--cuda-graph-backend-prefill tc_piecewise --piecewise-cuda-graph-compiler eager" ./GLM.sh ...
@@ -582,13 +609,17 @@ start_server() {
         # SGLANG_ENABLE_SPEC_V2=1 enables sglang's new spec scheduler (also set by InferenceX).
         # On MI355X we keep --nsa-{prefill,decode}-backend tilelang from above; do NOT
         # override --attention-backend (InferenceX doesn't either, tilelang NSA + EAGLE works).
+        # Override for tree spec (topk>1), e.g.:
+        #   SPEC_TOPK=2 SPEC_NUM_STEPS=5 SPEC_DRAFT_TOKENS=6 \
+        #   SERVER_EXTRA_ARGS="--attention-backend triton" ./GLM.sh --mtp --prof
+        # topk>1 is rejected by the DSA backend, so tree runs need triton.
         echo ">>> Speculative Decoding (MTP) is ENABLED." | tee -a "$logfile"
         export SGLANG_ENABLE_SPEC_V2=1
         cmd+=(
             --speculative-algorithm EAGLE
-            --speculative-num-draft-tokens 4
-            --speculative-num-steps 3
-            --speculative-eagle-topk 1
+            --speculative-num-draft-tokens "${SPEC_DRAFT_TOKENS:-4}"
+            --speculative-num-steps "${SPEC_NUM_STEPS:-3}"
+            --speculative-eagle-topk "${SPEC_TOPK:-1}"
         )
     fi
 
@@ -866,23 +897,72 @@ if [ "${ALLOW_LOCKED_CLOCKS:-0}" != "1" ]; then
     check_gpu_clocks || exit 1
 fi
 
-prof_mode_complete() {
-    # True (0) if every expected profile output for the CURRENT mode (LOG_DIR +
-    # PROMPT_MULTIPLIER already set for this mode) already exists on disk. Lets a
-    # re-run skip a whole mode — server launch + warmup + GSM8K included — and jump
-    # straight to the mode that still needs data (e.g. cuda-graph already profiled
-    # -> go directly to no-cuda-graph). Only meaningful in --prof mode.
-    [ "$PROF_ENABLED" == "true" ] || return 1
-    local io input_tokens output_tokens c num_prompts prof_dir
+shapes_complete() {
+    # True (0) if every (shape, concurrency) in the CURRENT in_out_tokens already
+    # has output on disk, for the current mode (LOG_DIR / PROMPT_MULTIPLIER /
+    # FINISH_LOG already set). Lets a re-run skip a whole server launch — warmup
+    # and GSM8K included — and jump straight to the work that is still missing.
+    local io input_tokens output_tokens c num_prompts
     for io in "${in_out_tokens[@]}"; do
         IFS=":" read -r input_tokens output_tokens <<< "$io"
         for c in "${concurrencies[@]}"; do
             num_prompts=$((c * PROMPT_MULTIPLIER))
-            prof_dir="${LOG_DIR}/prof_in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}${COMBINED_SUFFIX}"
-            [ -d "$prof_dir" ] || return 1
+            if [ "$PROF_ENABLED" == "true" ]; then
+                [ -d "${LOG_DIR}/prof_in${input_tokens}_out${output_tokens}_conc${c}_p${num_prompts}${COMBINED_SUFFIX}" ] || return 1
+            else
+                grep -q "${LOG_DIR}/bench_in${input_tokens}_out${output_tokens}_conc${c}.log" "$FINISH_LOG" 2>/dev/null || return 1
+            fi
         done
     done
     return 0
+}
+
+prof_mode_complete() {
+    # Whole-mode version of the above; only meaningful in --prof mode (e.g.
+    # cuda-graph already profiled -> go directly to no-cuda-graph).
+    [ "$PROF_ENABLED" == "true" ] || return 1
+    shapes_complete
+}
+
+build_shape_groups() {
+    # Partition in_out_tokens into groups of shapes that can share one server,
+    # keyed by the server args they need (see SHAPE_SERVER_ARGS). Groups run in
+    # first-seen order and unlisted shapes all land in one group, so the extra
+    # model load only happens when a listed shape is actually in the sweep — but
+    # shapes can be reordered relative to in_out_tokens to keep a group together.
+    # Sets _group_args[] (args string) and _group_shapes[] (space-separated shapes).
+    _group_args=()
+    _group_shapes=()
+    local io args i found
+    for io in "${in_out_tokens[@]}"; do
+        args="${SHAPE_SERVER_ARGS[$io]:-}"
+        found=-1
+        for i in "${!_group_args[@]}"; do
+            if [ "${_group_args[$i]}" = "$args" ]; then found=$i; break; fi
+        done
+        if [ "$found" -lt 0 ]; then
+            _group_args+=("$args")
+            _group_shapes+=("$io")
+        else
+            _group_shapes[$found]="${_group_shapes[$found]} $io"
+        fi
+    done
+}
+
+stop_server() {
+    # Graceful stop (SIGTERM). Do NOT pkill -9 GPU server procs on ROCm: a hard
+    # kill can trigger 100-200GB gpucore dumps that fill the shared disk.
+    pkill -TERM -f sglang.launch_server || true
+    for _i in $(seq 1 40); do pgrep -f sglang.launch_server >/dev/null 2>&1 || break; sleep 3; done
+    pkill -TERM -f "sglang::" || true
+    sleep 8
+    # The listening socket outlives the launcher (it is held by a tokenizer
+    # worker), and start_server's preflight aborts the run if the port is still
+    # bound — so when another server is about to start, wait on the port itself.
+    for _i in $(seq 1 30); do
+        (exec 3<>"/dev/tcp/${HOST}/${PORT}") 2>/dev/null || break
+        sleep 2
+    done
 }
 
 # ------------------- Start -----------------
@@ -930,22 +1010,42 @@ for PROF_MODE in "${PROF_SERVER_MODES[@]}"; do
     # aborts THIS mode rather than the whole script. The next mode (e.g.
     # no-cuda-graph) still runs, and the cleanup below always executes.
     (
-        echo ">>> [${PROF_MODE}] Starting server and benchmarks..."
-        start_server
-        warmup
-        if [ "$PROF_MODE" == "default" ]; then
-            accuracy_test
-        fi
-        run_benchmarks
+        build_shape_groups
+        for _gi in "${!_group_args[@]}"; do
+            # run_benchmarks / shapes_complete read in_out_tokens, so scope it
+            # down to this group's shapes for the lifetime of this server.
+            read -ra in_out_tokens <<< "${_group_shapes[$_gi]}"
+            SHAPE_EXTRA_SERVER_ARGS="${_group_args[$_gi]}"
+            _tag="${PROF_MODE}"
+            if [ "${#_group_args[@]}" -gt 1 ]; then
+                _tag="${PROF_MODE} server $((_gi + 1))/${#_group_args[@]}"
+                echo ">>> [${_tag}] shapes: ${in_out_tokens[*]} | extra server args: ${SHAPE_EXTRA_SERVER_ARGS:-<none>}"
+            fi
+
+            if shapes_complete; then
+                echo ">>> [${_tag}] all results already present under '${LOG_DIR}' — skipping server launch / warmup / gsm8k."
+                continue
+            fi
+
+            # Each group runs in its own subshell so a fatal error (start_server's
+            # `exit 1`, a profiler teardown crash) only aborts THIS group; the
+            # stop_server below still runs, so the next group gets a free port.
+            (
+                echo ">>> [${_tag}] Starting server and benchmarks..."
+                start_server
+                warmup
+                # Accuracy is shape-independent, so only the first server runs it.
+                if [ "$PROF_MODE" == "default" ] && [ "$_gi" -eq 0 ]; then
+                    accuracy_test
+                fi
+                run_benchmarks
+            ) || echo "[warn] shape group '${in_out_tokens[*]}' aborted (exit $?); continuing."
+            stop_server
+        done
     ) || echo "[warn] profiling mode '${PROF_MODE}' aborted (exit $?); continuing to cleanup and next mode."
 
     echo "[${PROF_SERVER_MODES[@]}], now is the end of ${PROF_MODE}"
-    # Graceful stop (SIGTERM). Do NOT pkill -9 GPU server procs on ROCm: a hard
-    # kill can trigger 100-200GB gpucore dumps that fill the shared disk.
-    pkill -TERM -f sglang.launch_server || true
-    for _i in $(seq 1 40); do pgrep -f sglang.launch_server >/dev/null 2>&1 || break; sleep 3; done
-    pkill -TERM -f "sglang::" || true
-    sleep 8
+    stop_server
 done
 
 
