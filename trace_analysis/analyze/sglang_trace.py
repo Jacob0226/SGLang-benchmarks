@@ -85,6 +85,11 @@ def extract_gpu_kernels(trace: dict | list, stream: int | None = None) -> list[d
 
 FORWARD_PREFIXES = ("step[", "prefill[", "decode[")
 
+# Leaf-module label for kernels whose launching module could not be determined,
+# as opposed to "(self)", which means the module ran the kernel in its own
+# forward rather than inside a child module.
+UNATTRIBUTED = "(unattributed)"
+
 
 def find_forward_windows(trace: dict | list, cat: str, match: str,
                          stream: int | None = None) -> list[tuple[float, float, str]]:
@@ -376,6 +381,70 @@ def _lookup_stat(name: str,
     return None, ""
 
 
+# Tokens that say nothing about which kernel this is, so they must not earn a
+# residual match on their own.
+_GENERIC_TOKENS = frozenset("""
+void anonymous namespace kernel const unsigned char int long float double bool
+true false native std detail impl type size ptr struct class operator
+""".split())
+
+
+def _name_tokens(name: str) -> set[str]:
+    toks = re.split(r"[^0-9a-zA-Z]+", name.lower())
+    return {t for t in toks if len(t) >= 3 and not t.isdigit()} - _GENERIC_TOKENS
+
+
+def _residual_match(agg_table: list[dict], kernels_off: list[dict],
+                    kernel_stats: list[dict] | None,
+                    stat_lookup: dict, stat_lookup_norm: dict) -> dict[int, dict]:
+    """Pair call sites that name matching missed with left-over graph-ON kernels.
+
+    A call site goes unmatched when the two traces dispatch a different kernel for
+    it. sgl-kernel's topk is the case this was written for: the captured graph at
+    small batch runs topk_small_batch_kernel while the graph-OFF warmup runs
+    topk_main_kernel, so the names never meet and the call site silently loses its
+    0.169 ms out of the DSA indexer bucket.
+
+    Pair only when the launch count agrees and exactly one candidate shares more of
+    the name than every other; an ambiguous case stays unmatched rather than
+    inventing an attribution. Matches made here are tagged "residual" so they can be
+    audited in the MatchMethod column.
+    """
+    if not kernel_stats:
+        return {}
+    claimed: set[str] = set()
+    pending: list[tuple[int, dict, str]] = []
+    for pos, e in enumerate(agg_table):
+        off_name = kernels_off[e["kidx"]]["name"]
+        s, _ = _lookup_stat(off_name, stat_lookup, stat_lookup_norm)
+        if s is not None:
+            claimed.add(s["name"])
+        else:
+            pending.append((pos, e, off_name))
+    if not pending:
+        return {}
+
+    out: dict[int, dict] = {}
+    taken: set[str] = set()
+    for pos, e, off_name in pending:
+        toks = _name_tokens(off_name)
+        scored = sorted(
+            ((len(toks & _name_tokens(s["name"])), s) for s in kernel_stats
+             if s["name"] not in claimed and s["name"] not in taken
+             and abs(s["count"] - e["count"]) < 0.5),
+            key=lambda x: -x[0])
+        if not scored or scored[0][0] < 1:
+            continue
+        if len(scored) > 1 and scored[1][0] == scored[0][0]:
+            continue
+        out[pos] = scored[0][1]
+        taken.add(scored[0][1]["name"])
+        print(f"[INFO] residual match: call site {off_name[:60]!r} "
+              f"-> graph-ON {scored[0][1]['name'][:60]!r} "
+              f"({e['count']} launches)", file=sys.stderr)
+    return out
+
+
 def write_step3(agg_table: list[dict], kernels_off: list[dict],
                 kernel_stats: list[dict] | None, path: str,
                 callsite_map: dict | None = None,
@@ -397,7 +466,7 @@ def write_step3(agg_table: list[dict], kernels_off: list[dict],
       AvgDuration_us,   ← graph-ON avg_dur if matched, else graph-OFF dur
       LaunchCount,      ← launches of THIS call site in the forward (one per layer)
       SumDuration_us, Percentage,
-      MatchMethod,      ← "exact" / "norm" / "none"
+      MatchMethod,      ← "exact" / "norm" / "residual" / "none"
       GraphOFF_KernelName, GraphOFF_Duration_us,  ← graph-OFF reference
       CallSite,
       KernelCount_fwd, KernelSum_ms_fwd  ← graph-ON ground truth for the whole
@@ -425,6 +494,9 @@ def write_step3(agg_table: list[dict], kernels_off: list[dict],
                "CallSite",
                "KernelCount_fwd", "KernelSum_ms_fwd"]
 
+    residual = _residual_match(agg_table, kernels_off, kernel_stats,
+                               stat_lookup, stat_lookup_norm)
+
     rows = []
     grand_total = 0.0  # sum of per-callsite graph-ON Σ (one forward), for Percentage
     for pos, e in enumerate(agg_table):
@@ -436,6 +508,8 @@ def write_step3(agg_table: list[dict], kernels_off: list[dict],
 
         if kernel_stats:
             s, method = _lookup_stat(off_name, stat_lookup, stat_lookup_norm)
+            if s is None and pos in residual:
+                s, method = residual[pos], "residual"
         else:
             s, method = None, "none"
 
@@ -633,23 +707,32 @@ def build_ext_id_map(trace: dict | list, kernels: list[dict]) -> tuple:
     Returns (ext_to_kidx, corr_to_kidx, runtime, rt_ts) where:
       ext_to_kidx: External id → kernel index
       corr_to_kidx: correlation → kernel index (for kernels without External id)
-      runtime: sorted cuda_runtime events (with External id or correlation)
+      runtime: sorted launch events (with External id or correlation)
       rt_ts: timestamps for binary search
+
+    Launches are collected from both the runtime API (`cudaLaunchKernel`) and the
+    driver API (`cuLaunchKernelEx`). cuBLASLt, FMHA and TRT-LLM kernels go
+    through the driver, and ignoring those left ~38% of B200 kernels with no
+    call site and no module.
     """
     events = trace if isinstance(trace, list) else trace.get("traceEvents", [])
     ext_to_kidx = {}
     corr_to_kidx = {}
+    # correlation is 1:1 with a launch, External id is 1:N (one cpu_op can emit
+    # several kernels, e.g. aiter's fused_moe_ launches gemm1 and gemm2 under a
+    # single id), so every kernel is registered by correlation as well.
     for i, k in enumerate(kernels):
         eid = k.get("args", {}).get("External id")
         corr = k.get("args", {}).get("correlation")
         if eid is not None and eid not in ext_to_kidx:
             ext_to_kidx[eid] = i
-        elif eid is None and corr is not None and corr not in corr_to_kidx:
+        if corr is not None and corr not in corr_to_kidx:
             corr_to_kidx[corr] = i
 
     runtime = sorted(
         [ev for ev in events
-         if isinstance(ev, dict) and ev.get("cat") == "cuda_runtime"
+         if isinstance(ev, dict)
+         and ev.get("cat") in ("cuda_runtime", "cuda_driver")
          and ev.get("ph") == "X"
          and (ev.get("args", {}).get("External id") is not None
               or ev.get("args", {}).get("correlation") is not None)],
@@ -901,22 +984,24 @@ def get_kernels_for_module(module_ev: dict, ext_to_kidx: dict,
     kidxs = set()
     for j in range(lo, hi):
         args = runtime[j].get("args", {})
+        # correlation first: it pairs this individual launch with its kernel,
+        # while External id would map every launch of a multi-kernel cpu_op
+        # onto that op's first kernel and lose the rest.
+        corr = args.get("correlation")
+        if corr is not None and corr in corr_to_kidx:
+            kidxs.add(corr_to_kidx[corr])
+            continue
         eid = args.get("External id")
         if eid is not None and eid in ext_to_kidx:
             kidxs.add(ext_to_kidx[eid])
-        else:
-            corr = args.get("correlation")
-            if corr is not None and corr in corr_to_kidx:
-                kidxs.add(corr_to_kidx[corr])
     return sorted(kidxs)
 
 
-def find_deep_kernel_labels(module_events: list[dict], layer_ev: dict,
-                             kidxs: list[int], kernels: list[dict],
-                             ext_to_rt: dict, corr_to_rt: dict) -> dict:
-    """Find deepest nn.Module path for each kernel within a layer.
+def build_layer_descendants(module_events: list[dict],
+                            layer_ev: dict) -> list[dict]:
+    """Collect the nn.Module descendants of a layer, each with its full path.
 
-    Returns {kernel_idx: "ParentModule > LeafModule"}.
+    Returns [{cls, ts, end, dur, path}, ...] sorted by duration descending.
     """
     pts = layer_ev["ts"]
     pend = pts + layer_ev.get("dur", 0)
@@ -935,7 +1020,7 @@ def find_deep_kernel_labels(module_events: list[dict], layer_ev: dict,
             })
 
     if not descendants:
-        return {}
+        return []
 
     # Build hierarchy paths: sort by duration desc (parents first)
     descendants.sort(key=lambda m: m["dur"], reverse=True)
@@ -950,31 +1035,54 @@ def find_deep_kernel_labels(module_events: list[dict], layer_ev: dict,
                 parent_dur = p["dur"]
         m["path"] = f"{parent_path} > {m['cls']}" if parent_path else m["cls"]
 
-    # For each kernel, find deepest enclosing module via runtime event timestamp
+    return descendants
+
+
+def leaf_at(descendants: list[dict], ts: float) -> str:
+    """Deepest (shortest-duration) nn.Module whose window contains `ts`."""
+    best = None
+    best_dur = float("inf")
+    for m in descendants:
+        if m["ts"] <= ts <= m["end"] and m["dur"] < best_dur:
+            best = m
+            best_dur = m["dur"]
+    return best["path"] if best else ""
+
+
+def find_deep_kernel_labels(descendants: list[dict], kidxs: list[int],
+                             kernels: list[dict], ext_to_rt: dict,
+                             corr_to_rt: dict) -> dict:
+    """Find deepest nn.Module path for each kernel within a layer.
+
+    Returns {kernel_idx: "ParentModule > LeafModule"}.
+    """
+    if not descendants:
+        return {}
     labels = {}
     for ki in kidxs:
-        k = kernels[ki]
-        args = k.get("args", {})
-        eid = args.get("External id")
-        rt = ext_to_rt.get(eid) if eid is not None else None
-        if rt is None:
-            corr = args.get("correlation")
-            rt = corr_to_rt.get(corr) if corr is not None else None
+        rt = rt_event_for(kernels[ki], ext_to_rt, corr_to_rt)
         if rt is None:
             continue
-        rt_ts_val = rt["ts"]
-
-        best = None
-        best_dur = float("inf")
-        for m in descendants:
-            if m["ts"] <= rt_ts_val <= m["end"] and m["dur"] < best_dur:
-                best = m
-                best_dur = m["dur"]
-
-        if best:
-            labels[ki] = best["path"]
-
+        path = leaf_at(descendants, rt["ts"])
+        if path:
+            labels[ki] = path
     return labels
+
+
+def rt_event_for(kernel: dict, ext_to_rt: dict, corr_to_rt: dict) -> dict | None:
+    """The launch event that produced this kernel, if correlated.
+
+    correlation is tried first: it identifies the individual launch, whereas
+    External id only identifies the enclosing cpu_op, which may have launched
+    several kernels.
+    """
+    args = kernel.get("args", {})
+    corr = args.get("correlation")
+    rt = corr_to_rt.get(corr) if corr is not None else None
+    if rt is None:
+        eid = args.get("External id")
+        rt = ext_to_rt.get(eid) if eid is not None else None
+    return rt
 
 
 def analyze_layer_structure(trace: dict | list, kernels: list[dict],
@@ -1067,19 +1175,14 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict],
         # Get kernel-to-module mapping (deep — find leaf module)
         all_kidxs = get_kernels_for_module(layer_ev, ext_to_kidx,
                                             corr_to_kidx, runtime, rt_ts)
+        descendants = build_layer_descendants(module_events, layer_ev)
         kernel_labels = find_deep_kernel_labels(
-            module_events, layer_ev, all_kidxs, kernels,
-            ext_to_rt, corr_to_rt)
+            descendants, all_kidxs, kernels, ext_to_rt, corr_to_rt)
 
         breakdown = []
         for ki in all_kidxs:
             # Determine section from python_function context
-            k_args = kernels[ki].get("args", {})
-            eid = k_args.get("External id")
-            rt = ext_to_rt.get(eid) if eid is not None else None
-            if rt is None:
-                corr = k_args.get("correlation")
-                rt = corr_to_rt.get(corr) if corr is not None else None
+            rt = rt_event_for(kernels[ki], ext_to_rt, corr_to_rt)
             section = get_section_name(sections, rt["ts"]) if rt else "(layer)"
 
             # Leaf module from nn.Module hierarchy
@@ -1103,11 +1206,11 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict],
         })
 
     # === Fallback: recover unlinked kernels via GPU-timestamp interpolation ===
-    # Some kernels (e.g. launched via cudaLaunchKernelExC) lack matching
-    # cuda_runtime events, so get_kernels_for_module cannot find them.
-    # We handle two sub-cases:
+    # A few kernels still have no launch event to correlate against, so
+    # get_kernels_for_module cannot find them. We handle two sub-cases:
     #   (a) Kernels that fall WITHIN the forward-pass GPU time window →
-    #       assign to the same layer/section as the nearest preceding linked kernel.
+    #       assign to the same layer/section as the nearest preceding linked
+    #       kernel; their module is left UNATTRIBUTED.
     #   (b) Kernels that fall OUTSIDE (after) the forward-pass window →
     #       these are inter-layer / model-level ops (allreduce, residual norms, etc.)
     #       that execute between decoder layers.  Collect them into a synthetic
@@ -1137,30 +1240,28 @@ def analyze_layer_structure(trace: dict | list, kernels: list[dict],
                 # case (b): inter-layer / post-layer kernel
                 inter_layer_kidxs.append(ki)
                 continue
-            # case (a): within window — assign to nearest preceding linked kernel
+            # case (a): within window — assign to nearest preceding linked kernel.
+            # The module stays UNATTRIBUTED rather than "(self)": not knowing
+            # which module launched a kernel is a different statement from the
+            # module having launched it in its own forward.
             pos = bisect.bisect_right(entry_ts, k["ts"]) - 1
-            if pos < 0:
-                ldi = linked_entries[0][2]
-                inferred_section = linked_entries[0][3]
-            else:
-                ldi = linked_entries[pos][2]
-                inferred_section = linked_entries[pos][3]
-            unlinked_by_layer.setdefault(ldi, []).append(
-                (ki, inferred_section))
+            prev = linked_entries[pos] if pos >= 0 else linked_entries[0]
+            unlinked_by_layer.setdefault(prev[2], []).append(
+                (ki, prev[3], UNATTRIBUTED))
 
         n_recovered = 0
         for ldi, items in unlinked_by_layer.items():
             ld = layer_data[ldi]
             existing = list(ld["kernel_breakdown"])
-            for ki, section in items:
-                existing.append((ki, section, ""))
+            existing.extend(items)
             existing.sort(key=lambda item: kernels[item[0]]["ts"])
             ld["kernel_breakdown"] = existing
             n_recovered += len(items)
 
         if n_recovered:
-            print(f"[INFO] Recovered {n_recovered} unlinked kernels via "
-                  f"GPU-timestamp interpolation", file=sys.stderr)
+            print(f"[INFO] Placed {n_recovered} kernels with no correlated "
+                  f"launch event by GPU timestamp; their module is "
+                  f"{UNATTRIBUTED}", file=sys.stderr)
 
         if inter_layer_kidxs:
             print(f"[INFO] Skipping {len(inter_layer_kidxs)} kernels outside "
@@ -1394,6 +1495,54 @@ def _index_ranges(idxs: list[int]) -> str:
 # Step 3: Per-layer kernel breakdown with sub-module labels
 # ===================================================================
 
+def audit_attribution(agg_table: list[dict], fine_types: list[dict]) -> bool:
+    """Warn about call sites whose module attribution looks wrong or missing.
+
+    Two checks, both derived from the trace rather than hard-coded, so they keep
+    working for other models and layer counts:
+
+    1. Any call site left UNATTRIBUTED.
+    2. Any call site that runs on exactly the layers which compute a fresh
+       indexer top-k ("full" layer types) but is not attributed to the Indexer.
+       A kernel that runs on 21 of 78 layers can only belong to the indexer
+       chain, so this catches the attribution failures that are easiest to miss
+       — they hide inside an otherwise plausible-looking MLA row.
+    """
+    n_full = sum(t["count"] for t in fine_types
+                 if str(t.get("label", "")).startswith("full"))
+    n_all = sum(t["count"] for t in fine_types)
+
+    unattributed = [e for e in agg_table if e.get("leaf") == UNATTRIBUTED]
+    suspects = []
+    if 0 < n_full < n_all:
+        for e in agg_table:
+            if e.get("count") != n_full:
+                continue
+            text = f"{e.get('section', '')} {e.get('leaf', '')}".lower()
+            if "indexer" not in text:
+                suspects.append(e)
+
+    for e in unattributed:
+        print(f"[WARN] no module for {e['kernel'][:60]!r} "
+              f"({e['count']} launches) — reported as {UNATTRIBUTED}",
+              file=sys.stderr)
+    for e in suspects:
+        print(f"[WARN] {e['kernel'][:60]!r} runs on exactly the {n_full} "
+              f"indexer layers but is attributed to "
+              f"'{e.get('leaf') or e.get('section')}', not the Indexer",
+              file=sys.stderr)
+
+    if n_full:
+        n_idx = sum(1 for e in agg_table
+                    if e.get("count") == n_full
+                    and "indexer" in f"{e.get('section', '')} "
+                                     f"{e.get('leaf', '')}".lower())
+        print(f"[INFO] Attribution audit: {n_idx} call site(s) on the {n_full} "
+              f"indexer layers of {n_all}, {len(suspects)} suspect, "
+              f"{len(unattributed)} {UNATTRIBUTED}", file=sys.stderr)
+    return not (unattributed or suspects)
+
+
 def print_step3(cls_name: str, agg_table: list[dict],
                 kernels: list[dict], kernel_stats: list[dict] | None,
                 callsite_map: dict | None = None) -> None:
@@ -1582,6 +1731,7 @@ def main() -> None:
 
             # --- Step 3: Combined breakdown ---
             if agg_table:
+                audit_attribution(agg_table, fine_types)
                 print_step3(cls_name, agg_table, kernels_off, kernel_stats,
                             callsite_map)
                 if out_dir:

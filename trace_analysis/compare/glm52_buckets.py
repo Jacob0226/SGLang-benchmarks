@@ -133,7 +133,30 @@ BUCKET_RULES = [
 ]
 COMPILED = [(name, [re.compile(p) for p in pats]) for name, pats in BUCKET_RULES]
 
-def classify(kernel_name: str) -> str:
+# --------------------------------------------------------------------------- #
+# Module-path rules, tried BEFORE the name rules and only on workbooks that carry
+# the nn.Module tree (step3). The tree is ground truth for who launched a kernel,
+# which the name cannot express: the DSA indexer's own q/k projections, layernorm,
+# rope, hadamard and wv splitk are ordinary hgemm / layernorm / rope / elementwise
+# kernels, so they were scattering into four other buckets and "DSA indexer+topk"
+# reported roughly half of what the indexer really costs (MI355X conc4 decode:
+# 0.765 ms by name against 1.485 ms for the whole Indexer subtree). step1 has no
+# module column and necessarily keeps the narrower name-based figure -- the two
+# scopes are expected to disagree on this bucket, and step3 is the one to quote.
+# --------------------------------------------------------------------------- #
+MODULE_RULES = [
+    ("DSA indexer+topk", [r"\bindexer\b"]),
+]
+MODULE_COMPILED = [(name, [re.compile(p, re.I) for p in pats])
+                   for name, pats in MODULE_RULES]
+
+
+def classify(kernel_name: str, module: str = "") -> str:
+    if module:
+        for name, pats in MODULE_COMPILED:
+            for p in pats:
+                if p.search(module):
+                    return name
     n = kernel_name.lower()
     for name, pats in COMPILED:
         for p in pats:
@@ -146,10 +169,11 @@ BUCKET_ORDER = [name for name, _ in BUCKET_RULES] + ["other"]
 
 
 def read_workbook(path):
-    """-> (scope, [(kernel_name, sum_us, launch_count)]).
+    """-> (scope, [(kernel_name, sum_us, launch_count, module_path)]).
 
     Accepts a step3 breakdown (one row per call site) or a step1 kernel-stats
-    sheet (one row per kernel name); scope is detected from the header."""
+    sheet (one row per kernel name); scope is detected from the header. module_path
+    is "Section > LeafModule" on step3 and "" on step1, which has no module tree."""
     ws = load_workbook(path, data_only=True).active
     rows = list(ws.iter_rows(values_only=True))
     if not rows:
@@ -165,6 +189,8 @@ def read_workbook(path):
     kn = col("KernelName", "Name")
     us = col("SumDuration_us")
     cnt = col("LaunchCount", "Count")
+    sec = col("Section")
+    leaf = col("LeafModule")
     if kn is None or us is None:
         raise SystemExit(f"[ERROR] {path}: not a step1/step3 workbook "
                          f"(header={list(h)[:8]})")
@@ -174,23 +200,32 @@ def read_workbook(path):
         name = r[kn]
         if not name or str(name).startswith(("TOTAL", "Subtotal", "#")):
             continue
+        mod = " > ".join(str(r[c]) for c in (sec, leaf)
+                         if c is not None and r[c])
         out.append((str(name), float(r[us] or 0.0),
-                    int(r[cnt] or 0) if cnt is not None else 0))
+                    int(r[cnt] or 0) if cnt is not None else 0, mod))
     return scope, out
 
 
 def bucketize(rows):
-    """-> ({bucket: sum_us}, [(bucket, kernel, sum_us, count)], total_us)."""
+    """-> ({bucket: sum_us}, [(bucket, kernel, sum_us, count)], total_us, moved).
+
+    moved lists the rows the module tree pulled out of the bucket their name alone
+    would have chosen, so the reclassification is auditable rather than silent."""
     buckets = defaultdict(float)
     perk = defaultdict(lambda: [0.0, 0])
-    for name, sum_us, cnt in rows:
-        b = classify(name)
+    moved = []
+    for name, sum_us, cnt, mod in rows:
+        b = classify(name, mod)
+        by_name = classify(name)
+        if b != by_name:
+            moved.append((by_name, b, name, sum_us, mod))
         buckets[b] += sum_us
         e = perk[(b, name)]
         e[0] += sum_us
         e[1] += cnt
     perk_rows = [(b, nm, v[0], v[1]) for (b, nm), v in perk.items()]
-    return dict(buckets), perk_rows, sum(v for v in buckets.values())
+    return dict(buckets), perk_rows, sum(v for v in buckets.values()), moved
 
 
 SCOPE_NOTE = {
@@ -216,9 +251,9 @@ def main():
     sides = []
     for label, path in args.src:
         scope, rows = read_workbook(path)
-        buckets, perk, total = bucketize(rows)
+        buckets, perk, total, moved = bucketize(rows)
         sides.append(dict(label=label, path=path, scope=scope, buckets=buckets,
-                          perk=perk, total=total, nrows=len(rows)))
+                          perk=perk, total=total, nrows=len(rows), moved=moved))
     scopes = {s["scope"] for s in sides}
     if len(scopes) > 1:
         raise SystemExit("[ERROR] mixed scopes: "
@@ -252,6 +287,16 @@ def main():
         a, b = tots
         line += f"{a-b:>12.2f}" + (f"{a/b:>8.2f}" if b > 1e-9 else f"{'inf':>8}")
     print(line)
+
+    for s in sides:
+        if not s["moved"]:
+            continue
+        tot_moved = sum(m[3] for m in s["moved"]) / 1000
+        print(f"\n  [{s['label']}] module tree reclassified {len(s['moved'])} call "
+              f"sites, {tot_moved:.3f} ms:")
+        for by_name, b, nm, us, mod in sorted(s["moved"], key=lambda m: -m[3]):
+            print(f"    {us/1000:7.3f} ms  {by_name:<22} -> {b:<22} "
+                  f"[{mod}] {nm[:44]}")
 
     # CSV layout is consumed verbatim by side_by_side.py --summary-csv.
     out = Path(args.out)

@@ -745,8 +745,15 @@ def _callorder_rows(path):
         return int(f) if f.is_integer() and "." not in str(v) else f
 
     out = []
+    dropped = []
     for r in load_breakdown(path):
         sum_us = r.get("SumDuration_us") or 0
+        # A row with a per-launch cost but no LaunchCount never matched a graph-ON
+        # kernel, so Σ_ms silently becomes 0 and the bucket under-reports. Shout
+        # rather than lose it: sglang_trace.py's residual pass should have paired
+        # it, and if it did not the attribution needs a look, not a zero.
+        if not sum_us and r.get("AvgDuration_us"):
+            dropped.append((r.get("LeafModule", ""), str(r.get("KernelName", ""))[:60]))
         out.append({
             "LayerType": r.get("LayerType", ""),
             "Section": r.get("Section", ""),
@@ -759,6 +766,12 @@ def _callorder_rows(path):
             "TrCount": pick(r, "KernelCount_fwd", "TraceCount_fwd"),
             "CallSite": r.get("CallSite", ""),
         })
+    if dropped:
+        print(f"[WARN] {os.path.basename(path)}: {len(dropped)} call site(s) have no "
+              f"LaunchCount, so their Σ_ms is 0 and the bucket totals below are "
+              f"short by that much:", file=sys.stderr)
+        for leaf, kn in dropped:
+            print(f"         [{leaf}] {kn}", file=sys.stderr)
     return out
 
 
@@ -859,7 +872,8 @@ def write_callorder_xlsx(src, out_path, title="", summary_csv=None):
         cat_sum = [defaultdict(float) for _ in sources]
         for si, (_, rows) in enumerate(sources):
             for d in rows:
-                cat_sum[si][classify(str(d["Kernel"]))] += d["Sum_ms"]
+                mod = " > ".join(str(d[k]) for k in ("Section", "Leaf") if d.get(k))
+                cat_sum[si][classify(str(d["Kernel"]), mod)] += d["Sum_ms"]
         cats = [c for c in BUCKET_ORDER if any(c in cs for cs in cat_sum)]
         ws.cell(sr, 1, "Bucket summary (Σ ms per bucket, this sheet's rows only)").font = bold
         sr += 1
