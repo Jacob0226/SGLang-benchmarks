@@ -111,6 +111,11 @@ MODEL_NAME="${_MODEL_ORG}_${_MODEL_LEAF}"
 #               HF card uses 0.80). No --disable-shared-experts-fusion (NV's
 #               HF launch command and InferenceX glm5_fp4_b200.sh both omit
 #               it — sglang's modelopt_fp4 path handles it correctly).
+#   *GLM-5.3* -> GLM-5.3-Flash (glm5_next). The checkpoint self-declares FP8 in
+#               config.json's quantization_config (with a long
+#               modules_to_not_convert list covering the MLA/MQA attention,
+#               hyper-connection and mHC tensors), so passing --quantization fp8
+#               would flatten that mixed-precision layout. Leave QUANT_ARGS empty.
 #   *FP8*    -> default GLM-5-FP8: --quantization fp8 on B200, none on ROCm.
 QUANT_ARGS=()
 MEM_FRACTION_STATIC="0.85"
@@ -142,6 +147,14 @@ case "${MODEL_NAME}" in
         # one that lines up with B200's TP=4 NVFP4 sweep, so default to 4
         # here for direct MI355X-vs-B200 comparison. Override with --tp 2
         # to match InferenceX's MXFP4 main sweep.
+        [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
+        ;;
+    *GLM-5.3*)
+        # 320B total / 18B active, FP8 weights ~306GB on disk -> ~77GB/GPU at
+        # TP=4, which fits a 192GB B200 with room for the KV and KDA pools.
+        # The cookbook's B200 cell is TP=8; we default to 4 so the sweep lines
+        # up with the GLM-5.2-NVFP4 TP4 numbers already in results/.
+        MEM_FRACTION_STATIC="0.8"
         [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
         ;;
     *FP8*)
@@ -247,11 +260,25 @@ PROMPT_MULTIPLIER=5
 # comparable. Short shapes must NOT be capped: at 1024:1024/conc64 a cap of 8
 # just serialises the run.
 #
+# GLM-5.3-Flash is the exception and defaults to NO cap. The premise above --
+# that a B200 KV pool only fits ~8 of these requests -- does not hold for its
+# hybrid KDA/DSA layout: only 11 of 45 layers keep a paged KV cache, so at TP4
+# the pool is 4,979,200 tokens (32.85 GB fp8), enough for 64 concurrent 70K
+# requests with room to spare. Measured 2026-08-28: at cap 8 the conc64 run just
+# queues -- median TTFT 121.7 s and output throughput flat at ~127 tok/s from
+# conc8 up -- so it reports the queue, not the model. Cap it
+# explicitly with I70K_MAX_RUNNING_REQUESTS=8 if you want the GLM-5.2-comparable
+# operating point back.
+#
 #   I70K_MAX_RUNNING_REQUESTS=16 ./GLM.sh   # different cap
 #   I70K_MAX_RUNNING_REQUESTS=0  ./GLM.sh   # off -> single shared server (pre-08/13 behaviour)
+case "${MODEL_NAME}" in
+    *GLM-5.3*) _i70k_cap_default=0 ;;
+    *)         _i70k_cap_default=8 ;;
+esac
 declare -A SHAPE_SERVER_ARGS=()
-if [ "${I70K_MAX_RUNNING_REQUESTS:-8}" != "0" ]; then
-    SHAPE_SERVER_ARGS["70000:300"]="--max-running-requests ${I70K_MAX_RUNNING_REQUESTS:-8}"
+if [ "${I70K_MAX_RUNNING_REQUESTS:-$_i70k_cap_default}" != "0" ]; then
+    SHAPE_SERVER_ARGS["70000:300"]="--max-running-requests ${I70K_MAX_RUNNING_REQUESTS:-$_i70k_cap_default}"
 fi
 if [ "$PROF_COMBINED" == "true" ]; then
     PROF_CMD=(--profile --profile-num-steps "${PROF_NUM_STEPS:-2}")
@@ -511,6 +538,37 @@ start_server() {
             NEED_DISABLE_SHARED_FUSION="true"
             export SGLANG_ENABLE_HIP_DUAL_STREAM=1
         fi
+    elif [[ "${MODEL_NAME}" == *GLM-5.3* ]]; then
+        # GLM-5.3-Flash (glm5_next) on B200. Same philosophy as the GLM-5.2 block
+        # below -- stay close to the vendor's own command and let sglang auto-pick
+        # what it can -- because this model is even more sensitive to the GLM-5 /
+        # GLM-5.1 tuning block in the `else` branch: its 45 text layers are a
+        # hybrid of 34 KDA linear-attention layers and 11 DSA sparse-attention
+        # layers, so a global --attention-backend is wrong for two thirds of them,
+        # and the flashinfer-allreduce-fusion + stream-interval + 32K chunking
+        # combo is the one that deadlocked the DSA all-gather on GLM-5.2.
+        #
+        # The three flags we DO set explicitly come from the verified B200 cell of
+        # sglang's cookbook (docs/cookbook/autoregressive/GLM/GLM-5.3-Flash.mdx):
+        #   --dsa-{prefill,decode}-backend trtllm
+        #       Must be paired with the fp8_e4m3 KV cache set above. TileLang DSA
+        #       with an FP8 KV cache is not a valid CUDA combination, so if auto
+        #       resolves to tilelang the server is misconfigured. Switch both
+        #       backends AND the KV dtype together if you want the BF16 pairing.
+        #   --moe-runner-backend deep_gemm
+        #       Every CUDA cell in the cookbook uses deep_gemm for these FP8
+        #       weights. flashinfer_trtllm (the `else` branch default) is the
+        #       NVFP4 path.
+        #   --ep-size = TP
+        #       The cookbook runs expert parallel at the same width as TP.
+        # Override any of them with SERVER_EXTRA_ARGS (appended later -> wins).
+        cmd+=(
+            --chunked-prefill-size 16384
+            --dsa-prefill-backend "${DSA_PREFILL_BACKEND:-trtllm}"
+            --dsa-decode-backend "${DSA_DECODE_BACKEND:-trtllm}"
+            --moe-runner-backend "${MOE_RUNNER_BACKEND:-deep_gemm}"
+            --ep-size "${EP_SIZE:-$TP_SIZE}"
+        )
     elif [[ "${MODEL_NAME}" == *GLM-5.2* ]]; then
         # GLM-5.2 (glm_moe_dsa) on B200: use NVIDIA's OFFICIAL HF launch settings
         # verbatim (https://huggingface.co/nvidia/GLM-5.2-NVFP4):
@@ -568,8 +626,19 @@ start_server() {
     # CUDA-only on purpose: tc_piecewise is unsupported on ROCm/NPU/CPU/MPS/XPU
     # (sglang's own is_hip()/is_npu()/... rules disable it), and older images may
     # not even expose --cuda-graph-backend-prefill. Gate to the non-ROCm path.
-    # Toggle off with ENABLE_PIECEWISE_CUDA_GRAPH=0.
-    if ! is_rocm_gpu_env && [ "${ENABLE_PIECEWISE_CUDA_GRAPH:-1}" = "1" ]; then
+    # Toggle with ENABLE_PIECEWISE_CUDA_GRAPH=0/1.
+    #
+    # Default OFF for GLM-5.3-Flash: none of the cookbook's verified cells select
+    # a prefill cuda-graph backend for it, and the one command that does mention
+    # prefill graphs (the GB300 encoder-disaggregation recipe) passes
+    # --disable-prefill-cuda-graph. Forcing tc_piecewise onto the KDA/DSA hybrid
+    # would be benchmarking an unvalidated path. Set
+    # ENABLE_PIECEWISE_CUDA_GRAPH=1 to measure it deliberately.
+    case "${MODEL_NAME}" in
+        *GLM-5.3*) _pcg_default=0 ;;
+        *)         _pcg_default=1 ;;
+    esac
+    if ! is_rocm_gpu_env && [ "${ENABLE_PIECEWISE_CUDA_GRAPH:-$_pcg_default}" = "1" ]; then
         cmd+=(--cuda-graph-backend-prefill tc_piecewise)
     fi
 
@@ -850,15 +919,25 @@ if ! is_rocm_gpu_env; then
     # pulls in a version whose built-in `qwen3_asr` config collides with sglang's
     # own qwen3_asr registration ("'qwen3_asr' is already used by a Transformers
     # config"), which kills server startup at import time.
+    #
+    # GLM-5.3-Flash (glm5_next) declares transformers_version 5.16.0 in its
+    # config.json, so it needs a newer floor than GLM-5.2.
+    _min_transformers=""
     case "${MODEL_NAME}" in
-        *GLM-5.2*)
-            if python3 -c "import transformers; from packaging.version import Version; import sys; sys.exit(0 if Version(transformers.__version__) >= Version('5.3.0') else 1)" 2>/dev/null; then
-                echo "[info] transformers $(python3 -c 'import transformers; print(transformers.__version__)') already satisfies >=5.3.0; skipping upgrade."
-            else
-                python3 -m pip install --break-system-packages "transformers>=5.3.0"
-            fi
-            ;;
+        *GLM-5.3*) _min_transformers="5.16.0" ;;
+        *GLM-5.2*) _min_transformers="5.3.0" ;;
     esac
+    # Compare on base_version so a pre-release satisfies its own floor: the
+    # glm-5.3-flash image ships transformers 5.16.0.dev0, and a plain
+    # Version() compare rates that BELOW 5.16.0 and would pip-install over the
+    # purpose-built build — the exact clobbering this gate exists to prevent.
+    if [ -n "${_min_transformers}" ]; then
+        if python3 -c "import transformers, sys; from packaging.version import Version; sys.exit(0 if Version(Version(transformers.__version__).base_version) >= Version('${_min_transformers}') else 1)" 2>/dev/null; then
+            echo "[info] transformers $(python3 -c 'import transformers; print(transformers.__version__)') already satisfies >=${_min_transformers}; skipping upgrade."
+        else
+            python3 -m pip install --break-system-packages "transformers>=${_min_transformers}"
+        fi
+    fi
 fi
 
 
