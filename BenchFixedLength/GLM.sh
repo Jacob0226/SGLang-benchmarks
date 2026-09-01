@@ -16,6 +16,10 @@
 # single_node/glm5.1_fp4_mi355x.sh and glm5_fp4_b200.sh):
 # ./GLM.sh --model amd/GLM-5.1-MXFP4               # MI355X (MXFP4 self-declares)
 # ./GLM.sh --model nvidia/GLM-5-NVFP4              # B200   (NV official ModelOpt quant)
+#
+# GLM-5.3-Flash on ROCm/gfx950 (sgl-project/sglang#36607 recipe: AITER MoE +
+# TileLang DSA + gfx950 mHC fast paths; needs SGLANG_USE_AITER=1, set automatically):
+# ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-5.3-Flash --tp 4 --tag TP4
 set -euo pipefail
 set -x
 ulimit -n 65535
@@ -94,6 +98,18 @@ _MODEL_LEAF=$(basename "${_MODEL_PATH_TRIMMED}")
 _MODEL_ORG=$(basename "$(dirname "${_MODEL_PATH_TRIMMED}")")
 MODEL_NAME="${_MODEL_ORG}_${_MODEL_LEAF}"
 
+# Results tree name. Defaults to the <org>_<leaf> form above, which is what the
+# existing amd_GLM-5.2-MXFP4 / nvidia_GLM-5.2-NVFP4 trees use. GLM-5.3-Flash is the
+# exception: its results tree was created as results/GLM-5.3-Flash/ by the PR #36607
+# reproduction, so keep writing there rather than forking a second
+# zai-org_GLM-5.3-Flash/ tree for the same model. Override with MODEL_DIR_NAME=...
+if [ -z "${MODEL_DIR_NAME:-}" ]; then
+    case "${MODEL_NAME}" in
+        *GLM-5.3-Flash*) MODEL_DIR_NAME="GLM-5.3-Flash" ;;
+        *)               MODEL_DIR_NAME="${MODEL_NAME}" ;;
+    esac
+fi
+
 # ===================== Quantization auto-detection (matches InferenceX) =====================
 # Pick --quantization and --mem-fraction-static based on the model name.
 # Mirrors SemiAnalysisAI/InferenceX recipes in benchmarks/single_node/
@@ -117,6 +133,24 @@ MODEL_NAME="${_MODEL_ORG}_${_MODEL_LEAF}"
 #               hyper-connection and mHC tensors), so passing --quantization fp8
 #               would flatten that mixed-precision layout. Leave QUANT_ARGS empty.
 #   *FP8*    -> default GLM-5-FP8: --quantization fp8 on B200, none on ROCm.
+# Defined up here rather than beside the other helpers because the model-detection
+# block below has to branch on the platform: GLM-5.3-Flash needs a different DSA
+# backend and KV dtype on ROCm than on Blackwell, and that block runs at load time,
+# long before start_server().
+# FORCE_PLATFORM=rocm|cuda overrides the probe. Its reason for existing is that the
+# two GLM-5.3-Flash recipes diverge in backend and KV dtype, and whoever is holding
+# an MI355X cannot otherwise see what the Blackwell command would come out as. Pair
+# it with DRY_RUN=1 (see start_server) to print the other platform's command without
+# loading a model:
+#   FORCE_PLATFORM=cuda DRY_RUN=1 ./GLM.sh --model .../GLM-5.3-Flash --tp 4
+is_rocm_gpu_env() {
+    case "${FORCE_PLATFORM:-}" in
+        rocm) return 0 ;;
+        cuda) return 1 ;;
+    esac
+    [ -e /dev/kfd ] || command -v rocm-smi >/dev/null 2>&1
+}
+
 QUANT_ARGS=()
 MEM_FRACTION_STATIC="0.85"
 # Set to "true" by --dual-stream-rocm (see start_server()) — needed so MoE.forward
@@ -151,11 +185,53 @@ case "${MODEL_NAME}" in
         ;;
     *GLM-5.3*)
         # 320B total / 18B active, FP8 weights ~306GB on disk -> ~77GB/GPU at
-        # TP=4, which fits a 192GB B200 with room for the KV and KDA pools.
-        # The cookbook's B200 cell is TP=8; we default to 4 so the sweep lines
-        # up with the GLM-5.2-NVFP4 TP4 numbers already in results/.
-        MEM_FRACTION_STATIC="0.8"
+        # TP=4, which fits a 192GB B200 with room for the KV and KDA pools and
+        # also fits an MI355X. The cookbook's B200 cell is TP=8 and PR #36607
+        # measured TP8, but we default to 4 so the sweep lines up with the
+        # GLM-5.2-NVFP4 TP4 numbers already in results/.
         [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
+        # Hybrid linear-attention + DSA MoE (45 layers: 34 linear_attention, 11 DSA)
+        # with mHC. Weights are FP8 block-quantized in the checkpoint itself
+        # (attention / mHC / hyper stay BF16), so it self-declares quant the same
+        # way MXFP4 does -- passing --quantization would override and break it.
+        # Matches PR #36607, which launches with no --quantization.
+        # ROCm runs TileLang DSA with BF16 KV (PR #36607); Blackwell runs TRT-LLM
+        # DSA with FP8 E4M3 KV (the cookbook's Blackwell default, sglang#36519).
+        # Set as a pair because the KV dtype here is a consequence of the DSA
+        # backend, not an independent choice -- see the ROCm comment below.
+        if is_rocm_gpu_env; then
+            DSA_PREFILL_BACKEND="${DSA_PREFILL_BACKEND:-tilelang}"
+            DSA_DECODE_BACKEND="${DSA_DECODE_BACKEND:-tilelang}"
+            # BF16 KV rather than this script's fp8_e4m3 default. FP8 KV with
+            # TileLang DSA is a supported ROCm path -- forward_mha_rocm.py has a
+            # branch guarded on exactly "fp8_e4m3 and DSA backend is not trtllm" --
+            # but that branch only runs when a prefill reads already-written prefix
+            # KV (mha_one_shot and sum(extend_prefix_lens_cpu) != 0), i.e. a
+            # chunked-prefill continuation. PR #36607 validated on 1024-token
+            # inputs, which never chunk, so it never entered the branch and its
+            # FP8 KV claim stands for that workload. GLM.sh's i70k shape and its
+            # high-concurrency GSM8K both chunk, and the branch then kills every
+            # rank at once:
+            #   forward_mha.py:500 _get_mla_kv_buffer_from_fp8_for_dsa
+            #   -> backend.forward_metadata.page_table_1_flattened
+            #   AttributeError: 'HybridLinearAttnBackend' has no attribute
+            #                   'forward_metadata'
+            # The helper unwraps TboAttnBackend but not the hybrid
+            # linear-attention wrapper that actually owns the DSA backend. Until
+            # that lands upstream -- one line, backend = getattr(backend,
+            # "full_attn_backend", backend), staged in
+            # tools/glm53_flash_setup_container.sh as APPLY_HYBRID_PATCH -- BF16
+            # is the only KV dtype that survives this harness on ROCm.
+            KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-bfloat16}"
+        else
+            # Blackwell. The FP8 dequant branch described above tests for a
+            # *non*-trtllm DSA backend, so choosing trtllm here means the hybrid
+            # wrapper bug is unreachable and FP8 KV is safe.
+            DSA_PREFILL_BACKEND="${DSA_PREFILL_BACKEND:-trtllm}"
+            DSA_DECODE_BACKEND="${DSA_DECODE_BACKEND:-trtllm}"
+            KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
+            MEM_FRACTION_STATIC="0.8"
+        fi
         ;;
     *FP8*)
         QUANT_ARGS=(--quantization fp8)
@@ -217,6 +293,19 @@ export SGLANG_DSA_DECODE_DUAL_GRAPH="${SGLANG_DSA_DECODE_DUAL_GRAPH:-1}"
 # SGLANG_DSA_FUSE_HADAMARD_QUANT=0. Ignored on branches without the feature.
 export SGLANG_DSA_FUSE_HADAMARD_QUANT="${SGLANG_DSA_FUSE_HADAMARD_QUANT:-1}"
 # export AITER_ONLINE_TUNE=1
+
+# ===================== GLM-5.3-Flash (ROCm/gfx950, PR #36607) =====================
+# The whole point of the gfx950 enablement is the AITER mHC path: matrix-free
+# hypercomplex pre/post kernels plus a fused attention->FFN boundary, gated on
+# HIP + gfx95 + SGLANG_USE_AITER. Without this env var the model still runs but
+# falls back to the unfused reference path, which the PR measures at 5.42x slower
+# -- i.e. exactly the "2x+ off" failure this script now warns about. Set it here
+# so it can never be forgotten, and verify it actually fired (check_mhc_markers).
+# ROCm only: on Blackwell there is no AITER, and exporting it there just puts a
+# misleading line in the run's provenance.
+if [[ "${MODEL_NAME}" == *GLM-5.3-Flash* ]] && is_rocm_gpu_env; then
+    export SGLANG_USE_AITER="${SGLANG_USE_AITER:-1}"
+fi
 
 # Scheduler watchdog timeout (s). The torch-profiler teardown for an eager
 # (no-cuda-graph) high-concurrency trace disposes millions of ProfilerResult
@@ -336,7 +425,7 @@ DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
 # MTP stays in the path so an MTP run and its non-MTP twin can share a --tag
 # without overwriting each other.
 LEAF_TAG="${SPECIAL_TAG#-}-Fixed${MTP_TAG}${USER_TAG}"
-LOG_DIR="$HOME/SGLang-benchmarks/results/${MODEL_NAME}/$DOCKER_FILENAME/${LEAF_TAG}"
+LOG_DIR="$HOME/SGLang-benchmarks/results/${MODEL_DIR_NAME}/$DOCKER_FILENAME/${LEAF_TAG}"
 FINISH_LOG="$LOG_DIR/Finish.log"
 # Single continuous server log. Exported so log_command() can stamp a banner into
 # it before each client command (warmup / GSM8K / per-config warmup / bench), so
@@ -371,10 +460,6 @@ log_command() {
 
     # Execute command
     "$@" 2>&1 | tee -a "$logfile"
-}
-
-is_rocm_gpu_env() {
-    [ -e /dev/kfd ] || command -v rocm-smi >/dev/null 2>&1
 }
 
 list_profiler_dirs() {
@@ -493,7 +578,7 @@ start_server() {
             --reasoning-parser glm45
             --watchdog-timeout "${WATCHDOG_TIMEOUT:-1200}"
             --mem-fraction-static "$MEM_FRACTION_STATIC"
-            --kv-cache-dtype fp8_e4m3
+            --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_e4m3}"
             --disable-radix-cache
             --model-loader-extra-config "{\"enable_multithread_load\": true, \"num_threads\": ${WEIGHT_LOAD_THREADS:-32}}"
     )
@@ -520,6 +605,24 @@ start_server() {
                 if [ "${DISABLE_AITER_ALLREDUCE_FUSION:-0}" != "1" ]; then
                     cmd+=(--enable-aiter-allreduce-fusion)
                 fi
+                ;;
+        esac
+        # ===== GLM-5.3-Flash: PR #36607 gfx950 serving recipe =====
+        case "${MODEL_NAME}" in
+            *GLM-5.3-Flash*)
+                # AITER MoE runner is the PR's measured configuration (288 routed
+                # + 1 shared expert). TileLang DSA backends are set via
+                # DSA_{PREFILL,DECODE}_BACKEND in the model-detection block above.
+                #
+                # --context-length: the checkpoint declares 1,048,576, which makes
+                # the KV planner size a pool nothing here will ever use. The PR
+                # pinned 65536, but this script's i70k shape sends up to 70,000
+                # input + 300 output tokens, so 65536 would reject every i70k
+                # request. 131072 clears i70k with margin and keeps the pool sane.
+                cmd+=(
+                    --moe-runner-backend "${MOE_RUNNER_BACKEND:-aiter}"
+                    --context-length "${CONTEXT_LENGTH:-131072}"
+                )
                 ;;
         esac
         if [ "$DUAL_STREAM_ROCM" == "true" ]; then
@@ -551,10 +654,13 @@ start_server() {
         # The three flags we DO set explicitly come from the verified B200 cell of
         # sglang's cookbook (docs/cookbook/autoregressive/GLM/GLM-5.3-Flash.mdx):
         #   --dsa-{prefill,decode}-backend trtllm
-        #       Must be paired with the fp8_e4m3 KV cache set above. TileLang DSA
-        #       with an FP8 KV cache is not a valid CUDA combination, so if auto
-        #       resolves to tilelang the server is misconfigured. Switch both
-        #       backends AND the KV dtype together if you want the BF16 pairing.
+        #       Must be paired with the fp8_e4m3 KV cache set above, and the
+        #       pairing is load-bearing rather than cosmetic: sglang's FP8 KV read
+        #       path for DSA is guarded on a *non*-trtllm backend, and that path
+        #       cannot see past this model's HybridLinearAttnBackend wrapper (the
+        #       ROCm branch above documents the failure in full). Choosing trtllm
+        #       keeps it unreachable. Switch both backends AND the KV dtype
+        #       together if you want the BF16 pairing.
         #   --moe-runner-backend deep_gemm
         #       Every CUDA cell in the cookbook uses deep_gemm for these FP8
         #       weights. flashinfer_trtllm (the `else` branch default) is the
@@ -562,12 +668,20 @@ start_server() {
         #   --ep-size = TP
         #       The cookbook runs expert parallel at the same width as TP.
         # Override any of them with SERVER_EXTRA_ARGS (appended later -> wins).
+        #
+        # --attention-backend is deliberately not set, matching the reference
+        # command; sglang resolves DSA from the model config.
+        #
+        # --context-length: as on ROCm, the checkpoint declares 1,048,576 and the
+        # i70k shape needs 70,300, so pin something in between rather than let the
+        # KV planner size a pool for a million tokens.
         cmd+=(
             --chunked-prefill-size 16384
             --dsa-prefill-backend "${DSA_PREFILL_BACKEND:-trtllm}"
             --dsa-decode-backend "${DSA_DECODE_BACKEND:-trtllm}"
             --moe-runner-backend "${MOE_RUNNER_BACKEND:-deep_gemm}"
             --ep-size "${EP_SIZE:-$TP_SIZE}"
+            --context-length "${CONTEXT_LENGTH:-131072}"
         )
     elif [[ "${MODEL_NAME}" == *GLM-5.2* ]]; then
         # GLM-5.2 (glm_moe_dsa) on B200: use NVIDIA's OFFICIAL HF launch settings
@@ -698,6 +812,21 @@ start_server() {
         cmd+=("${EXTRA_SERVER_ARGS[@]}")
     fi
 
+    # DRY_RUN=1 prints the resolved launch command and exits without loading the
+    # model (~4 min) — for checking that a new model's args resolve as intended.
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        set +x
+        echo ""
+        echo ">>> DRY_RUN: resolved server command"
+        printf '    %s\n' "${cmd[@]}"
+        echo ""
+        echo ">>> MODEL_NAME=${MODEL_NAME}  TP_SIZE=${TP_SIZE}  MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC}"
+        echo ">>> SGLANG_USE_AITER=${SGLANG_USE_AITER:-<unset>}  DSA prefill/decode=${DSA_PREFILL_BACKEND:-triton}/${DSA_DECODE_BACKEND:-triton}"
+        echo ">>> shapes=${in_out_tokens[*]}  concurrencies=${concurrencies[*]}"
+        echo ">>> LOG_DIR=${LOG_DIR}"
+        exit 0
+    fi
+
     # Preflight: fail fast if the port is already taken (otherwise the model
     # loads for ~2 min and only then dies with "[Errno 98] Address already in
     # use"). Common cause: a stale/orphaned sglang server from a previous run,
@@ -727,6 +856,36 @@ start_server() {
         echo "Waiting for server to be ready at http://${HOST}:$PORT/health..."
         sleep 5
     done
+
+    # Verify the arch-gated fast paths actually engaged before spending an hour
+    # benchmarking. Warns; does not abort, so a deliberate fallback run still works.
+    check_mhc_markers
+}
+
+# ===================== gfx950 fast-path check =====================
+# On gfx950 the GLM-5.3-Flash mHC fast paths are env/arch gated (HIP + gfx95 +
+# SGLANG_USE_AITER). When a gate silently misses -- SGLANG_USE_AITER unset, wrong
+# GPU, an image whose aiter lacks aiter.ops.mhc -- the model still serves correct
+# tokens, just on the unfused reference path that PR #36607 measures at 5.42x
+# slower. Nothing in the benchmark output says "you measured the slow path", so
+# state it explicitly once at startup. The PR's own evidence that the fast paths
+# engaged is that every TP rank logs both mHC lines.
+check_mhc_markers() {
+    case "${MODEL_NAME}" in *GLM-5.3-Flash*) ;; *) return 0 ;; esac
+    is_rocm_gpu_env || return 0
+    local log="${SERVER_LOG}" pre fused
+    pre=$(grep -c 'Using AITER gfx950 mHC pre/post kernels' "$log" 2>/dev/null || true)
+    fused=$(grep -c 'Using fused AITER mHC attention-to-FFN boundary' "$log" 2>/dev/null || true)
+    echo ">>> [mHC] AITER gfx950 pre/post kernels: ${pre}/${TP_SIZE} ranks | fused attn->FFN boundary: ${fused}/${TP_SIZE} ranks"
+    if [ "${pre:-0}" -lt "$TP_SIZE" ] || [ "${fused:-0}" -lt "$TP_SIZE" ]; then
+        echo "!!! WARNING: GLM-5.3-Flash gfx950 mHC fast paths did NOT engage on every rank."
+        echo "!!!   mHC pre/post kernels : ${pre:-0}/${TP_SIZE} ranks"
+        echo "!!!   fused attn->FFN      : ${fused:-0}/${TP_SIZE} ranks"
+        echo "!!! The unfused fallback is 5.42x slower (PR #36607), so these numbers are"
+        echo "!!! not comparable to any published GLM-5.3-Flash result."
+        echo "!!! Check SGLANG_USE_AITER=${SGLANG_USE_AITER:-<unset>}, that the GPU is gfx950,"
+        echo "!!! and that this image's aiter exposes aiter.ops.mhc (mhc_pre / mhc_post)."
+    fi
 }
 
 warmup() {
@@ -748,6 +907,54 @@ warmup() {
     log_command "$warmup_log" "${warmup_cmd[@]}"
 }
 
+# Which GSM8K harness to use: sgl-eval for thinking models, the in-tree
+# bench_sglang.py otherwise. Force either way with ACCURACY_HARNESS=sgl-eval|bench_sglang.
+accuracy_harness() {
+    if [ -n "${ACCURACY_HARNESS:-}" ]; then
+        echo "$ACCURACY_HARNESS"
+        return 0
+    fi
+    case "${MODEL_NAME}" in
+        *GLM-5.3-Flash*)
+            if command -v sgl-eval >/dev/null 2>&1; then
+                echo "sgl-eval"
+            else
+                echo "[warn] sgl-eval not on PATH; falling back to bench_sglang.py, which" \
+                     "under-scores this model by 6-25 points. Install with:" \
+                     "pip install 'git+https://github.com/sgl-project/sgl-eval'" >&2
+                echo "bench_sglang"
+            fi
+            ;;
+        *) echo "bench_sglang" ;;
+    esac
+}
+
+# Surface the headline score in the run's own stdout; otherwise it is buried in the
+# harness log (bench_sglang.py) or a nested metrics.json (sgl-eval).
+report_gsm8k_score() {
+    local log=$1
+    if [ "$(accuracy_harness)" = "sgl-eval" ]; then
+        local mj
+        mj=$(find "${LOG_DIR}/sgl_eval_gsm8k" -name metrics.json 2>/dev/null \
+             | xargs -r ls -t 2>/dev/null | head -1)
+        if [ -n "$mj" ]; then
+            python3 - "$mj" <<'PY' || true
+import json, sys
+d = json.load(open(sys.argv[1])); a = d["aggregate"]; n = d["num_examples"]
+print(">>> [gsm8k] sgl-eval %.2f%% (%d/%d) | truncated %.2f%% | errors %.3f | wall %.0fs | %s threads"
+      % (a["score"] * 100, round(a["score"] * n), n, a["truncated_rate"] * 100,
+         a["error_rate"], d["latency_seconds"], d.get("num_threads", "?")))
+PY
+        else
+            echo "[warn] sgl-eval produced no metrics.json under ${LOG_DIR}/sgl_eval_gsm8k"
+        fi
+    else
+        local acc
+        acc=$(grep -aoE "Accuracy: [0-9.]+" "$log" | tail -1 | awk '{print $2}')
+        [ -n "$acc" ] && echo ">>> [gsm8k] bench_sglang.py accuracy ${acc}"
+    fi
+}
+
 accuracy_test() {
     # Optional skip (e.g. quick perf-only runs): SKIP_GSM8K=1 ./GLM.sh ...
     if [ "${SKIP_GSM8K:-0}" = "1" ]; then
@@ -758,19 +965,72 @@ accuracy_test() {
     gsm8k_logfile=$LOG_DIR/Accuracy_GSM8K.log
     if ! grep -q "$gsm8k_logfile" "$FINISH_LOG"; then
         echo ">>> Running Accuracy check (GSM8K)..."
-        # --parallel caps how many GSM8K requests run concurrently. A very high
-        # value (e.g. 1200) floods the server into one giant batch (#running-req
-        # ~1197) which can trip a GPU memory-access fault in the MXFP4/tilelang
-        # NSA kernels on MI355X. Accuracy is unaffected by lowering it (same 1200
-        # questions, fewer in flight). Override with GSM8K_PARALLEL=<n>.
-        gsm8k_cmd=(
-            python3 /sgl-workspace/sglang/benchmark/gsm8k/bench_sglang.py 
-                --port "$PORT" 
-                --num-questions "${GSM8K_NUM_QUESTIONS:-1200}" 
-                --parallel "${GSM8K_PARALLEL:-1200}"
-        )
+        local gsm8k_cmd
+        if [ "$(accuracy_harness)" = "sgl-eval" ]; then
+            # ===== sgl-eval: the right grader for a thinking model =====
+            # benchmark/gsm8k/bench_sglang.py measures something else entirely:
+            # 5-shot raw completion (no chat template, so no thinking), 512-token
+            # cap, and "the last number anywhere in the output" as the answer.
+            # On GLM-5.3-Flash that scores 71-90% depending on unrelated server
+            # tuning, while sgl-eval's zero-shot + thinking + \boxed{} extraction
+            # scores 95.8% and is stable. Measured on this box, same server:
+            #   bench_sglang.py 1319q  89.4-90.3% | under GLM.sh's env tuning 71.3%
+            #   sgl-eval        1319q  95.83%
+            #
+            # Two independent wall-clock levers. The uncapped 64-thread reference
+            # run took 602.7s at 776 tok/s, and both levers were needed:
+            #
+            # GSM8K_MAX_TOKENS -- the dominant one, because the tail is serial.
+            # Token distribution over the 1319 questions: p50=84, p90=201,
+            # p99=2135, max=32768. Ten requests exceed 4096 and the slowest single
+            # request alone took 565.6s of the 602.7s wall -- no amount of
+            # concurrency touches that, it is one request emitting tokens one at a
+            # time. Capping at 4096 drops 260K of the 467K generated tokens (56%)
+            # and loses exactly one correct answer: 95.83% -> 95.75%, -0.08 points.
+            # Measured cost of tighter caps: 3072 also -0.08, 2048 -0.15,
+            # 1024 -0.30. Set GSM8K_MAX_TOKENS=32768 for the uncapped reference.
+            #
+            # GSM8K_THREADS -- sgl-eval's --num-threads is documented as
+            # "concurrent requests" and is the direct equivalent of
+            # bench_serving's --parallel (runner uses a pool of
+            # min(num_threads, num_samples) in-flight requests); there is no
+            # separate --parallel flag. The default is 64, which starves an 8-GPU
+            # box on this workload: 64 concurrent *short* answers only reached
+            # 776 tok/s, whereas 64 concurrent *long* ones on the same hardware
+            # sustained 3229 tok/s. So the deficit is idle GPU waiting on
+            # round-trips, not compute, and raising the ceiling is nearly free.
+            # 207K post-cap tokens at that rate is ~60-90s end to end.
+            gsm8k_cmd=(
+                sgl-eval run gsm8k
+                    --base-url "http://${HOST}:${PORT}/v1"
+                    --model "${SERVED_MODEL_NAME:-$MODEL_PATH}"
+                    --num-threads "${GSM8K_THREADS:-1200}"
+                    --max-tokens "${GSM8K_MAX_TOKENS:-4096}"
+                    --temperature "${GSM8K_TEMPERATURE:-1.0}"
+                    --top-p "${GSM8K_TOP_P:-0.95}"
+                    --seed "${GSM8K_SEED:-0}"
+                    --thinking
+                    --out-dir "${LOG_DIR}/sgl_eval_gsm8k"
+            )
+            if [ -n "${GSM8K_NUM_EXAMPLES:-}" ]; then
+                gsm8k_cmd+=(--num-examples "${GSM8K_NUM_EXAMPLES}")
+            fi
+        else
+            # --parallel caps how many GSM8K requests run concurrently. A very high
+            # value (e.g. 1200) floods the server into one giant batch (#running-req
+            # ~1197) which can trip a GPU memory-access fault in the MXFP4/tilelang
+            # NSA kernels on MI355X. Accuracy is unaffected by lowering it (same 1200
+            # questions, fewer in flight). Override with GSM8K_PARALLEL=<n>.
+            gsm8k_cmd=(
+                python3 /sgl-workspace/sglang/benchmark/gsm8k/bench_sglang.py
+                    --port "$PORT"
+                    --num-questions "${GSM8K_NUM_QUESTIONS:-1200}"
+                    --parallel "${GSM8K_PARALLEL:-1200}"
+            )
+        fi
         log_command "$gsm8k_logfile" "${gsm8k_cmd[@]}"
         echo "$gsm8k_logfile" >> "$FINISH_LOG"
+        report_gsm8k_score "$gsm8k_logfile"
     else
         echo "Found Accuracy_GSM8K.log in ${FINISH_LOG}. Skipping."
     fi
@@ -1128,6 +1388,9 @@ for PROF_MODE in "${PROF_SERVER_MODES[@]}"; do
     echo "[${PROF_SERVER_MODES[@]}], now is the end of ${PROF_MODE}"
     stop_server
 done
+
+set +x
+echo ">>> Results: ${BASE_LOG_DIR}"
 
 
 
