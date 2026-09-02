@@ -13,8 +13,10 @@
 #
 # The tag defaults to TP<tp>_EP<ep>, so the arm alone picks the leaf.
 #
-#   ./ix_agentx_glm52.sh --conc "1 2 4 8 10 12 16"   # bench-Agentic-TP4_EP4
+#   ./ix_agentx_glm52.sh --conc "1 4 8 12 16"        # bench-Agentic-TP4_EP4
 #   ./ix_agentx_glm52.sh --arm tp4 --smoke --conc 4  # bench-Agentic-TP4_EP1
+#   ./ix_agentx_glm52.sh --arm tp4 --quick --conc 16 # A/B iteration, ~30 min
+#   ./ix_agentx_glm52.sh --arm tp4 --hicache-size 0 --conc 16     # no host tier
 set -uo pipefail
 
 IX=/workspace
@@ -24,10 +26,13 @@ ARM="tep4"                 # tep4 = tp4/ep4 (board arm) | tp4 = tp4/ep1 | tp8 = 
 CONC_LIST=""
 DURATION="${DURATION:-3600}"
 FAST=0
+QUICK=0
 SMOKE=0
 DSA_PREFILL="tilelang"
 DSA_DECODE="tilelang"
 PORT_BASE=28800
+HICACHE_SIZE_GB=""
+DEVICE_POOL_TOKENS=""
 declare -a EXTRA_ENV=()
 
 usage() { sed -n '2,14p' "$0"; exit 1; }
@@ -42,7 +47,10 @@ while [[ $# -gt 0 ]]; do
         --dsa-prefill)  DSA_PREFILL="$2"; shift 2 ;;
         --dsa-decode)   DSA_DECODE="$2"; shift 2 ;;
         --port)     PORT_BASE="$2"; shift 2 ;;
+        --hicache-size)        HICACHE_SIZE_GB="$2"; shift 2 ;;
+        --device-pool-tokens)  DEVICE_POOL_TOKENS="$2"; shift 2 ;;
         --fast)     FAST=1; shift ;;
+        --quick)    QUICK=1; shift ;;
         --smoke)    SMOKE=1; shift ;;
         --env)      EXTRA_ENV+=("$2"); shift 2 ;;
         *) echo "unknown option: $1" >&2; usage ;;
@@ -113,9 +121,53 @@ export DSA_DECODE_BACKEND="$DSA_DECODE"
 export SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION="${SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION:-0.04}"
 for kv in "${EXTRA_ENV[@]:-}"; do [ -n "$kv" ] && export "${kv?}"; done
 
+# Absolute per-rank host tier. Passed straight through as HICACHE_SIZE, which
+# the recipe forwards to --hicache-size; SGLang then divides by the pool's real
+# bytes/token itself. 0 disables HiCache.
+#
+# This used to convert GB -> HICACHE_RATIO because the recipe only exposed a
+# ratio. That conversion was wrong twice over: it assumed 78 layers when the
+# pool packs 79 (78 target + 1 MTP draft) since v0.5.18, and a ratio multiplies
+# the device pool, which drifts ~6% between boots with HBM fragmentation. The
+# same "--hicache-size 270" landed on 356.8 GB/rank one boot and 335.6 the
+# next. The recipe now takes the absolute size, so the conversion is gone.
+#
+# Leaving the size unset lets the recipe pick from its own per-concurrency
+# table, which is what the CI sweep runs.
+if [ -n "$HICACHE_SIZE_GB" ]; then
+    export HICACHE_SIZE="$HICACHE_SIZE_GB"
+    echo "HICACHE_SIZE=${HICACHE_SIZE_GB} GB/rank (absolute, overriding the recipe's per-conc table)"
+fi
+if [ -n "$DEVICE_POOL_TOKENS" ]; then
+    echo "WARNING: --device-pool-tokens is obsolete since sizing stopped going through a ratio; ignoring '$DEVICE_POOL_TOKENS'." >&2
+fi
+
 if [ "$FAST" = "1" ]; then
     export AIPERF_EXPERIMENTAL_FAST=1   # duration 1200s, 1 warmup req per lane
     TAG="${TAG}-fast"
+fi
+# A/B iteration mode: halve warmup, 10-minute window. conc 16 lands in ~30 min
+# against ~100 for a board run, which is the point - it is for answering "did
+# the change I just made help", not for producing a submittable number.
+#
+# Two things this costs, both of which matter when reading the output:
+#
+# Warmup is what fills the host tier, so halving it means the L2 starts the
+# window less full and load-back traffic is lower than a board run would see.
+# That compresses any HiCache-related delta rather than inventing one, so a
+# win here is real but understated. --fast is worse than useless for HiCache
+# work: 1 warmup request per lane leaves the tier nearly empty and the delta
+# vanishes entirely. Do not reach for it here.
+#
+# A 600s window is under AIPerf's 900s threshold, so results carry
+# submission_valid=false. Compare these runs only against each other, and only
+# against runs with the same warmup and duration - the 60-minute sweeps are
+# not a valid baseline for them.
+if [ "$QUICK" = "1" ]; then
+    export AIPERF_WARMUP_REQUESTS_PER_LANE="${AIPERF_WARMUP_REQUESTS_PER_LANE:-5}"
+    DURATION=600
+    TAG="${TAG}-quick"
+    echo "QUICK mode: warmup ${AIPERF_WARMUP_REQUESTS_PER_LANE} req/lane (default 10), ${DURATION}s window (submission_valid=false)"
 fi
 if [ "$SMOKE" = "1" ]; then
     # Plumbing check only: one warmup request per lane and a sub-900s window,
@@ -135,7 +187,7 @@ ROOT="$BENCH_HOME/results/$MODEL_NAME/$DOCKER_FILENAME/bench-Agentic-$TAG"
 mkdir -p "$ROOT"
 SWEEP_LOG="$ROOT/sweep.log"
 echo "=== $(date -Is) tag=$TAG arm=$ARM tp=$TP ep=$EP dsa=$DSA_PREFILL/$DSA_DECODE duration=$DURATION conc=($CONC_LIST) ===" | tee -a "$SWEEP_LOG"
-env | grep -E '^SGLANG_|^DSA_' | sort | tee -a "$SWEEP_LOG"
+env | grep -E '^SGLANG_|^DSA_|^HICACHE_' | sort | tee -a "$SWEEP_LOG"
 
 for CONC in $CONC_LIST; do
     export CONC DURATION
@@ -181,6 +233,12 @@ for CONC in $CONC_LIST; do
         > "$RESULT_DIR/recipe.log" 2>&1
     rc=$?
     echo ">>> $(date -Is) conc=$CONC exit=$rc" | tee -a "$SWEEP_LOG"
+
+    # allocated_cpu_dram_gb in the result JSON is InferenceX's budget, not what
+    # the run took: the hicache recipe sizes the pool itself and never checks
+    # back against it. Read the pinned bytes out of server.log so the result
+    # records the real figure, indexer sidecar included.
+    python3 "$BENCH_HOME/tools/record_host_dram.py" "$RESULT_DIR" 2>&1 | tee -a "$SWEEP_LOG"
 
     # The recipe leaves the server running when it exits non-zero mid-flight.
     pkill -9 -f 'sglang.launch_server' 2>/dev/null
