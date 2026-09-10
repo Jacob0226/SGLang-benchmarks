@@ -909,13 +909,20 @@ warmup() {
 
 # Which GSM8K harness to use: sgl-eval for thinking models, the in-tree
 # bench_sglang.py otherwise. Force either way with ACCURACY_HARNESS=sgl-eval|bench_sglang.
+#
+# The GLM-5.3 arm is deliberately platform-independent. sgl-eval is not a ROCm
+# workaround -- it is the only harness that grades this model the way it answers
+# (zero-shot chat template, thinking enabled, \boxed{} extraction). bench_sglang.py
+# is 5-shot raw completion capped at 512 tokens and reads "the last number anywhere
+# in the output", which costs the same server 6-25 points. So MI355X and B200 must
+# both take this arm or their accuracy columns are not the same measurement.
 accuracy_harness() {
     if [ -n "${ACCURACY_HARNESS:-}" ]; then
         echo "$ACCURACY_HARNESS"
         return 0
     fi
     case "${MODEL_NAME}" in
-        *GLM-5.3-Flash*)
+        *GLM-5.3*)
             if command -v sgl-eval >/dev/null 2>&1; then
                 echo "sgl-eval"
             else
@@ -1004,7 +1011,7 @@ accuracy_test() {
                 sgl-eval run gsm8k
                     --base-url "http://${HOST}:${PORT}/v1"
                     --model "${SERVED_MODEL_NAME:-$MODEL_PATH}"
-                    --num-threads "${GSM8K_THREADS:-1200}"
+                    --num-threads "${GSM8K_THREADS:-1319}"
                     --max-tokens "${GSM8K_MAX_TOKENS:-4096}"
                     --temperature "${GSM8K_TEMPERATURE:-1.0}"
                     --top-p "${GSM8K_TOP_P:-0.95}"
@@ -1024,8 +1031,8 @@ accuracy_test() {
             gsm8k_cmd=(
                 python3 /sgl-workspace/sglang/benchmark/gsm8k/bench_sglang.py
                     --port "$PORT"
-                    --num-questions "${GSM8K_NUM_QUESTIONS:-1200}"
-                    --parallel "${GSM8K_PARALLEL:-1200}"
+                    --num-questions "${GSM8K_NUM_QUESTIONS:-1319}"
+                    --parallel "${GSM8K_PARALLEL:-1319}"
             )
         fi
         log_command "$gsm8k_logfile" "${gsm8k_cmd[@]}"
@@ -1200,6 +1207,71 @@ if ! is_rocm_gpu_env; then
     fi
 fi
 
+# ===================== sgl-eval (GSM8K harness for thinking models) =====================
+# accuracy_harness() selects sgl-eval for GLM-5.3-Flash and quietly falls back to
+# benchmark/gsm8k/bench_sglang.py when it is missing. That fallback scores the SAME
+# server 6-25 points lower (71-90% vs 95.8%) because it is 5-shot raw completion with
+# no thinking and a 512-token cap, so a run that takes it produces an accuracy number
+# that compares to nothing. Install the harness here instead of relying on whoever
+# built the container.
+#
+# Pinned to a231b7a4 because that is the revision behind the ~97% reference runs: it
+# writes ns_commit_sha 645cf567ff08c0ae9cc3fc8e1edbb975b3067816 into metrics.json,
+# which is the value the reference metrics.json carries. Do not try to install
+# 645cf567 itself -- it is a field sgl-eval computes, not a fetchable ref, and pip
+# fails on it with "not our ref".
+#
+#   SGL_EVAL_REF=pypi ./GLM.sh          # take the released wheel instead
+#   SGL_EVAL_REF=<git-sha> ./GLM.sh     # some other revision
+#   SKIP_SGL_EVAL_INSTALL=1 ./GLM.sh    # leave the environment alone
+install_sgl_eval() {
+    if [ "${SKIP_SGL_EVAL_INSTALL:-0}" = "1" ] || [ "${SKIP_GSM8K:-0}" = "1" ]; then
+        return 0
+    fi
+    # Only models whose harness is sgl-eval; ACCURACY_HARNESS forces either way.
+    # Keep this arm identical to accuracy_harness()'s -- if the two disagree, one
+    # platform installs the harness and the other silently grades with the wrong one.
+    if [ "${ACCURACY_HARNESS:-}" != "sgl-eval" ]; then
+        if [ -n "${ACCURACY_HARNESS:-}" ]; then
+            return 0
+        fi
+        case "${MODEL_NAME}" in
+            *GLM-5.3*) ;;
+            *) return 0 ;;
+        esac
+    fi
+    if command -v sgl-eval >/dev/null 2>&1; then
+        echo "[info] sgl-eval already present at $(command -v sgl-eval); skipping install."
+        return 0
+    fi
+
+    local ref="${SGL_EVAL_REF:-a231b7a439b235090ff7baa30778fa2b514309ae}"
+    local spec="git+https://github.com/sgl-project/sgl-eval.git@${ref}"
+    [ "$ref" = "pypi" ] && spec="sgl-eval"
+    echo ">>> Installing GSM8K harness: ${spec}"
+    # Widen only as far as each image needs: plain works on the venv-based ROCm
+    # images, --break-system-packages is for the NV images' PEP 668 "externally
+    # managed" Python, --user for a container that is not running as root.
+    if ! python3 -m pip install "$spec" \
+        && ! python3 -m pip install --break-system-packages "$spec" \
+        && ! python3 -m pip install --user --break-system-packages "$spec"; then
+        echo "[warn] sgl-eval install failed. accuracy_harness() will fall back to" \
+             "bench_sglang.py, whose score is NOT comparable to the published" \
+             "GLM-5.3-Flash numbers. Re-run with SKIP_GSM8K=1 to skip accuracy entirely."
+        return 0
+    fi
+    # --user drops the console script in ~/.local/bin, which is not on PATH in
+    # these images -- without this the harness would still silently fall back.
+    if ! command -v sgl-eval >/dev/null 2>&1 && [ -x "${HOME}/.local/bin/sgl-eval" ]; then
+        export PATH="${HOME}/.local/bin:${PATH}"
+    fi
+    if command -v sgl-eval >/dev/null 2>&1; then
+        echo "[info] sgl-eval installed at $(command -v sgl-eval)."
+    else
+        echo "[warn] pip reported success but 'sgl-eval' is not on PATH."
+    fi
+}
+install_sgl_eval
 
 
 # ===================== GPU clock sanity check (NVIDIA only) =====================
