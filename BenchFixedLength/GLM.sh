@@ -98,18 +98,6 @@ _MODEL_LEAF=$(basename "${_MODEL_PATH_TRIMMED}")
 _MODEL_ORG=$(basename "$(dirname "${_MODEL_PATH_TRIMMED}")")
 MODEL_NAME="${_MODEL_ORG}_${_MODEL_LEAF}"
 
-# Results tree name. Defaults to the <org>_<leaf> form above, which is what the
-# existing amd_GLM-5.2-MXFP4 / nvidia_GLM-5.2-NVFP4 trees use. GLM-5.3-Flash is the
-# exception: its results tree was created as results/GLM-5.3-Flash/ by the PR #36607
-# reproduction, so keep writing there rather than forking a second
-# zai-org_GLM-5.3-Flash/ tree for the same model. Override with MODEL_DIR_NAME=...
-if [ -z "${MODEL_DIR_NAME:-}" ]; then
-    case "${MODEL_NAME}" in
-        *GLM-5.3-Flash*) MODEL_DIR_NAME="GLM-5.3-Flash" ;;
-        *)               MODEL_DIR_NAME="${MODEL_NAME}" ;;
-    esac
-fi
-
 # ===================== Quantization auto-detection (matches InferenceX) =====================
 # Pick --quantization and --mem-fraction-static based on the model name.
 # Mirrors SemiAnalysisAI/InferenceX recipes in benchmarks/single_node/
@@ -425,7 +413,7 @@ DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
 # MTP stays in the path so an MTP run and its non-MTP twin can share a --tag
 # without overwriting each other.
 LEAF_TAG="${SPECIAL_TAG#-}-Fixed${MTP_TAG}${USER_TAG}"
-LOG_DIR="$HOME/SGLang-benchmarks/results/${MODEL_DIR_NAME}/$DOCKER_FILENAME/${LEAF_TAG}"
+LOG_DIR="$HOME/SGLang-benchmarks/results/${MODEL_NAME}/$DOCKER_FILENAME/${LEAF_TAG}"
 FINISH_LOG="$LOG_DIR/Finish.log"
 # Single continuous server log. Exported so log_command() can stamp a banner into
 # it before each client command (warmup / GSM8K / per-config warmup / bench), so
