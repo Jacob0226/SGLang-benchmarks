@@ -888,6 +888,29 @@ check_mhc_markers() {
     fi
 }
 
+# WARMUP_CONCURRENCY=1 is load-bearing on GLM-5.3-Flash, not a tuning choice.
+# Several ~1000-token prefills arriving together as the FIRST traffic a fresh
+# server sees put it into a state where later requests stop terminating, for the
+# life of the process. This warmup at --max-concurrency 4 was exactly that, and
+# it runs before accuracy_test, so every GSM8K number this script produced for
+# the model was graded on an already-broken server: 20.32% and 31.01% on two
+# runs against ~97% from a hand-written launch, with 65-75% of completions
+# running to the token cap.
+#
+# Serialising it removes the trigger and keeps the point of the warmup, which is
+# to JIT-compile the kernels for a 1024-token prefill -- the same shapes get
+# compiled, just not concurrently. It also inoculates the server: once anything
+# has been served, the same concurrent batch is harmless, which is why the bench
+# loop's own in1024/conc4 config is safe afterwards.
+#
+# Shortening --random-input instead would not work: it would stop warming the
+# 1024-token prefill path this exists to warm.
+#
+# Measured on rocm/sgl-dev:v0.5.19-rocm720-mi35x-20260909, TP4, GSM8K 1,319 at
+# 1319 threads: concurrency 4 -> poisoned 6/6 (20-35%); concurrency 1 -> 96.74%.
+# The defect is upstream, not in the ROCm PRs: it reproduces on sgl-project/
+# sglang#36607's own tree and neither that patch nor the Day-0 stack touches the
+# linear-attention state path. Full write-up in GLM53-Flash-ROCm-PrStack_Repro.md.
 warmup() {
     local warmup_log="${LOG_DIR}/warmup.log"
     local warmup_cmd=(
@@ -899,7 +922,7 @@ warmup() {
         --random-input 1024
         --random-output 16
         --random-range-ratio "${random_range_ratio}"
-        --max-concurrency 4 
+        --max-concurrency "${WARMUP_CONCURRENCY:-1}"
         --num-prompt 4 
         --output-file /dev/null
         --ready-check-timeout-sec "${READY_CHECK_TIMEOUT_SEC:-600}"
