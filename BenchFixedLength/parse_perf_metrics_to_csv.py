@@ -130,6 +130,19 @@ def get_bench_meta(path: Path):
     return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
+def detect_model_from_path(input_dir: Path):
+    """結果樹是 results/<model>/<docker>/<leaf_tag>，取 <model>。
+
+    以 'results' 這一層為錨點往下數一層，而不是固定往上數兩層，這樣從
+    results/ 以外的地方指進來也不會拿到錯的名字。找不到就退回上兩層的名字。
+    """
+    parts = input_dir.resolve().parts
+    for i in range(len(parts) - 1, -1, -1):
+        if parts[i] == "results" and i + 1 < len(parts):
+            return parts[i + 1]
+    return input_dir.resolve().parent.parent.name
+
+
 def detect_tp_from_path(input_dir: Path):
     """從 input_dir 名稱猜 TP 大小 (例如 'GLM-5-FP8-bench-0507_TP4' -> 4)。
     找不到則回傳 None，讓呼叫端套用預設或 CLI 指定的值。"""
@@ -460,7 +473,14 @@ def write_csv(records, column_order, output_csv, *, tp, accuracy=None,
 def main():
     parser = argparse.ArgumentParser(description="Parse benchmark logs sorted by concurrency number")
     parser.add_argument("--input_dir", "-i", required=True, help="Input directory")
-    parser.add_argument("--output", "-o", required=True, help="Output csv file")
+    parser.add_argument(
+        "--output",
+        "-o",
+        default=None,
+        help="Output csv file. Defaults to "
+             "<input_dir>/{Device}-{model}-TP{n}-perf.csv, e.g. "
+             "MI355X-zai-org_GLM-5.3-Flash-TP4-perf.csv.",
+    )
     parser.add_argument(
         "--tp",
         type=int,
@@ -552,6 +572,15 @@ def main():
             tp_size = 8
             tp_source = "default fallback"
     print(f"TP size: {tp_size} ({tp_source})")
+
+    # 檔名規則 {Device}-{model}-{TPX}-perf.csv，讓不同機器/模型/TP 的 CSV
+    # 放在一起也不會撞名，也不用每次手打 -o。
+    if args.output is None:
+        model_name = detect_model_from_path(input_path)
+        args.output = str(
+            input_path / f"{args.hardware}-{model_name}-TP{tp_size}-perf.csv"
+        )
+        print(f"Output (auto): {args.output}")
 
     # 解析第二份 table 的 metadata
     variant = args.variant or input_path.name
