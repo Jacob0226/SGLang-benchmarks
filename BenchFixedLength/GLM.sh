@@ -141,6 +141,8 @@ is_rocm_gpu_env() {
 
 QUANT_ARGS=()
 MEM_FRACTION_STATIC="0.85"
+# See the --disable-radix-cache block in start_server().
+_radix_default=1
 # Set to "true" by --dual-stream-rocm (see start_server()) — needed so MoE.forward
 # takes forward_normal_dual_stream instead of the fused shared-expert path.
 NEED_DISABLE_SHARED_FUSION="false"
@@ -149,6 +151,33 @@ case "${MODEL_NAME}" in
         QUANT_ARGS=(--quantization modelopt_fp4)
         MEM_FRACTION_STATIC="0.8"
         case "${MODEL_NAME}" in
+            *GLM-5.3*)
+                # GLM-5.3-Flash NVFP4 (nvidia/GLM-5.3-Flash-NVFP4). This arm has to
+                # repeat what the *GLM-5.3* arm below does, because a name carrying
+                # both NVFP4 and GLM-5.3 matches *NVFP4* first and never reaches it --
+                # which is how this checkpoint used to end up served as if it were the
+                # FP8 one. NVFP4 is a Blackwell-only W4A4 path (Hopper cannot serve it
+                # at all), so unlike the FP8 arm there is no ROCm case to split on.
+                #
+                # The cookbook's NVFP4 cells differ from its FP8 cells in exactly two
+                # places: flashinfer_cutlass rather than flashinfer_trtllm, and
+                # mem-fraction 0.85 rather than 0.80 (W4A4 weights are half the size,
+                # so more of the budget can go to the pools).
+                #
+                # KV/DSA: the published NVFP4 cell pairs BF16 KV with TileLang, and
+                # its GSM8K/AIME numbers were measured that way. trtllm + fp8_e4m3 is
+                # the cookbook's FP8-KV overlay on the same recipe -- a TP4-only speed
+                # variant -- and that is what we default to here, so this and the FP8
+                # sweep differ only in the weights. For the accuracy-reference pairing:
+                #   KV_CACHE_DTYPE=bfloat16 DSA_PREFILL_BACKEND=tilelang \
+                #   DSA_DECODE_BACKEND=tilelang ./GLM.sh --model .../GLM-5.3-Flash-NVFP4
+                [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
+                MEM_FRACTION_STATIC="0.85"
+                MOE_RUNNER_DEFAULT="flashinfer_cutlass"
+                DSA_PREFILL_BACKEND="${DSA_PREFILL_BACKEND:-trtllm}"
+                DSA_DECODE_BACKEND="${DSA_DECODE_BACKEND:-trtllm}"
+                KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
+                ;;
             *GLM-5.2*)
                 # GLM-5.2 (glm_moe_dsa): NVIDIA's HF card launches at TP=8
                 # But I need TP4
@@ -572,9 +601,22 @@ start_server() {
             --watchdog-timeout "${WATCHDOG_TIMEOUT:-1200}"
             --mem-fraction-static "$MEM_FRACTION_STATIC"
             --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_e4m3}"
-            --disable-radix-cache
             --model-loader-extra-config "{\"enable_multithread_load\": true, \"num_threads\": ${WEIGHT_LOAD_THREADS:-32}}"
     )
+    # Prefix reuse off for every model so each (shape, concurrency) cell measures a
+    # cold prefill. This is NOT the cosmetic difference from the cookbook's flag
+    # list that it looks like: bench_serving reuses the same seed for every cell,
+    # so the tree carries prompts over from the previous cell and the sweep grades
+    # a warm cache from the second cell on. Measured 2026-09-15 on GLM-5.3-Flash
+    # TP4/B200 with the tree left enabled, at 1024 input (short enough that
+    # chunked prefill cannot account for it, so every hit is real cross-request
+    # reuse): conc4 4.5% of prefill tokens cached -- it runs first, on an empty
+    # tree -- then 47.7 / 47.8 / 46.4 / 45.5% at conc 8 / 16 / 32 / 64. Half the
+    # prefill silently disappears and TTFT with it. Set DISABLE_RADIX_CACHE=0 only
+    # if measuring the cache is the point.
+    if [ "${DISABLE_RADIX_CACHE:-$_radix_default}" = "1" ]; then
+        cmd+=(--disable-radix-cache)
+    fi
     if [ ${#QUANT_ARGS[@]} -gt 0 ]; then
         cmd+=("${QUANT_ARGS[@]}")
     fi
@@ -654,12 +696,19 @@ start_server() {
         #       ROCm branch above documents the failure in full). Choosing trtllm
         #       keeps it unreachable. Switch both backends AND the KV dtype
         #       together if you want the BF16 pairing.
-        #   --moe-runner-backend deep_gemm
-        #       Every CUDA cell in the cookbook uses deep_gemm for these FP8
-        #       weights. flashinfer_trtllm (the `else` branch default) is the
-        #       NVFP4 path.
-        #   --ep-size = TP
-        #       The cookbook runs expert parallel at the same width as TP.
+        #   --moe-runner-backend flashinfer_trtllm
+        #       Which runner the cookbook picks tracks the hardware, not the FP8
+        #       weights: its Blackwell cells (b200 / b300 / gb300 / gb200) all use
+        #       flashinfer_trtllm and only the Hopper cells (h100 / h200) use
+        #       deep_gemm. This branch asked for deep_gemm until 2026-09-15, which
+        #       measured a runner no published Blackwell number uses. The NVFP4
+        #       checkpoint wants flashinfer_cutlass instead and sets
+        #       MOE_RUNNER_DEFAULT in the model-detection block to say so.
+        #   no --ep-size
+        #       The Blackwell cells do not set it, so the MoE stays pure TP
+        #       (sglang's default ep_size=1). Expert parallel at TP width is a
+        #       Hopper-cell thing (--ep-size 8 alongside --tp-size 8). Set EP_SIZE
+        #       to put the flag back.
         # Override any of them with SERVER_EXTRA_ARGS (appended later -> wins).
         #
         # --attention-backend is deliberately not set, matching the reference
@@ -672,10 +721,12 @@ start_server() {
             --chunked-prefill-size 16384
             --dsa-prefill-backend "${DSA_PREFILL_BACKEND:-trtllm}"
             --dsa-decode-backend "${DSA_DECODE_BACKEND:-trtllm}"
-            --moe-runner-backend "${MOE_RUNNER_BACKEND:-deep_gemm}"
-            --ep-size "${EP_SIZE:-$TP_SIZE}"
+            --moe-runner-backend "${MOE_RUNNER_BACKEND:-${MOE_RUNNER_DEFAULT:-flashinfer_trtllm}}"
             --context-length "${CONTEXT_LENGTH:-131072}"
         )
+        if [ -n "${EP_SIZE:-}" ]; then
+            cmd+=(--ep-size "$EP_SIZE")
+        fi
     elif [[ "${MODEL_NAME}" == *GLM-5.2* ]]; then
         # GLM-5.2 (glm_moe_dsa) on B200: use NVIDIA's OFFICIAL HF launch settings
         # verbatim (https://huggingface.co/nvidia/GLM-5.2-NVFP4):
@@ -783,7 +834,12 @@ start_server() {
     fi
 
     if [ "$MTP_ENABLED" == "true" ]; then
-        # EAGLE chain matches InferenceX glm5_fp8_mi355x_mtp.sh: (steps=3, topk=1, draft=4).
+        # The EAGLE chain is per-model. InferenceX glm5_fp8_mi355x_mtp.sh runs
+        # (steps=3, topk=1, draft=4) and that stays the default, but every
+        # GLM-5.3-Flash cell in the cookbook that turns MTP on -- the Low Latency
+        # column on all six platforms, FP8 and NVFP4 alike -- runs (5, 1, 6). Taking
+        # the GLM-5 chain on GLM-5.3-Flash verifies 4 draft tokens where the
+        # published numbers verify 6, so its speedup is not the measured one.
         # SGLANG_ENABLE_SPEC_V2=1 enables sglang's new spec scheduler (also set by InferenceX).
         # On MI355X we keep --nsa-{prefill,decode}-backend tilelang from above; do NOT
         # override --attention-backend (InferenceX doesn't either, tilelang NSA + EAGLE works).
@@ -793,10 +849,14 @@ start_server() {
         # topk>1 is rejected by the DSA backend, so tree runs need triton.
         echo ">>> Speculative Decoding (MTP) is ENABLED." | tee -a "$logfile"
         export SGLANG_ENABLE_SPEC_V2=1
+        case "${MODEL_NAME}" in
+            *GLM-5.3*) _spec_steps=5; _spec_draft=6 ;;
+            *)         _spec_steps=3; _spec_draft=4 ;;
+        esac
         cmd+=(
             --speculative-algorithm EAGLE
-            --speculative-num-draft-tokens "${SPEC_DRAFT_TOKENS:-4}"
-            --speculative-num-steps "${SPEC_NUM_STEPS:-3}"
+            --speculative-num-draft-tokens "${SPEC_DRAFT_TOKENS:-$_spec_draft}"
+            --speculative-num-steps "${SPEC_NUM_STEPS:-$_spec_steps}"
             --speculative-eagle-topk "${SPEC_TOPK:-1}"
         )
     fi
