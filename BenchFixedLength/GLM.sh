@@ -163,14 +163,11 @@ case "${MODEL_NAME}" in
                 ;;
         esac
         ;;
-    *MXFP4*)
-        # MXFP4 self-declares; shared experts are also MXFP4 -> fusion OK.
-        # InferenceX MI355X main sweep is TP=2 but its TP=4 entry is the
-        # one that lines up with B200's TP=4 NVFP4 sweep, so default to 4
-        # here for direct MI355X-vs-B200 comparison. Override with --tp 2
-        # to match InferenceX's MXFP4 main sweep.
-        [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
-        ;;
+    # GLM-5.3-Flash must be matched before the generic *MXFP4* arm below:
+    # amd/GLM-5.3-Flash-Quark-MXFP4 satisfies both, and bash case takes the
+    # first match. Taking the MXFP4 arm leaves the ROCm DSA backend at this
+    # script's triton default, which rejects index_kpool > 1 at decode graph
+    # capture with NotImplementedError.
     *GLM-5.3*)
         # 320B total / 18B active, FP8 weights ~306GB on disk -> ~77GB/GPU at
         # TP=4, which fits a 192GB B200 with room for the KV and KDA pools and
@@ -220,6 +217,14 @@ case "${MODEL_NAME}" in
             KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
             MEM_FRACTION_STATIC="0.8"
         fi
+        ;;
+    *MXFP4*)
+        # MXFP4 self-declares; shared experts are also MXFP4 -> fusion OK.
+        # InferenceX MI355X main sweep is TP=2 but its TP=4 entry is the
+        # one that lines up with B200's TP=4 NVFP4 sweep, so default to 4
+        # here for direct MI355X-vs-B200 comparison. Override with --tp 2
+        # to match InferenceX's MXFP4 main sweep.
+        [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
         ;;
     *FP8*)
         QUANT_ARGS=(--quantization fp8)

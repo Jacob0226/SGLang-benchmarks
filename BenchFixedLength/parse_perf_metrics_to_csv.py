@@ -181,17 +181,28 @@ def detect_image_from_path(input_dir: Path):
 
 
 def detect_accuracy_from_dir(input_dir: Path):
-    """從 input_dir 內的 Accuracy*.log 抓 'Accuracy: 0.943' 數值。
-    找不到 (沒檔案 / 沒這行) 則回傳 None。"""
+    """從 input_dir 內的 Accuracy*.log 抓準確率，回傳 0-1 的字串。
+
+    兩種格式都吃：
+      - bench_sglang.py 舊格式：``Accuracy: 0.943``
+      - sgl-eval 格式：    ``* score           =  97.12%``
+    找不到 (沒檔案 / 沒這行) 則回傳 None。
+    """
     acc_re = re.compile(r"Accuracy:\s*([0-9.]+)")
+    score_re = re.compile(r"^\s*\*?\s*score\s*=\s*([0-9.]+)\s*%", re.IGNORECASE)
     for log in sorted(input_dir.glob("Accuracy*.log")):
         try:
             with open(log, "r", encoding="utf-8") as f:
                 last = None
-                for line in f:
+                # sgl-eval writes progress with \r, so split on it too
+                for line in re.split(r"[\r\n]", f.read()):
                     m = acc_re.search(line)
                     if m:
                         last = m.group(1)
+                        continue
+                    m = score_re.search(line)
+                    if m:
+                        last = f"{float(m.group(1)) / 100:.4f}"
                 if last is not None:
                     return last
         except Exception:
