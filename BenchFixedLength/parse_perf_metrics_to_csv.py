@@ -13,9 +13,45 @@ kv_pattern = re.compile(r"^(.*?):\s+(.*)$")
 meta_pattern = re.compile(r"in(\d+)_out(\d+)_conc_?(\d+)")
 # 從 input_dir 路徑抓 TP 大小，例如 ".../GLM-5-FP8-bench-0507_TP4"
 tp_pattern = re.compile(r"[Tt][Pp](\d+)")
-# 從路徑名稱嗅 precision / spec_method
-precision_pattern = re.compile(r"\b(fp4|fp8|fp16|bf16)\b", re.IGNORECASE)
+# 從路徑名稱嗅 precision / spec_method。
+# FP4 有兩種互不相容的格式 (NVIDIA NVFP4 / OCP MXFP4)，而且它們在路徑裡一律寫成
+# 'NVFP4' / 'MXFP4' -- 沒有前置詞界，所以舊的 \bfp4\b 永遠漏掉這兩個。長的排前面，
+# 讓 'GLM-5.3-Flash-NVFP4' 命中 nvfp4 而不是退化成 fp4。
+precision_pattern = re.compile(r"(nvfp4|mxfp4|fp4|fp8|fp16|bf16)\b", re.IGNORECASE)
 mtp_pattern = re.compile(r"(?:^|[_\W])mtp(?:[_\W]|$)", re.IGNORECASE)
+
+PRECISION_CHOICES = ["nvfp4", "mxfp4", "fp4", "fp8", "fp16", "bf16"]
+
+# sglang 的 "Load weight end." 行帶著真正生效的量化方式，比路徑名稱可靠:
+#   quant=modelopt_fp4, quant_algo=NVFP4   -> nvfp4
+#   quant=fp8, fmt=e4m3                    -> fp8
+#   quant=quark                            -> AMD Quark，格式要看路徑 (通常 mxfp4)
+load_weight_pattern = re.compile(
+    r"Load weight end\..*?quant=(?P<quant>[\w.]+)"
+    r"(?:.*?quant_algo=(?P<algo>[\w.]+))?",
+    re.IGNORECASE,
+)
+
+# GPU 架構標記。sglang 會把它寫進 FlashInfer/AITER 的 autotune cache 路徑，
+# 所以即使事後在另一台機器 parse，也還原得出這份結果是哪種硬體跑的。
+arch_pattern = re.compile(r"\b(gfx\d{3,4}[a-z]?|sm_?(?:\d{2,3}))\b", re.IGNORECASE)
+
+# 架構 -> 代表機種。同一個架構可能對到多張卡 (gfx950 = MI350X/MI355X，
+# sm100 = B200/B300/GB200/GB300)，所以這只是「問不到實體 GPU 時」的退路，
+# 真正精確的名字來自 detect_gpu_from_smi()。
+ARCH_TO_HARDWARE = {
+    "gfx942": "MI300X",
+    "gfx950": "MI355X",
+    "sm90": "H100",
+    "sm100": "B200",
+    "sm103": "B300",
+}
+
+# nvidia-smi / rocm-smi 回報的完整名稱 -> 表格用的短名
+GPU_NAME_PATTERN = re.compile(
+    r"\b(GB300|GB200|B300|B200|H200|H100|A100|MI355X|MI350X|MI325X|MI300X)\b",
+    re.IGNORECASE,
+)
 
 # 第一份 table 的 derived 欄位 (沿用原本格式，附加在 CSV 尾巴)
 INTERACTIVITY_COL = "Interactivity (tok/s/user)"
@@ -154,12 +190,118 @@ def detect_tp_from_path(input_dir: Path):
 
 
 def detect_precision_from_path(input_dir: Path):
-    """從路徑名稱抓 precision (fp4/fp8/...)，找不到回傳空字串。"""
+    """從路徑名稱抓 precision (nvfp4/mxfp4/fp8/...)，找不到回傳空字串。"""
     for part in (input_dir.name, *(p.name for p in input_dir.parents)):
         m = precision_pattern.search(part)
         if m:
             return m.group(1).lower()
     return ""
+
+
+def iter_server_logs(input_dir: Path):
+    """這次 run 自己的 server log。GLM.sh 一個 run 只寫一份 server_<model>.log。"""
+    return sorted(input_dir.glob("server_*.log"))
+
+
+def _scan_logs(input_dir: Path, pattern, limit_bytes=4_000_000):
+    """在 server log 前段找第一個 match。
+
+    只讀前幾 MB：要找的兩樣東西 (權重量化、autotune 的架構標記) 都在啟動階段就
+    印完了，而一份跑完整 sweep 的 server log 可以到幾百 MB。
+    """
+    for log in iter_server_logs(input_dir):
+        try:
+            with open(log, "rb") as f:
+                text = f.read(limit_bytes).decode("utf-8", "ignore")
+        except OSError:
+            continue
+        m = pattern.search(text)
+        if m:
+            return m
+    return None
+
+
+def detect_precision_from_logs(input_dir: Path):
+    """從 server log 的 "Load weight end." 行判定實際生效的量化格式。
+
+    這比路徑名稱可信，因為它是 sglang 載完權重後自己回報的。回傳空字串代表
+    沒找到、或找到的是 AMD Quark 這種不自報 FP4 子格式的包裝 (交給路徑去判)。
+    """
+    m = _scan_logs(input_dir, load_weight_pattern)
+    if not m:
+        return ""
+    algo = (m.group("algo") or "").lower()
+    if algo in ("nvfp4", "mxfp4"):
+        return algo
+    quant = (m.group("quant") or "").lower()
+    if quant in ("fp8", "w8a8_fp8", "blockwise_int8"):
+        return "fp8"
+    if quant == "modelopt_fp4":
+        # ModelOpt 只產 NVFP4；沒印 quant_algo 的舊版走這裡。
+        return "nvfp4"
+    # quark / compressed-tensors 等包裝沒說子格式 -> 讓呼叫端退回路徑判斷
+    return ""
+
+
+def detect_arch_from_logs(input_dir: Path):
+    """從 server log 抓 GPU 架構標記 (gfx950 / sm100)，找不到回傳空字串。"""
+    m = _scan_logs(input_dir, arch_pattern)
+    if not m:
+        return ""
+    return m.group(1).lower().replace("sm_", "sm")
+
+
+def detect_gpu_from_smi():
+    """問本機 GPU 的型號。跑在別台機器 parse 時會回空字串。"""
+    import shutil
+    import subprocess
+
+    probes = [
+        (["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"]),
+        (["rocm-smi", "--showproductname"]),
+    ]
+    for cmd in probes:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            out = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=20
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        m = GPU_NAME_PATTERN.search(out)
+        if m:
+            return m.group(1).upper()
+    return ""
+
+
+def detect_hardware(input_dir: Path):
+    """判定這份結果是哪張卡跑的，回傳 (名稱, 來源說明)。
+
+    順序是刻意的。路徑和 log 都綁在這次 run 上，本機 GPU 不是 -- 在 B200 上
+    parse 一份 MI355X 的結果是常有的事，所以實體 GPU 只能當最後的退路，而且
+    只有在它跟 log 記錄的架構相符時才採信。
+    """
+    for part in (input_dir.name, *(p.name for p in input_dir.parents)):
+        m = GPU_NAME_PATTERN.search(part)
+        if m:
+            return m.group(1).upper(), "path"
+
+    arch = detect_arch_from_logs(input_dir)
+    local = detect_gpu_from_smi()
+    if arch:
+        family = ARCH_TO_HARDWARE.get(arch, "")
+        # 本機 GPU 跟 log 的架構是同一族 -> 用本機回報的精確型號 (B200 vs B300、
+        # MI350X vs MI355X 這種同架構不同卡的差別，只有實體 GPU 分得出來)。
+        if local and ARCH_TO_HARDWARE.get(arch) and (
+            local == family or local[:2] == family[:2]
+        ):
+            return local, f"local GPU (arch {arch} from log)"
+        if family:
+            return family, f"arch {arch} from log"
+    if local:
+        return local, "local GPU"
+    return "", ""
 
 
 def detect_spec_method_from_path(input_dir: Path):
@@ -479,7 +621,7 @@ def main():
         default=None,
         help="Output csv file. Defaults to "
              "<input_dir>/{Device}-{model}-TP{n}-perf.csv, e.g. "
-             "MI355X-zai-org_GLM-5.3-Flash-TP4-perf.csv.",
+             "B200-RadixArk_GLM-5.3-Flash-NVFP4-TP4-perf.csv。Device 預設自動偵測。",
     )
     parser.add_argument(
         "--tp",
@@ -501,8 +643,9 @@ def main():
         "--precision",
         type=str,
         default=None,
-        choices=["fp4", "fp8", "fp16", "bf16"],
-        help="精度。預設從 input_dir 路徑自動偵測 (fp4/fp8/fp16/bf16)。",
+        choices=PRECISION_CHOICES,
+        help="精度。預設自動偵測：先看 server log 的 'Load weight end.' 量化欄位，"
+             "再退回路徑名稱。FP4 會細分成 nvfp4 / mxfp4。",
     )
     parser.add_argument(
         "--spec-method",
@@ -534,8 +677,9 @@ def main():
     parser.add_argument(
         "--hardware",
         type=str,
-        default="MI355X",
-        help="硬體名稱 (metadata 第一列)。預設 'MI355X'。",
+        default=None,
+        help="硬體名稱 (metadata 第一列，也是輸出檔名的前綴)。預設自動偵測："
+             "路徑裡的機種 > server log 的架構標記 (gfx950/sm100) > 本機 GPU。",
     )
     parser.add_argument(
         "--machine",
@@ -573,18 +717,34 @@ def main():
             tp_source = "default fallback"
     print(f"TP size: {tp_size} ({tp_source})")
 
+    # 硬體名稱: CLI > 自動偵測 > 'unknown-gpu'。它同時決定輸出檔名的前綴，所以
+    # 要在組 --output 之前算好。
+    if args.hardware:
+        hardware, hw_source = args.hardware, "cli"
+    else:
+        hardware, hw_source = detect_hardware(input_path)
+        if not hardware:
+            hardware, hw_source = "unknown-gpu", "not detected"
+    print(f"Hardware: {hardware} ({hw_source})")
+
     # 檔名規則 {Device}-{model}-{TPX}-perf.csv，讓不同機器/模型/TP 的 CSV
     # 放在一起也不會撞名，也不用每次手打 -o。
     if args.output is None:
         model_name = detect_model_from_path(input_path)
         args.output = str(
-            input_path / f"{args.hardware}-{model_name}-TP{tp_size}-perf.csv"
+            input_path / f"{hardware}-{model_name}-TP{tp_size}-perf.csv"
         )
         print(f"Output (auto): {args.output}")
 
     # 解析第二份 table 的 metadata
     variant = args.variant or input_path.name
-    precision = args.precision or detect_precision_from_path(input_path)
+    # 精度: CLI > server log 自報的量化方式 > 路徑名稱。log 優先是因為它是 sglang
+    # 載完權重後回報的實況；路徑只在 log 給的是 quark 這種不分子格式的包裝時才接手。
+    precision = (
+        args.precision
+        or detect_precision_from_logs(input_path)
+        or detect_precision_from_path(input_path)
+    )
     spec_method = args.spec_method or detect_spec_method_from_path(input_path)
     framework = args.framework
     num_decode_gpu = args.num_decode_gpu if args.num_decode_gpu is not None else tp_size
@@ -649,7 +809,7 @@ def main():
         accuracy=accuracy,
         run_date=run_date,
         meta=dict(
-            hardware=args.hardware,
+            hardware=hardware,
             image=image,
             framework=framework,
             precision=precision,
