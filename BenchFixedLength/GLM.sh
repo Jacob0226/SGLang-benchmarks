@@ -25,6 +25,82 @@
 # Everything resolves from the model name: TP4, modelopt_fp4, trtllm DSA, fp8_e4m3
 # KV, flashinfer_trtllm MoE, and the decode cuda-graph cap this checkpoint needs:
 # ./GLM.sh --model /data/huggingface/hub/RadixArk/GLM-5.3-Flash-NVFP4 --tp 4 --tag NVFP4-TP4
+#
+# ===================== Known issues behind the per-model flags =====================
+# The per-model blocks further down stay short on purpose. Anything in them that
+# looks arbitrary is explained here once.
+#
+# [radix] --disable-radix-cache, every model
+#   Not cosmetic. bench_serving reuses one seed for every cell, so the prefix tree
+#   carries prompts over and the sweep grades a warm cache from the second cell on.
+#   Measured 2026-09-15, GLM-5.3-Flash TP4/B200, 1024-token input (too short for
+#   chunked prefill to explain it): conc4 4.5% of prefill tokens cached (it runs
+#   first, on an empty tree), then 47.7 / 47.8 / 46.4 / 45.5% at conc 8/16/32/64.
+#   Half the prefill disappears and TTFT with it. DISABLE_RADIX_CACHE=0 to measure
+#   the cache deliberately.
+#
+# [rocm-kv] GLM-5.3-Flash on ROCm pairs TileLang DSA with BF16 KV, not FP8
+#   FP8 KV with TileLang DSA is a supported ROCm path on paper -- forward_mha_rocm.py
+#   branches on exactly "fp8_e4m3 and DSA backend is not trtllm" -- but that branch
+#   only runs when a prefill reads already-written prefix KV, i.e. a chunked-prefill
+#   continuation. PR #36607 validated 1024-token inputs, which never chunk, so it
+#   never entered the branch. This harness does: the i70k shape and high-concurrency
+#   GSM8K both chunk, and then every rank dies at once:
+#     forward_mha.py:500 _get_mla_kv_buffer_from_fp8_for_dsa
+#     -> backend.forward_metadata.page_table_1_flattened
+#     AttributeError: 'HybridLinearAttnBackend' has no attribute 'forward_metadata'
+#   The helper unwraps TboAttnBackend but not the hybrid linear-attention wrapper
+#   that owns the DSA backend. One-line upstream fix (backend = getattr(backend,
+#   "full_attn_backend", backend)) is staged in tools/glm53_flash_setup_container.sh
+#   as APPLY_HYBRID_PATCH. Until it lands, BF16 is the only KV dtype that survives.
+#   The Blackwell side picks trtllm DSA, which makes the bug unreachable, so FP8 KV
+#   is safe there -- the DSA backend and the KV dtype are one decision, not two.
+#
+# [nvfp4-graph] GLM-5.3-Flash NVFP4 caps --cuda-graph-max-bs at 128
+#   Without a cap the sweep produces nothing: 11 consecutive attempts on 2026-09-15
+#   finished 0 of 15 cells (tools/glm53_retry_sweep.sh, ~/glm53_nvfp4_retry.log).
+#   Where it dies is not deterministic, so the cap is not a diagnosed root-cause fix.
+#   Of those 11: six died during decode cuda-graph capture at bs=208/224/248/432/
+#   496/512 on different attempts with >20 GB free (so not memory pressure); four
+#   captured every graph, served, then died in process_batch_result_decode; the TP8
+#   run died in triton's clear_cache at bs=1. Identical arguments each time.
+#   What the two configurations that do survive share is a small captured decode
+#   batch: RadixArk's own command turns NEXTN on and so only captures verify/draft
+#   graphs (bs<=48), and this cap does the same for the non-speculative baseline the
+#   sweep measures. With it, two full sweeps completed 15/15 plus GSM8K.
+#   Caveat, and it is a big one: every failure was on dgx-027 and every success on
+#   dgx-024, so the cap and the machine changed together. dgx-027 also killed the
+#   FP8 checkpoint at TP8 with the same IMA -- a configuration with no NVFP4, no
+#   cutlass and no large decode graph -- while FP8 at TP4 passed there, which is
+#   what one bad GPU out of eight would look like. Untested either way:
+#   CUDA_GRAPH_MAX_BS=512 on a healthy node is the experiment that would settle it.
+#
+# [nvfp4-moe] GLM-5.3-Flash NVFP4 uses flashinfer_trtllm, not the card's cutlass
+#   flashinfer_cutlass is why NVFP4 first measured slower than the FP8 weights.
+#   Measured 2026-09-16, TP4/B200, same image, otherwise identical args, output
+#   token throughput vs results/zai-org_GLM-5.3-Flash/.../bench-Fixed-TP4-0915-
+#   cookbook-ht-noradix:
+#     cutlass  i1k -12%..+5%   i8k -10%..-1%   i70k -5%..-0.3%
+#     trtllm   i1k  +5%..+10%  i8k  +6%..+18%  i70k +16%..+23%
+#   trtllm wins all 15 cells and beats cutlass by up to +30% at low concurrency,
+#   where cutlass's grouped-GEMM overhead dominates. It has its own NVFP4 path
+#   (fused_experts_none_to_flashinfer_trtllm_fp4), so this is a supported pairing
+#   rather than a fallback, and it lets the NVFP4 and FP8 sweeps share a MoE runner
+#   so their delta is the weights alone. GSM8K 97.50% on it, vs 97.14% on the card's
+#   own configuration.
+#
+# [glm52-deadlock] GLM-5.2 deliberately skips the GLM-5/5.1 tuning block
+#   --attention-backend nsa + --enable-flashinfer-allreduce-fusion + --stream-interval
+#   30 + 32K chunking + --cuda-graph-max-bs together triggered a reproducible
+#   vocab-sized TP all-gather deadlock on the DSA path. NVIDIA's own GLM-5.2-NVFP4
+#   command sets none of them, and letting sglang auto-pick ran stably.
+#
+# [pcg] GLM-5.3-Flash leaves the prefill cuda-graph backend alone
+#   None of the cookbook's verified GLM-5.3-Flash cells select one, and the one
+#   command that mentions prefill graphs passes --disable-prefill-cuda-graph.
+#   Forcing tc_piecewise onto the KDA/DSA hybrid would benchmark an unvalidated
+#   path. ENABLE_PIECEWISE_CUDA_GRAPH=1 to measure it deliberately.
+#
 set -euo pipefail
 set -x
 ulimit -n 65535
@@ -124,7 +200,7 @@ MODEL_NAME="${_MODEL_ORG}_${_MODEL_LEAF}"
 #               config.json's quantization_config (with a long
 #               modules_to_not_convert list covering the MLA/MQA attention,
 #               hyper-connection and mHC tensors), so passing --quantization fp8
-#               would flatten that mixed-precision layout. Leave QUANT_ARGS empty.
+#               would flatten that mixed-precision layout, so no --quantization.
 #   *FP8*    -> default GLM-5-FP8: --quantization fp8 on B200, none on ROCm.
 # Defined up here rather than beside the other helpers because the model-detection
 # block below has to branch on the platform: GLM-5.3-Flash needs a different DSA
@@ -144,168 +220,242 @@ is_rocm_gpu_env() {
     [ -e /dev/kfd ] || command -v rocm-smi >/dev/null 2>&1
 }
 
-QUANT_ARGS=()
+# ===================== Per-model server configuration =====================
+# One block per (platform, checkpoint). Platform first, then the checkpoint named
+# in full -- no name globs that quietly catch a second model, no fallthrough to a
+# shared arm. Flags repeat between blocks on purpose: reading one block should tell
+# you everything a model is served with, without tracing what it inherited.
+#
+# Each block sets exactly three things:
+#   TP_SIZE             default TP, skipped when --tp was passed
+#   MEM_FRACTION_STATIC --mem-fraction-static
+#   MODEL_SERVER_ARGS   every other model- or platform-specific launch flag
+# Flags common to all models (model path, host/port, parsers, watchdog, weight
+# loader, --disable-radix-cache) live in start_server(); so do the ones driven by
+# CLI flags rather than by the model (--mtp, --prof, --dual-stream-rocm).
+#
+# Env overrides stay inline as ${VAR:-default} so a one-off rerun never needs an
+# edit here. Tags in [brackets] point at "Known issues" at the top of the file.
+MODEL_SERVER_ARGS=()
 MEM_FRACTION_STATIC="0.85"
-# See the --disable-radix-cache block in start_server().
+# See the --disable-radix-cache block in start_server().  [radix]
 _radix_default=1
 # Set to "true" by --dual-stream-rocm (see start_server()) — needed so MoE.forward
 # takes forward_normal_dual_stream instead of the fused shared-expert path.
 NEED_DISABLE_SHARED_FUSION="false"
-case "${MODEL_NAME}" in
-    *NVFP4*)
-        QUANT_ARGS=(--quantization modelopt_fp4)
-        MEM_FRACTION_STATIC="0.8"
-        case "${MODEL_NAME}" in
-            *GLM-5.3*)
-                # GLM-5.3-Flash NVFP4 (nvidia/GLM-5.3-Flash-NVFP4). This arm has to
-                # repeat what the *GLM-5.3* arm below does, because a name carrying
-                # both NVFP4 and GLM-5.3 matches *NVFP4* first and never reaches it --
-                # which is how this checkpoint used to end up served as if it were the
-                # FP8 one. NVFP4 is a Blackwell-only W4A4 path (Hopper cannot serve it
-                # at all), so unlike the FP8 arm there is no ROCm case to split on.
-                #
-                # The cookbook's NVFP4 cells differ from its FP8 cells in exactly two
-                # places: flashinfer_cutlass rather than flashinfer_trtllm, and
-                # mem-fraction 0.85 rather than 0.80 (W4A4 weights are half the size,
-                # so more of the budget can go to the pools).
-                #
-                # KV/DSA: RadixArk's card validates two pairings and we take the
-                # FP8 one (trtllm + fp8_e4m3, ~1.8x KV token capacity) so this and
-                # the FP8 weight sweep differ only in the weights. The BF16
-                # accuracy-reference pairing is:
-                #   KV_CACHE_DTYPE=bfloat16 DSA_PREFILL_BACKEND=tilelang \
-                #   DSA_DECODE_BACKEND=tilelang ./GLM.sh --model .../GLM-5.3-Flash-NVFP4
-                [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
-                MEM_FRACTION_STATIC="0.85"
-                # RadixArk's card launches with flashinfer_cutlass, but on this
-                # checkpoint that runner is the reason NVFP4 looked slower than the
-                # FP8 weights. Measured 2026-09-16, TP4/B200, same image and
-                # otherwise identical args, output token throughput vs the FP8
-                # sweep in results/zai-org_GLM-5.3-Flash/.../bench-Fixed-TP4-0915-
-                # cookbook-ht-noradix:
-                #   cutlass  i1k -12%..+5%   i8k -10%..-1%   i70k -5%..-0.3%
-                #   trtllm   i1k +5%..+10%   i8k +6%..+18%   i70k +16%..+23%
-                # trtllm wins all 15 cells and beats cutlass by up to +30% at low
-                # concurrency, where cutlass's grouped-GEMM overhead dominates.
-                # flashinfer_trtllm has its own NVFP4 path
-                # (fused_experts_none_to_flashinfer_trtllm_fp4), so this is a
-                # supported pairing, not a fallback. It also makes the NVFP4 and
-                # FP8 sweeps share a MoE runner, so their delta is the weights
-                # alone. Set MOE_RUNNER_BACKEND=flashinfer_cutlass for the card's
-                # configuration.
-                MOE_RUNNER_DEFAULT="flashinfer_trtllm"
-                DSA_PREFILL_BACKEND="${DSA_PREFILL_BACKEND:-trtllm}"
-                DSA_DECODE_BACKEND="${DSA_DECODE_BACKEND:-trtllm}"
-                KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
-                # Without a cap on the captured decode batch sizes this checkpoint
-                # hits a CUDA illegal memory access and the sweep produces nothing:
-                # 11 consecutive attempts on 2026-09-15 finished 0 of 15 cells (see
-                # tools/glm53_retry_sweep.sh and ~/glm53_nvfp4_retry.log).
-                #
-                # Where it lands is not deterministic, so do not read the cap as a
-                # diagnosed root-cause fix. Of those 11: six died during decode
-                # cuda-graph capture, at bs=208/224/248/432/496/512 on different
-                # attempts, with >20 GB still free (so not memory pressure); four
-                # captured every graph, served, and then died in
-                # batch_result_processor.process_batch_result_decode; the TP8 run
-                # died inside triton's clear_cache at bs=1. Same args every time.
-                #
-                # What the two configurations known to survive have in common is a
-                # small captured decode batch: RadixArk's own command turns NEXTN on,
-                # which captures verify/draft graphs at bs<=48 and never captures a
-                # large decode graph (4x1319 GSM8K, zero errors -- see
-                # results/.../hfcard-gsm8k-0916/GSM8K_SUMMARY.md), and this cap does
-                # the same thing for the non-speculative baseline the sweep measures.
-                # With it, two full sweeps (cutlass and trtllm MoE) completed 15/15
-                # plus GSM8K, against 0/11 without. 128 clears the sweep's max
-                # concurrency of 64 with headroom. The GLM-5/5.1 NVFP4 arm already
-                # caps at 256 for unrelated reasons, so the flag is not new here.
-                # Raise it with CUDA_GRAPH_MAX_BS to probe the fault.
-                CUDA_GRAPH_MAX_BS_DEFAULT=128
-                ;;
-            *GLM-5.2*)
-                # GLM-5.2 (glm_moe_dsa): NVIDIA's HF card launches at TP=8
-                # But I need TP4
-                # (https://huggingface.co/nvidia/GLM-5.2-NVFP4).
-                [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
-                ;;
-            *)
-                # GLM-5 NVFP4 default TP=4 — InferenceX runs both TP=4 and TP=8
-                # for B200 NVFP4 (yaml: { tp: 4, conc 4–256 } is the main sweep);
-                # we pick TP=4 so it cross-compares cleanly with MI355X MXFP4 at TP=4.
-                [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
-                ;;
-        esac
-        ;;
-    # GLM-5.3-Flash must be matched before the generic *MXFP4* arm below:
-    # amd/GLM-5.3-Flash-Quark-MXFP4 satisfies both, and bash case takes the
-    # first match. Taking the MXFP4 arm leaves the ROCm DSA backend at this
-    # script's triton default, which rejects index_kpool > 1 at decode graph
-    # capture with NotImplementedError.
-    *GLM-5.3*)
-        # 320B total / 18B active, FP8 weights ~306GB on disk -> ~77GB/GPU at
-        # TP=4, which fits a 192GB B200 with room for the KV and KDA pools and
-        # also fits an MI355X. The cookbook's B200 cell is TP=8 and PR #36607
-        # measured TP8, but we default to 4 so the sweep lines up with the
-        # GLM-5.2-NVFP4 TP4 numbers already in results/.
-        [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
-        # Hybrid linear-attention + DSA MoE (45 layers: 34 linear_attention, 11 DSA)
-        # with mHC. Weights are FP8 block-quantized in the checkpoint itself
-        # (attention / mHC / hyper stay BF16), so it self-declares quant the same
-        # way MXFP4 does -- passing --quantization would override and break it.
-        # Matches PR #36607, which launches with no --quantization.
-        # ROCm runs TileLang DSA with BF16 KV (PR #36607); Blackwell runs TRT-LLM
-        # DSA with FP8 E4M3 KV (the cookbook's Blackwell default, sglang#36519).
-        # Set as a pair because the KV dtype here is a consequence of the DSA
-        # backend, not an independent choice -- see the ROCm comment below.
-        if is_rocm_gpu_env; then
-            DSA_PREFILL_BACKEND="${DSA_PREFILL_BACKEND:-tilelang}"
-            DSA_DECODE_BACKEND="${DSA_DECODE_BACKEND:-tilelang}"
-            # BF16 KV rather than this script's fp8_e4m3 default. FP8 KV with
-            # TileLang DSA is a supported ROCm path -- forward_mha_rocm.py has a
-            # branch guarded on exactly "fp8_e4m3 and DSA backend is not trtllm" --
-            # but that branch only runs when a prefill reads already-written prefix
-            # KV (mha_one_shot and sum(extend_prefix_lens_cpu) != 0), i.e. a
-            # chunked-prefill continuation. PR #36607 validated on 1024-token
-            # inputs, which never chunk, so it never entered the branch and its
-            # FP8 KV claim stands for that workload. GLM.sh's i70k shape and its
-            # high-concurrency GSM8K both chunk, and the branch then kills every
-            # rank at once:
-            #   forward_mha.py:500 _get_mla_kv_buffer_from_fp8_for_dsa
-            #   -> backend.forward_metadata.page_table_1_flattened
-            #   AttributeError: 'HybridLinearAttnBackend' has no attribute
-            #                   'forward_metadata'
-            # The helper unwraps TboAttnBackend but not the hybrid
-            # linear-attention wrapper that actually owns the DSA backend. Until
-            # that lands upstream -- one line, backend = getattr(backend,
-            # "full_attn_backend", backend), staged in
-            # tools/glm53_flash_setup_container.sh as APPLY_HYBRID_PATCH -- BF16
-            # is the only KV dtype that survives this harness on ROCm.
-            KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-bfloat16}"
-        else
-            # Blackwell. The FP8 dequant branch described above tests for a
-            # *non*-trtllm DSA backend, so choosing trtllm here means the hybrid
-            # wrapper bug is unreachable and FP8 KV is safe.
-            DSA_PREFILL_BACKEND="${DSA_PREFILL_BACKEND:-trtllm}"
-            DSA_DECODE_BACKEND="${DSA_DECODE_BACKEND:-trtllm}"
-            KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
+
+if is_rocm_gpu_env; then
+    case "${MODEL_NAME}" in
+        amd_GLM-5.1-MXFP4)
+            # InferenceX glm5.1_fp4_mi355x.sh. MXFP4 self-declares in the
+            # checkpoint, so no --quantization; shared experts are MXFP4 too, so
+            # the fused shared-expert path is fine. TP=4 to line up with the B200
+            # NVFP4 sweep (InferenceX's own MXFP4 sweep is TP=2; pass --tp 2).
+            [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
+            MEM_FRACTION_STATIC="0.85"
+            MODEL_SERVER_ARGS=(
+                --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_e4m3}"
+                --dsa-prefill-backend "${DSA_PREFILL_BACKEND:-triton}"
+                --dsa-decode-backend "${DSA_DECODE_BACKEND:-triton}"
+                --tokenizer-worker-num $((TP_SIZE * 2))
+            )
+            # gfx950 fused allreduce(+residual+rmsnorm), ~12us/layer on MI355X.
+            # Validated on this recipe and GLM-5.2-MXFP4 only. Asserts against
+            # --enable-prefill-cp, hence the escape hatch.
+            [ "${DISABLE_AITER_ALLREDUCE_FUSION:-0}" = "1" ] || \
+                MODEL_SERVER_ARGS+=(--enable-aiter-allreduce-fusion)
+            ;;
+        amd_GLM-5.2-MXFP4)
+            # Same recipe as GLM-5.1-MXFP4 above; GLM-5.2's DSA changes nothing
+            # that this arg set cares about on ROCm.
+            [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
+            MEM_FRACTION_STATIC="0.85"
+            MODEL_SERVER_ARGS=(
+                --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_e4m3}"
+                --dsa-prefill-backend "${DSA_PREFILL_BACKEND:-triton}"
+                --dsa-decode-backend "${DSA_DECODE_BACKEND:-triton}"
+                --tokenizer-worker-num $((TP_SIZE * 2))
+            )
+            [ "${DISABLE_AITER_ALLREDUCE_FUSION:-0}" = "1" ] || \
+                MODEL_SERVER_ARGS+=(--enable-aiter-allreduce-fusion)
+            ;;
+        zai-org_GLM-5.3-Flash)
+            # sgl-project/sglang#36607's gfx950 recipe. Hybrid KDA + DSA MoE
+            # (45 layers: 34 linear-attention, 11 DSA) with mHC. The checkpoint
+            # self-declares FP8 block quant with attention/mHC left BF16, so
+            # --quantization would override and break that layout. AITER MoE is
+            # the PR's measured runner; SGLANG_USE_AITER is exported further down.
+            # BF16 KV is forced by a TileLang DSA bug, not by preference. [rocm-kv]
+            # --context-length: checkpoint declares 1,048,576, the i70k shape needs
+            # 70,300, so pin something in between rather than size a 1M-token pool.
+            [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
+            MEM_FRACTION_STATIC="0.85"
+            MODEL_SERVER_ARGS=(
+                --kv-cache-dtype "${KV_CACHE_DTYPE:-bfloat16}"
+                --dsa-prefill-backend "${DSA_PREFILL_BACKEND:-tilelang}"
+                --dsa-decode-backend "${DSA_DECODE_BACKEND:-tilelang}"
+                --moe-runner-backend "${MOE_RUNNER_BACKEND:-aiter}"
+                --context-length "${CONTEXT_LENGTH:-131072}"
+                --tokenizer-worker-num $((TP_SIZE * 2))
+            )
+            ;;
+        amd_GLM-5.3-Flash-Quark-MXFP4)
+            # Same gfx950 GLM-5.3-Flash recipe as the FP8 checkpoint above; only
+            # the weights differ, and Quark self-declares them. Must be its own
+            # block rather than falling into a *MXFP4* arm: the generic MXFP4
+            # recipe leaves DSA at triton, which rejects index_kpool > 1 at decode
+            # graph capture with NotImplementedError.
+            [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
+            MEM_FRACTION_STATIC="0.85"
+            MODEL_SERVER_ARGS=(
+                --kv-cache-dtype "${KV_CACHE_DTYPE:-bfloat16}"
+                --dsa-prefill-backend "${DSA_PREFILL_BACKEND:-tilelang}"
+                --dsa-decode-backend "${DSA_DECODE_BACKEND:-tilelang}"
+                --moe-runner-backend "${MOE_RUNNER_BACKEND:-aiter}"
+                --context-length "${CONTEXT_LENGTH:-131072}"
+                --tokenizer-worker-num $((TP_SIZE * 2))
+            )
+            ;;
+        zai-org_GLM-5-FP8|zai-org_GLM-5.1-FP8)
+            # InferenceX glm5_fp8_mi355x.sh. No ROCm-specific tuning beyond the
+            # backends; the B200 tuning block is deliberately not mirrored here.
+            [ "$TP_SIZE" = "auto" ] && TP_SIZE=8
+            MEM_FRACTION_STATIC="0.85"
+            MODEL_SERVER_ARGS=(
+                --quantization fp8
+                --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_e4m3}"
+                --dsa-prefill-backend "${DSA_PREFILL_BACKEND:-triton}"
+                --dsa-decode-backend "${DSA_DECODE_BACKEND:-triton}"
+                --tokenizer-worker-num $((TP_SIZE * 2))
+            )
+            ;;
+        *)
+            echo "[warn] no ROCm recipe for '${MODEL_NAME}' -- serving it with" \
+                 "sglang defaults plus triton DSA. Add a block above before" \
+                 "trusting any number from this run." >&2
+            [ "$TP_SIZE" = "auto" ] && TP_SIZE=8
+            MODEL_SERVER_ARGS=(
+                --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_e4m3}"
+                --dsa-prefill-backend "${DSA_PREFILL_BACKEND:-triton}"
+                --dsa-decode-backend "${DSA_DECODE_BACKEND:-triton}"
+                --tokenizer-worker-num $((TP_SIZE * 2))
+            )
+            ;;
+    esac
+else
+    case "${MODEL_NAME}" in
+        zai-org_GLM-5-FP8|zai-org_GLM-5.1-FP8)
+            # InferenceX glm5_fp8_b200.sh: trtllm NSA, flashinfer MoE, 32K prefill
+            # chunking, allreduce fusion, fixed stream-interval.
+            [ "$TP_SIZE" = "auto" ] && TP_SIZE=8
+            MEM_FRACTION_STATIC="0.85"
+            MODEL_SERVER_ARGS=(
+                --quantization fp8
+                --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_e4m3}"
+                --attention-backend nsa
+                --nsa-prefill-backend trtllm
+                --nsa-decode-backend trtllm
+                --moe-runner-backend "${MOE_RUNNER_BACKEND:-flashinfer_trtllm}"
+                --chunked-prefill-size 32768
+                --max-prefill-tokens 32768
+                --enable-flashinfer-allreduce-fusion
+                --stream-interval 30
+                --tokenizer-worker-num 6
+            )
+            ;;
+        nvidia_GLM-5-NVFP4|lukealonso_GLM-5.1-NVFP4)
+            # InferenceX glm5_fp4_b200.sh: the FP8 tuning above plus NVFP4's own
+            # cuda-graph cap and scheduler poll interval. No
+            # --disable-shared-experts-fusion -- NV's command omits it and
+            # sglang's modelopt_fp4 path handles the mixed-precision shared
+            # expert correctly. TP=4 so it cross-compares with MI355X MXFP4 TP4.
+            [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
             MEM_FRACTION_STATIC="0.8"
-        fi
-        ;;
-    *MXFP4*)
-        # MXFP4 self-declares; shared experts are also MXFP4 -> fusion OK.
-        # InferenceX MI355X main sweep is TP=2 but its TP=4 entry is the
-        # one that lines up with B200's TP=4 NVFP4 sweep, so default to 4
-        # here for direct MI355X-vs-B200 comparison. Override with --tp 2
-        # to match InferenceX's MXFP4 main sweep.
-        [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
-        ;;
-    *FP8*)
-        QUANT_ARGS=(--quantization fp8)
-        ;;
-esac
-# Fallback for FP8 / unrecognized models: keep the historical TP=8 default.
-[ "$TP_SIZE" = "auto" ] && TP_SIZE=8
+            MODEL_SERVER_ARGS=(
+                --quantization modelopt_fp4
+                --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_e4m3}"
+                --attention-backend nsa
+                --nsa-prefill-backend trtllm
+                --nsa-decode-backend trtllm
+                --moe-runner-backend "${MOE_RUNNER_BACKEND:-flashinfer_trtllm}"
+                --chunked-prefill-size 32768
+                --max-prefill-tokens 32768
+                --enable-flashinfer-allreduce-fusion
+                --stream-interval 30
+                --tokenizer-worker-num 6
+                --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS:-256}"
+                --scheduler-recv-interval 10
+            )
+            ;;
+        nvidia_GLM-5.2-NVFP4)
+            # NVIDIA's official HF command verbatim, which is deliberately bare:
+            # TP/quant/parsers/mem-fraction plus 16K chunking and nothing else.
+            # The GLM-5/5.1 tuning block above deadlocks this model. [glm52-deadlock]
+            # NV's card launches TP=8; we run TP=4 to match the rest of results/.
+            [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
+            MEM_FRACTION_STATIC="0.8"
+            MODEL_SERVER_ARGS=(
+                --quantization modelopt_fp4
+                --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_e4m3}"
+                --chunked-prefill-size 16384
+            )
+            ;;
+        zai-org_GLM-5.3-Flash)
+            # sglang cookbook's verified Blackwell cell
+            # (docs/cookbook/autoregressive/GLM/GLM-5.3-Flash.mdx). Hybrid KDA +
+            # DSA MoE, so no global --attention-backend: it would be wrong for two
+            # thirds of the 45 layers, and sglang resolves DSA from the config.
+            # The checkpoint self-declares FP8 block quant, so no --quantization.
+            # trtllm DSA is paired with FP8 KV on purpose. [rocm-kv]
+            # No --ep-size: the Blackwell cells leave the MoE pure TP.
+            # 320B total / 18B active, ~306GB FP8 on disk -> ~77GB/GPU at TP=4.
+            [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
+            MEM_FRACTION_STATIC="0.8"
+            MODEL_SERVER_ARGS=(
+                --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_e4m3}"
+                --dsa-prefill-backend "${DSA_PREFILL_BACKEND:-trtllm}"
+                --dsa-decode-backend "${DSA_DECODE_BACKEND:-trtllm}"
+                --moe-runner-backend "${MOE_RUNNER_BACKEND:-flashinfer_trtllm}"
+                --chunked-prefill-size "${CHUNKED_PREFILL_SIZE:-16384}"
+                --context-length "${CONTEXT_LENGTH:-131072}"
+            )
+            [ -n "${EP_SIZE:-}" ] && MODEL_SERVER_ARGS+=(--ep-size "$EP_SIZE")
+            ;;
+        RadixArk_GLM-5.3-Flash-NVFP4|nvidia_GLM-5.3-Flash-NVFP4)
+            # Same cookbook cell as the FP8 checkpoint above, with three changes
+            # the W4A4 weights need: --quantization modelopt_fp4, mem-fraction
+            # 0.85 (half-size weights leave more for the pools), and a decode
+            # cuda-graph cap without which the server never survives long enough
+            # to produce a cell. [nvfp4-graph]
+            # The MoE runner is trtllm rather than the card's cutlass. [nvfp4-moe]
+            # For the card's BF16-KV accuracy-reference pairing instead:
+            #   KV_CACHE_DTYPE=bfloat16 DSA_PREFILL_BACKEND=tilelang \
+            #   DSA_DECODE_BACKEND=tilelang ./GLM.sh --model .../GLM-5.3-Flash-NVFP4
+            [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
+            MEM_FRACTION_STATIC="0.85"
+            MODEL_SERVER_ARGS=(
+                --quantization modelopt_fp4
+                --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_e4m3}"
+                --dsa-prefill-backend "${DSA_PREFILL_BACKEND:-trtllm}"
+                --dsa-decode-backend "${DSA_DECODE_BACKEND:-trtllm}"
+                --moe-runner-backend "${MOE_RUNNER_BACKEND:-flashinfer_trtllm}"
+                --chunked-prefill-size "${CHUNKED_PREFILL_SIZE:-16384}"
+                --context-length "${CONTEXT_LENGTH:-131072}"
+                --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS:-128}"
+            )
+            [ -n "${EP_SIZE:-}" ] && MODEL_SERVER_ARGS+=(--ep-size "$EP_SIZE")
+            ;;
+        *)
+            echo "[warn] no Blackwell recipe for '${MODEL_NAME}' -- serving it" \
+                 "with sglang defaults. Add a block above before trusting any" \
+                 "number from this run." >&2
+            [ "$TP_SIZE" = "auto" ] && TP_SIZE=8
+            MODEL_SERVER_ARGS=(
+                --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_e4m3}"
+            )
+            ;;
+    esac
+fi
 
 # ===================== Server and Benchmark Setting =====================
 # InferenceMax tuning (from InferenceX/glm5_fp8_mi355x.sh)
@@ -645,7 +795,6 @@ start_server() {
             --reasoning-parser glm45
             --watchdog-timeout "${WATCHDOG_TIMEOUT:-1200}"
             --mem-fraction-static "$MEM_FRACTION_STATIC"
-            --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_e4m3}"
             --model-loader-extra-config "{\"enable_multithread_load\": true, \"num_threads\": ${WEIGHT_LOAD_THREADS:-32}}"
     )
     # Prefix reuse off for every model so each (shape, concurrency) cell measures a
@@ -662,164 +811,26 @@ start_server() {
     if [ "${DISABLE_RADIX_CACHE:-$_radix_default}" = "1" ]; then
         cmd+=(--disable-radix-cache)
     fi
-    if [ ${#QUANT_ARGS[@]} -gt 0 ]; then
-        cmd+=("${QUANT_ARGS[@]}")
-    fi
 
-    if is_rocm_gpu_env; then
-        # Match InferenceX glm5.1_fp4_mi355x.sh: tilelang NSA backends,
-        # tokenizer-worker-num scales with TP.
-        cmd+=(
-            --dsa-prefill-backend "${DSA_PREFILL_BACKEND:-triton}"
-            --dsa-decode-backend "${DSA_DECODE_BACKEND:-triton}"
-            --tokenizer-worker-num $((TP_SIZE * 2))
-        )
-        # opt#3: aiter fused allreduce(+residual+rmsnorm) replaces the unfused
-        # cross_device_reduce + add_rmsnorm_quant pair (~12us/layer on MI355X,
-        # matching ATOM's allreduce_fusion_kernel_1stage). gfx950-only path; enable
-        # only for the AMD MXFP4 GLM-5.1/5.2 recipes it was validated against.
-        # DISABLE_AITER_ALLREDUCE_FUSION=1 omits the flag (required for
-        # --enable-prefill-cp, which asserts it's incompatible).
-        case "${MODEL_NAME}" in
-            amd_GLM-5.1-MXFP4|amd_GLM-5.2-MXFP4)
-                if [ "${DISABLE_AITER_ALLREDUCE_FUSION:-0}" != "1" ]; then
-                    cmd+=(--enable-aiter-allreduce-fusion)
-                fi
-                ;;
-        esac
-        # ===== GLM-5.3-Flash: PR #36607 gfx950 serving recipe =====
-        case "${MODEL_NAME}" in
-            *GLM-5.3-Flash*)
-                # AITER MoE runner is the PR's measured configuration (288 routed
-                # + 1 shared expert). TileLang DSA backends are set via
-                # DSA_{PREFILL,DECODE}_BACKEND in the model-detection block above.
-                #
-                # --context-length: the checkpoint declares 1,048,576, which makes
-                # the KV planner size a pool nothing here will ever use. The PR
-                # pinned 65536, but this script's i70k shape sends up to 70,000
-                # input + 300 output tokens, so 65536 would reject every i70k
-                # request. 131072 clears i70k with margin and keeps the pool sane.
-                cmd+=(
-                    --moe-runner-backend "${MOE_RUNNER_BACKEND:-aiter}"
-                    --context-length "${CONTEXT_LENGTH:-131072}"
-                )
-                ;;
-        esac
-        if [ "$DUAL_STREAM_ROCM" == "true" ]; then
-            # Two independent toggles must both be set for full ROCm dual-stream:
-            #   (a) --disable-shared-experts-fusion
-            #         Forces num_fused_shared_experts=0 so DeepseekV2MoE.forward
-            #         takes forward_normal_dual_stream (shared ∥ routed overlap)
-            #         instead of forward_normal which would use the fused
-            #         _fused_append_shared_experts_kernel.
-            #   (b) SGLANG_ENABLE_HIP_DUAL_STREAM=1
-            #         Required to actually create alt_stream on ROCm. Without
-            #         it, alt_stream=None on HIP and *both* the NSA-decode A_v4
-            #         layout and the MoE forward_normal_dual_stream are skipped.
-            #         (Default OFF because the layout regresses on MI355X — see
-            #         tools/dual_stream_regression_analysis.md for full analysis.)
-            NEED_DISABLE_SHARED_FUSION="true"
-            export SGLANG_ENABLE_HIP_DUAL_STREAM=1
-        fi
-    elif [[ "${MODEL_NAME}" == *GLM-5.3* ]]; then
-        # GLM-5.3-Flash (glm5_next) on B200. Same philosophy as the GLM-5.2 block
-        # below -- stay close to the vendor's own command and let sglang auto-pick
-        # what it can -- because this model is even more sensitive to the GLM-5 /
-        # GLM-5.1 tuning block in the `else` branch: its 45 text layers are a
-        # hybrid of 34 KDA linear-attention layers and 11 DSA sparse-attention
-        # layers, so a global --attention-backend is wrong for two thirds of them,
-        # and the flashinfer-allreduce-fusion + stream-interval + 32K chunking
-        # combo is the one that deadlocked the DSA all-gather on GLM-5.2.
-        #
-        # The three flags we DO set explicitly come from the verified B200 cell of
-        # sglang's cookbook (docs/cookbook/autoregressive/GLM/GLM-5.3-Flash.mdx):
-        #   --dsa-{prefill,decode}-backend trtllm
-        #       Must be paired with the fp8_e4m3 KV cache set above, and the
-        #       pairing is load-bearing rather than cosmetic: sglang's FP8 KV read
-        #       path for DSA is guarded on a *non*-trtllm backend, and that path
-        #       cannot see past this model's HybridLinearAttnBackend wrapper (the
-        #       ROCm branch above documents the failure in full). Choosing trtllm
-        #       keeps it unreachable. Switch both backends AND the KV dtype
-        #       together if you want the BF16 pairing.
-        #   --moe-runner-backend flashinfer_trtllm
-        #       Which runner the cookbook picks tracks the hardware, not the FP8
-        #       weights: its Blackwell cells (b200 / b300 / gb300 / gb200) all use
-        #       flashinfer_trtllm and only the Hopper cells (h100 / h200) use
-        #       deep_gemm. This branch asked for deep_gemm until 2026-09-15, which
-        #       measured a runner no published Blackwell number uses. The NVFP4
-        #       checkpoint wants flashinfer_cutlass instead and sets
-        #       MOE_RUNNER_DEFAULT in the model-detection block to say so.
-        #   no --ep-size
-        #       The Blackwell cells do not set it, so the MoE stays pure TP
-        #       (sglang's default ep_size=1). Expert parallel at TP width is a
-        #       Hopper-cell thing (--ep-size 8 alongside --tp-size 8). Set EP_SIZE
-        #       to put the flag back.
-        # Override any of them with SERVER_EXTRA_ARGS (appended later -> wins).
-        #
-        # --attention-backend is deliberately not set, matching the reference
-        # command; sglang resolves DSA from the model config.
-        #
-        # --context-length: as on ROCm, the checkpoint declares 1,048,576 and the
-        # i70k shape needs 70,300, so pin something in between rather than let the
-        # KV planner size a pool for a million tokens.
-        cmd+=(
-            --chunked-prefill-size 16384
-            --dsa-prefill-backend "${DSA_PREFILL_BACKEND:-trtllm}"
-            --dsa-decode-backend "${DSA_DECODE_BACKEND:-trtllm}"
-            --moe-runner-backend "${MOE_RUNNER_BACKEND:-${MOE_RUNNER_DEFAULT:-flashinfer_trtllm}}"
-            --context-length "${CONTEXT_LENGTH:-131072}"
-        )
-        # Set only by the NVFP4 sub-arm above, which needs it to get through
-        # decode cuda-graph capture at all; the FP8 checkpoint captures the full
-        # default bs list fine and stays unflagged.
-        if [ -n "${CUDA_GRAPH_MAX_BS:-${CUDA_GRAPH_MAX_BS_DEFAULT:-}}" ]; then
-            cmd+=(--cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS:-$CUDA_GRAPH_MAX_BS_DEFAULT}")
-        fi
-        if [ -n "${EP_SIZE:-}" ]; then
-            cmd+=(--ep-size "$EP_SIZE")
-        fi
-    elif [[ "${MODEL_NAME}" == *GLM-5.2* ]]; then
-        # GLM-5.2 (glm_moe_dsa) on B200: use NVIDIA's OFFICIAL HF launch settings
-        # verbatim (https://huggingface.co/nvidia/GLM-5.2-NVFP4):
-        #     --tp 8 --quantization modelopt_fp4 --tool-call-parser glm47
-        #     --reasoning-parser glm45 --trust-remote-code
-        #     --chunked-prefill-size 16384 --mem-fraction-static 0.80
-        # TP (8) / quant (modelopt_fp4) / parsers / trust-remote-code / mem-fraction
-        # (0.80) are already set above; here we only add the 16K prefill chunk.
-        # We deliberately do NOT apply the GLM-5 / GLM-5.1 B200 tuning block below
-        # (--attention-backend nsa, --enable-flashinfer-allreduce-fusion,
-        # --stream-interval 30, --moe-runner-backend, 32K chunking, --cuda-graph-max-bs):
-        # that combo triggered a reproducible TP all-gather (vocab-sized) deadlock on
-        # the DSA path. Letting sglang auto-pick backends matches NV's command and
-        # ran stably in testing.
-        cmd+=(
-            --chunked-prefill-size 16384
-        )
-    else
-        # NVIDIA (B200) specific optimizations. Matches InferenceX
-        # glm5_fp4_b200.sh / glm5_fp8_b200.sh: trtllm NSA, flashinfer MoE,
-        # 32K prefill chunking, allreduce fusion, fixed stream-interval.
-        cmd+=(
-            --attention-backend nsa
-            --nsa-prefill-backend trtllm
-            --nsa-decode-backend trtllm
-            --moe-runner-backend flashinfer_trtllm
-            --chunked-prefill-size 32768
-            --max-prefill-tokens 32768
-            --enable-flashinfer-allreduce-fusion
-            --stream-interval 30
-            --tokenizer-worker-num 6
-        )
-        # NVFP4-specific: cap CUDA-graph BS and lower scheduler poll
-        # interval to match InferenceX's glm5_fp4_b200.sh exactly.
-        case "${MODEL_NAME}" in
-            *NVFP4*)
-                cmd+=(
-                    --cuda-graph-max-bs 256
-                    --scheduler-recv-interval 10
-                )
-                ;;
-        esac
+    # Everything model- and platform-specific was resolved up front, in the
+    # per-model configuration block. See it for why any particular flag is here.
+    cmd+=("${MODEL_SERVER_ARGS[@]}")
+
+    if is_rocm_gpu_env && [ "$DUAL_STREAM_ROCM" == "true" ]; then
+        # Two independent toggles must both be set for full ROCm dual-stream:
+        #   (a) --disable-shared-experts-fusion
+        #         Forces num_fused_shared_experts=0 so DeepseekV2MoE.forward
+        #         takes forward_normal_dual_stream (shared ∥ routed overlap)
+        #         instead of forward_normal which would use the fused
+        #         _fused_append_shared_experts_kernel.
+        #   (b) SGLANG_ENABLE_HIP_DUAL_STREAM=1
+        #         Required to actually create alt_stream on ROCm. Without
+        #         it, alt_stream=None on HIP and *both* the NSA-decode A_v4
+        #         layout and the MoE forward_normal_dual_stream are skipped.
+        #         (Default OFF because the layout regresses on MI355X — see
+        #         tools/dual_stream_regression_analysis.md for full analysis.)
+        NEED_DISABLE_SHARED_FUSION="true"
+        export SGLANG_ENABLE_HIP_DUAL_STREAM=1
     fi
 
     # ===== Piecewise CUDA Graph (PCG) prefill backend — NVIDIA/CUDA only =====
@@ -862,7 +873,9 @@ start_server() {
         cmd+=(--disable-shared-experts-fusion)
     fi
 
-    # Optional override of chunked-prefill-size (appended last so it wins in argparse).
+    # Override chunked-prefill-size for the blocks that hardcode it (the
+    # GLM-5.3-Flash blocks already read CHUNKED_PREFILL_SIZE inline; appending
+    # here too is harmless because the later flag wins in argparse).
     #   CHUNKED_PREFILL_SIZE=131072 ./GLM.sh ...
     if [ -n "${CHUNKED_PREFILL_SIZE:-}" ]; then
         cmd+=(--chunked-prefill-size "$CHUNKED_PREFILL_SIZE")
@@ -925,7 +938,8 @@ start_server() {
         printf '    %s\n' "${cmd[@]}"
         echo ""
         echo ">>> MODEL_NAME=${MODEL_NAME}  TP_SIZE=${TP_SIZE}  MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC}"
-        echo ">>> SGLANG_USE_AITER=${SGLANG_USE_AITER:-<unset>}  DSA prefill/decode=${DSA_PREFILL_BACKEND:-triton}/${DSA_DECODE_BACKEND:-triton}"
+        echo ">>> SGLANG_USE_AITER=${SGLANG_USE_AITER:-<unset>}"
+        echo ">>> model block args: ${MODEL_SERVER_ARGS[*]}"
         echo ">>> shapes=${in_out_tokens[*]}  concurrencies=${concurrencies[*]}"
         echo ">>> LOG_DIR=${LOG_DIR}"
         exit 0
