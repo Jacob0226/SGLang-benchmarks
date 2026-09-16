@@ -13,6 +13,10 @@ kv_pattern = re.compile(r"^(.*?):\s+(.*)$")
 meta_pattern = re.compile(r"in(\d+)_out(\d+)_conc_?(\d+)")
 # 從 input_dir 路徑抓 TP 大小，例如 ".../GLM-5-FP8-bench-0507_TP4"
 tp_pattern = re.compile(r"[Tt][Pp](\d+)")
+# 從 server log 的啟動命令列抓 TP 大小 (sglang 兩種拼法都收)
+tp_flag_pattern = re.compile(r"--tp(?:-size)?[= ]+(\d+)")
+# 從 server log 的啟動命令列抓投機解碼演算法
+spec_algo_pattern = re.compile(r"--speculative-algorithm[= ]+([\w]+)")
 # 從路徑名稱嗅 precision / spec_method。
 # FP4 有兩種互不相容的格式 (NVIDIA NVFP4 / OCP MXFP4)，而且它們在路徑裡一律寫成
 # 'NVFP4' / 'MXFP4' -- 沒有前置詞界，所以舊的 \bfp4\b 永遠漏掉這兩個。長的排前面，
@@ -221,6 +225,17 @@ def _scan_logs(input_dir: Path, pattern, limit_bytes=4_000_000):
     return None
 
 
+def detect_tp_from_logs(input_dir: Path):
+    """從 server log 的啟動命令列讀 --tp / --tp-size。
+
+    比路徑名稱可靠：路徑只在 --tag 剛好寫了 TP4 時才有線索，而像
+    'bench-Fixed-MTP-0916' 這種 tag 沒有，就會靜靜退回預設 8 並讓
+    per-GPU throughput 整欄算錯。找不到回傳 None。
+    """
+    m = _scan_logs(input_dir, tp_flag_pattern)
+    return int(m.group(1)) if m else None
+
+
 def detect_precision_from_logs(input_dir: Path):
     """從 server log 的 "Load weight end." 行判定實際生效的量化格式。
 
@@ -302,6 +317,20 @@ def detect_hardware(input_dir: Path):
     if local:
         return local, "local GPU"
     return "", ""
+
+
+def detect_spec_method_from_logs(input_dir: Path):
+    """從 server log 看這次有沒有開投機解碼。
+
+    比路徑可靠，路徑只在 --tag 或 GLM.sh 的 MTP_TAG 寫進名字時才有線索。
+    欄位語意是「投機解碼開/關」，所以 EAGLE / NEXTN / EAGLE3 一律算 mtp --
+    NEXTN 在 sglang 裡本來就是 EAGLE 的別名。找不到旗標回傳空字串 (不是
+    'none')，讓呼叫端能再退回路徑判斷。
+    """
+    m = _scan_logs(input_dir, spec_algo_pattern)
+    if not m:
+        return ""
+    return "none" if m.group(1).lower() in ("none", "null") else "mtp"
 
 
 def detect_spec_method_from_path(input_dir: Path):
@@ -621,7 +650,8 @@ def main():
         default=None,
         help="Output csv file. Defaults to "
              "<input_dir>/{Device}-{model}-TP{n}-perf.csv, e.g. "
-             "B200-RadixArk_GLM-5.3-Flash-NVFP4-TP4-perf.csv。Device 預設自動偵測。",
+             "B200-RadixArk_GLM-5.3-Flash-NVFP4-TP4-MTP-perf.csv。Device / TP / "
+             "投機設定都預設自動偵測；-MTP 只在開了投機解碼時出現。",
     )
     parser.add_argument(
         "--tp",
@@ -653,7 +683,8 @@ def main():
         type=str,
         default=None,
         choices=["none", "mtp"],
-        help="Speculative decoding method。預設：路徑含 'mtp' -> 'mtp'，否則 'none'。",
+        help="Speculative decoding method。預設自動偵測：先看 server log 的 "
+             "--speculative-algorithm，再退回路徑是否含 'mtp'。也決定輸出檔名有無 -MTP。",
     )
     parser.add_argument(
         "--framework",
@@ -704,17 +735,25 @@ def main():
     input_path = Path(args.input_dir)
 
     # 解析 TP 大小: CLI > 路徑 auto-detect > 預設 8
+    # TP: CLI > the run's own launch command > path name > 8. The log comes first
+    # because a --tag without "TP<n>" in it would otherwise silently fall back to
+    # 8 and skew every per-GPU throughput number.
     if args.tp is not None:
         tp_size = args.tp
         tp_source = "cli"
     else:
-        detected = detect_tp_from_path(input_path)
+        detected = detect_tp_from_logs(input_path)
         if detected is not None:
             tp_size = detected
-            tp_source = "auto-detected from path"
+            tp_source = "auto-detected from server log"
         else:
-            tp_size = 8
-            tp_source = "default fallback"
+            detected = detect_tp_from_path(input_path)
+            if detected is not None:
+                tp_size = detected
+                tp_source = "auto-detected from path"
+            else:
+                tp_size = 8
+                tp_source = "default fallback"
     print(f"TP size: {tp_size} ({tp_source})")
 
     # 硬體名稱: CLI > 自動偵測 > 'unknown-gpu'。它同時決定輸出檔名的前綴，所以
@@ -727,12 +766,25 @@ def main():
             hardware, hw_source = "unknown-gpu", "not detected"
     print(f"Hardware: {hardware} ({hw_source})")
 
-    # 檔名規則 {Device}-{model}-{TPX}-perf.csv，讓不同機器/模型/TP 的 CSV
-    # 放在一起也不會撞名，也不用每次手打 -o。
+    # 投機解碼: CLI > server log 的 --speculative-algorithm > 路徑名稱。
+    # 要在組檔名之前算好 -- 同一個模型的 MTP 與非 MTP 兩輪只差這一項，不放進
+    # 檔名的話兩份 CSV 同名，收集到一起就會互相覆蓋。
+    if args.spec_method:
+        spec_method, spec_source = args.spec_method, "cli"
+    else:
+        spec_method = detect_spec_method_from_logs(input_path)
+        spec_source = "server log"
+        if not spec_method:
+            spec_method, spec_source = detect_spec_method_from_path(input_path), "path"
+    print(f"Spec method: {spec_method} ({spec_source})")
+
+    # 檔名規則 {Device}-{model}-TP{n}[-MTP]-perf.csv，讓不同機器/模型/TP/投機
+    # 設定的 CSV 放在一起也不會撞名，也不用每次手打 -o。
     if args.output is None:
         model_name = detect_model_from_path(input_path)
+        spec_tag = "-MTP" if spec_method == "mtp" else ""
         args.output = str(
-            input_path / f"{hardware}-{model_name}-TP{tp_size}-perf.csv"
+            input_path / f"{hardware}-{model_name}-TP{tp_size}{spec_tag}-perf.csv"
         )
         print(f"Output (auto): {args.output}")
 
@@ -745,7 +797,6 @@ def main():
         or detect_precision_from_logs(input_path)
         or detect_precision_from_path(input_path)
     )
-    spec_method = args.spec_method or detect_spec_method_from_path(input_path)
     framework = args.framework
     num_decode_gpu = args.num_decode_gpu if args.num_decode_gpu is not None else tp_size
     # Docker image: CLI > 路徑 auto-detect > 空字串
