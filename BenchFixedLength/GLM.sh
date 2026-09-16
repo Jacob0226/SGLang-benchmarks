@@ -197,28 +197,30 @@ case "${MODEL_NAME}" in
                 DSA_PREFILL_BACKEND="${DSA_PREFILL_BACKEND:-trtllm}"
                 DSA_DECODE_BACKEND="${DSA_DECODE_BACKEND:-trtllm}"
                 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
-                # Decode cuda-graph capture dies with a CUDA illegal memory access
-                # on this checkpoint unless the captured batch-size set is capped.
-                # Evidence (2026-09-15, lmsysorg/sglang:glm-5.3-flash, TP4/B200):
-                # 11 consecutive GLM.sh attempts completed 0 of 15 sweep cells --
-                # see tools/glm53_retry_sweep.sh and ~/glm53_nvfp4_retry.log. The
-                # capture walks the default bs list downward from 512 and always
-                # dies at bs=272, 15 graphs in, with 23.4 GB still free, so this is
-                # a kernel fault at a specific shape rather than memory pressure:
-                #   decode_cuda_graph_runner.py:491
-                #   Exception: Capture cuda graph failed: CUDA error: an illegal
-                #   memory access was encountered
-                # Speculative decoding hides it -- with NEXTN the runner captures
-                # verify/draft graphs (bs<=48) and never reaches the failing shape,
-                # which is why RadixArk's own launch command, which turns MTP on,
-                # serves fine: reproduced 2026-09-16 on the same image, 4x1319
-                # GSM8K requests at 97.14% with zero errors (see
-                # results/.../hfcard-gsm8k-0916/GSM8K_SUMMARY.md).
-                # This sweep measures the non-speculative baseline, so cap instead:
-                # concurrency tops out at 64, so 128 covers every cell with headroom
-                # and stays far below the failing region. The GLM-5/5.1 NVFP4 arm
-                # already caps at 256 for unrelated reasons, so the flag itself is
-                # not new here. Raise it with CUDA_GRAPH_MAX_BS to probe the fault.
+                # Without a cap on the captured decode batch sizes this checkpoint
+                # hits a CUDA illegal memory access and the sweep produces nothing:
+                # 11 consecutive attempts on 2026-09-15 finished 0 of 15 cells (see
+                # tools/glm53_retry_sweep.sh and ~/glm53_nvfp4_retry.log).
+                #
+                # Where it lands is not deterministic, so do not read the cap as a
+                # diagnosed root-cause fix. Of those 11: six died during decode
+                # cuda-graph capture, at bs=208/224/248/432/496/512 on different
+                # attempts, with >20 GB still free (so not memory pressure); four
+                # captured every graph, served, and then died in
+                # batch_result_processor.process_batch_result_decode; the TP8 run
+                # died inside triton's clear_cache at bs=1. Same args every time.
+                #
+                # What the two configurations known to survive have in common is a
+                # small captured decode batch: RadixArk's own command turns NEXTN on,
+                # which captures verify/draft graphs at bs<=48 and never captures a
+                # large decode graph (4x1319 GSM8K, zero errors -- see
+                # results/.../hfcard-gsm8k-0916/GSM8K_SUMMARY.md), and this cap does
+                # the same thing for the non-speculative baseline the sweep measures.
+                # With it, two full sweeps (cutlass and trtllm MoE) completed 15/15
+                # plus GSM8K, against 0/11 without. 128 clears the sweep's max
+                # concurrency of 64 with headroom. The GLM-5/5.1 NVFP4 arm already
+                # caps at 256 for unrelated reasons, so the flag is not new here.
+                # Raise it with CUDA_GRAPH_MAX_BS to probe the fault.
                 CUDA_GRAPH_MAX_BS_DEFAULT=128
                 ;;
             *GLM-5.2*)
