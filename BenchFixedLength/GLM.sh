@@ -20,6 +20,11 @@
 # GLM-5.3-Flash on ROCm/gfx950 (sgl-project/sglang#36607 recipe: AITER MoE +
 # TileLang DSA + gfx950 mHC fast paths; needs SGLANG_USE_AITER=1, set automatically):
 # ./GLM.sh --model /data/huggingface/hub/zai-org/GLM-5.3-Flash --tp 4 --tag TP4
+#
+# GLM-5.3-Flash NVFP4 on Blackwell (RadixArk/GLM-5.3-Flash-NVFP4, W4A4 ModelOpt).
+# Everything resolves from the model name: TP4, modelopt_fp4, trtllm DSA, fp8_e4m3
+# KV, flashinfer_trtllm MoE, and the decode cuda-graph cap this checkpoint needs:
+# ./GLM.sh --model /data/huggingface/hub/RadixArk/GLM-5.3-Flash-NVFP4 --tp 4 --tag NVFP4-TP4
 set -euo pipefail
 set -x
 ulimit -n 65535
@@ -164,19 +169,57 @@ case "${MODEL_NAME}" in
                 # mem-fraction 0.85 rather than 0.80 (W4A4 weights are half the size,
                 # so more of the budget can go to the pools).
                 #
-                # KV/DSA: the published NVFP4 cell pairs BF16 KV with TileLang, and
-                # its GSM8K/AIME numbers were measured that way. trtllm + fp8_e4m3 is
-                # the cookbook's FP8-KV overlay on the same recipe -- a TP4-only speed
-                # variant -- and that is what we default to here, so this and the FP8
-                # sweep differ only in the weights. For the accuracy-reference pairing:
+                # KV/DSA: RadixArk's card validates two pairings and we take the
+                # FP8 one (trtllm + fp8_e4m3, ~1.8x KV token capacity) so this and
+                # the FP8 weight sweep differ only in the weights. The BF16
+                # accuracy-reference pairing is:
                 #   KV_CACHE_DTYPE=bfloat16 DSA_PREFILL_BACKEND=tilelang \
                 #   DSA_DECODE_BACKEND=tilelang ./GLM.sh --model .../GLM-5.3-Flash-NVFP4
                 [ "$TP_SIZE" = "auto" ] && TP_SIZE=4
                 MEM_FRACTION_STATIC="0.85"
-                MOE_RUNNER_DEFAULT="flashinfer_cutlass"
+                # RadixArk's card launches with flashinfer_cutlass, but on this
+                # checkpoint that runner is the reason NVFP4 looked slower than the
+                # FP8 weights. Measured 2026-09-16, TP4/B200, same image and
+                # otherwise identical args, output token throughput vs the FP8
+                # sweep in results/zai-org_GLM-5.3-Flash/.../bench-Fixed-TP4-0915-
+                # cookbook-ht-noradix:
+                #   cutlass  i1k -12%..+5%   i8k -10%..-1%   i70k -5%..-0.3%
+                #   trtllm   i1k +5%..+10%   i8k +6%..+18%   i70k +16%..+23%
+                # trtllm wins all 15 cells and beats cutlass by up to +30% at low
+                # concurrency, where cutlass's grouped-GEMM overhead dominates.
+                # flashinfer_trtllm has its own NVFP4 path
+                # (fused_experts_none_to_flashinfer_trtllm_fp4), so this is a
+                # supported pairing, not a fallback. It also makes the NVFP4 and
+                # FP8 sweeps share a MoE runner, so their delta is the weights
+                # alone. Set MOE_RUNNER_BACKEND=flashinfer_cutlass for the card's
+                # configuration.
+                MOE_RUNNER_DEFAULT="flashinfer_trtllm"
                 DSA_PREFILL_BACKEND="${DSA_PREFILL_BACKEND:-trtllm}"
                 DSA_DECODE_BACKEND="${DSA_DECODE_BACKEND:-trtllm}"
                 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
+                # Decode cuda-graph capture dies with a CUDA illegal memory access
+                # on this checkpoint unless the captured batch-size set is capped.
+                # Evidence (2026-09-15, lmsysorg/sglang:glm-5.3-flash, TP4/B200):
+                # 11 consecutive GLM.sh attempts completed 0 of 15 sweep cells --
+                # see tools/glm53_retry_sweep.sh and ~/glm53_nvfp4_retry.log. The
+                # capture walks the default bs list downward from 512 and always
+                # dies at bs=272, 15 graphs in, with 23.4 GB still free, so this is
+                # a kernel fault at a specific shape rather than memory pressure:
+                #   decode_cuda_graph_runner.py:491
+                #   Exception: Capture cuda graph failed: CUDA error: an illegal
+                #   memory access was encountered
+                # Speculative decoding hides it -- with NEXTN the runner captures
+                # verify/draft graphs (bs<=48) and never reaches the failing shape,
+                # which is why RadixArk's own launch command, which turns MTP on,
+                # serves fine: reproduced 2026-09-16 on the same image, 4x1319
+                # GSM8K requests at 97.14% with zero errors (see
+                # results/.../hfcard-gsm8k-0916/GSM8K_SUMMARY.md).
+                # This sweep measures the non-speculative baseline, so cap instead:
+                # concurrency tops out at 64, so 128 covers every cell with headroom
+                # and stays far below the failing region. The GLM-5/5.1 NVFP4 arm
+                # already caps at 256 for unrelated reasons, so the flag itself is
+                # not new here. Raise it with CUDA_GRAPH_MAX_BS to probe the fault.
+                CUDA_GRAPH_MAX_BS_DEFAULT=128
                 ;;
             *GLM-5.2*)
                 # GLM-5.2 (glm_moe_dsa): NVIDIA's HF card launches at TP=8
@@ -724,6 +767,12 @@ start_server() {
             --moe-runner-backend "${MOE_RUNNER_BACKEND:-${MOE_RUNNER_DEFAULT:-flashinfer_trtllm}}"
             --context-length "${CONTEXT_LENGTH:-131072}"
         )
+        # Set only by the NVFP4 sub-arm above, which needs it to get through
+        # decode cuda-graph capture at all; the FP8 checkpoint captures the full
+        # default bs list fine and stays unflagged.
+        if [ -n "${CUDA_GRAPH_MAX_BS:-${CUDA_GRAPH_MAX_BS_DEFAULT:-}}" ]; then
+            cmd+=(--cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS:-$CUDA_GRAPH_MAX_BS_DEFAULT}")
+        fi
         if [ -n "${EP_SIZE:-}" ]; then
             cmd+=(--ep-size "$EP_SIZE")
         fi
