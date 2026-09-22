@@ -986,21 +986,31 @@ start_server() {
 # GPU, an image whose aiter lacks aiter.ops.mhc -- the model still serves correct
 # tokens, just on the unfused reference path that PR #36607 measures at 5.42x
 # slower. Nothing in the benchmark output says "you measured the slow path", so
-# state it explicitly once at startup. The PR's own evidence that the fast paths
-# engaged is that every TP rank logs both mHC lines.
+# state it explicitly once at startup. The evidence that the fast path engaged is
+# that every TP rank logs the mHC pre/post line.
+#
+# Only the pre/post line is checked, and that is a correction. This function used
+# to also grep for "Using fused AITER mHC attention-to-FFN boundary" and warn when
+# it was missing, which it now always is -- so every GLM-5.3-Flash run printed the
+# 5.42x warning while running the fast path. #36607's boundary fusion came back
+# upstream in a different shape, as #39200's glm5_next.hc_ffn_post_pre: wired
+# through MHCLayerCommunicator when is_cross_layer_mhc_fusion_enabled() (true on
+# gfx95 + AITER), logging nothing, and deliberately capped at
+# _MHC_FUSED_BOUNDARY_MAX_TOKENS=16 so a conc64 decode does not take it -- a rank
+# count was never the right shape for that question anyway. Note #39200 is NOT in
+# the 20260914 image's own tree; that run had it only because the Day-0 PR heads
+# each carry a newer main. Verified 2026-09-21 on the ten-PR Day-0 stack.
 check_mhc_markers() {
     case "${MODEL_NAME}" in *GLM-5.3-Flash*) ;; *) return 0 ;; esac
     is_rocm_gpu_env || return 0
-    local log="${SERVER_LOG}" pre fused
+    local log="${SERVER_LOG}" pre
     pre=$(grep -c 'Using AITER gfx950 mHC pre/post kernels' "$log" 2>/dev/null || true)
-    fused=$(grep -c 'Using fused AITER mHC attention-to-FFN boundary' "$log" 2>/dev/null || true)
-    echo ">>> [mHC] AITER gfx950 pre/post kernels: ${pre}/${TP_SIZE} ranks | fused attn->FFN boundary: ${fused}/${TP_SIZE} ranks"
-    if [ "${pre:-0}" -lt "$TP_SIZE" ] || [ "${fused:-0}" -lt "$TP_SIZE" ]; then
-        echo "!!! WARNING: GLM-5.3-Flash gfx950 mHC fast paths did NOT engage on every rank."
-        echo "!!!   mHC pre/post kernels : ${pre:-0}/${TP_SIZE} ranks"
-        echo "!!!   fused attn->FFN      : ${fused:-0}/${TP_SIZE} ranks"
-        echo "!!! The unfused fallback is 5.42x slower (PR #36607), so these numbers are"
-        echo "!!! not comparable to any published GLM-5.3-Flash result."
+    echo ">>> [mHC] AITER gfx950 pre/post kernels: ${pre}/${TP_SIZE} ranks"
+    if [ "${pre:-0}" -lt "$TP_SIZE" ]; then
+        echo "!!! WARNING: the GLM-5.3-Flash gfx950 mHC pre/post kernels did NOT engage"
+        echo "!!! on every rank (${pre:-0}/${TP_SIZE}). The unfused fallback is 5.42x slower"
+        echo "!!! (PR #36607), so these numbers are not comparable to any published"
+        echo "!!! GLM-5.3-Flash result."
         echo "!!! Check SGLANG_USE_AITER=${SGLANG_USE_AITER:-<unset>}, that the GPU is gfx950,"
         echo "!!! and that this image's aiter exposes aiter.ops.mhc (mhc_pre / mhc_post)."
     fi
@@ -1524,6 +1534,13 @@ if [ "$PROF_ENABLED" == "true" ]; then
     PROF_SERVER_MODES=("default" "no-cuda-graph")
 else
     PROF_SERVER_MODES=("default")
+fi
+# Space-separated override, e.g. to skip the eager pass when only the captured
+# traces are wanted (the no-cuda-graph i70k/conc64 cell is the most expensive one
+# in the sweep and the likeliest to OOM):
+#   PROF_SERVER_MODES_OVERRIDE="default" ./GLM.sh --prof ...
+if [ -n "${PROF_SERVER_MODES_OVERRIDE:-}" ]; then
+    read -ra PROF_SERVER_MODES <<< "$PROF_SERVER_MODES_OVERRIDE"
 fi
 
 BASE_LOG_DIR="$LOG_DIR"
