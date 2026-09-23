@@ -89,6 +89,16 @@
 #   so their delta is the weights alone. GSM8K 97.50% on it, vs 97.14% on the card's
 #   own configuration.
 #
+# [cgmb-rename] --cuda-graph-max-bs is spelled differently on v0.5.20+
+#   sglang split the flag into per-phase --cuda-graph-max-bs-{decode,prefill} and
+#   dropped the unsuffixed name. On v0.5.20 the old spelling is not even an
+#   unambiguous prefix any more, so argparse rejects it before the model loads:
+#     sglang serve: error: ambiguous option: --cuda-graph-max-bs could match
+#     --cuda-graph-max-bs-decode, --cuda-graph-max-bs-prefill
+#   Both callers cap the DECODE capture, so cuda_graph_max_bs_flag() resolves to
+#   --cuda-graph-max-bs-decode on new builds and keeps the old name on the images
+#   that still take it. CUDA_GRAPH_MAX_BS keeps working either way.
+#
 # [glm52-deadlock] GLM-5.2 deliberately skips the GLM-5/5.1 tuning block
 #   --attention-backend nsa + --enable-flashinfer-allreduce-fusion + --stream-interval
 #   30 + 32K chunking + --cuda-graph-max-bs together triggered a reproducible
@@ -218,6 +228,20 @@ is_rocm_gpu_env() {
         cuda) return 1 ;;
     esac
     [ -e /dev/kfd ] || command -v rocm-smi >/dev/null 2>&1
+}
+
+# Name of the decode cuda-graph batch cap on this image. See [cgmb-rename].
+# Reads --help into a variable rather than piping into grep: under `set -o
+# pipefail` an early `grep -q` exit SIGPIPEs python and the pipeline then
+# reports 141 even on a match, which would pick the wrong flag.
+cuda_graph_max_bs_flag() {
+    local help_text
+    help_text=$(python3 -m sglang.launch_server --help 2>&1 || true)
+    if grep -q -- "--cuda-graph-max-bs " <<< "$help_text"; then
+        echo "--cuda-graph-max-bs"
+    else
+        echo "--cuda-graph-max-bs-decode"
+    fi
 }
 
 # ===================== Per-model server configuration =====================
@@ -383,7 +407,7 @@ else
                 --enable-flashinfer-allreduce-fusion
                 --stream-interval 30
                 --tokenizer-worker-num 6
-                --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS:-256}"
+                "$(cuda_graph_max_bs_flag)" "${CUDA_GRAPH_MAX_BS:-256}"
                 --scheduler-recv-interval 10
             )
             ;;
@@ -441,7 +465,7 @@ else
                 --moe-runner-backend "${MOE_RUNNER_BACKEND:-flashinfer_trtllm}"
                 --chunked-prefill-size "${CHUNKED_PREFILL_SIZE:-16384}"
                 --context-length "${CONTEXT_LENGTH:-131072}"
-                --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS:-128}"
+                "$(cuda_graph_max_bs_flag)" "${CUDA_GRAPH_MAX_BS:-128}"
             )
             [ -n "${EP_SIZE:-}" ] && MODEL_SERVER_ARGS+=(--ep-size "$EP_SIZE")
             ;;
