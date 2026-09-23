@@ -586,11 +586,35 @@ declare -A SHAPE_SERVER_ARGS=()
 if [ "${I70K_MAX_RUNNING_REQUESTS:-$_i70k_cap_default}" != "0" ]; then
     SHAPE_SERVER_ARGS["70000:300"]="--max-running-requests ${I70K_MAX_RUNNING_REQUESTS:-$_i70k_cap_default}"
 fi
+# 4 steps, not 2, because the first captured DECODE step is not usable on ROCm
+# and the second one is disturbed. Measured 2026-09-22 on GLM-5.3-Flash MXFP4
+# TP4, v0.5.19-rocm720-mi35x-20260914, --profile-by-stage:
+#
+#   The decode session's GPU-side tracing starts 19-70 ms after its CPU side.
+#   Both conc4 and conc64 traces hold two step[DECODE bs=N] CPU annotations but
+#   only ONE gpu_user_annotation, and exactly one forward's worth of kernels (91
+#   collectives = 2 per layer x 45 + 1). The first step falls entirely inside
+#   that blind window: conc4's first GPU kernel lands +69.95 ms after the first
+#   annotation, 1.5 ms before the second one. Prefill does not lose a step --
+#   its first kernel precedes its first annotation by 0.36 ms, and a 150-200 ms
+#   forward would swallow the latency anyway. It is decode's 2.5-15 ms steps
+#   that are shorter than the arming delay. B200/CUPTI keeps both steps.
+#
+#   The steps that do survive are also the most disturbed ones. In the same
+#   B200 capture the two decode forwards sit 11.08 ms apart while that run's own
+#   median ITL was 6.08 ms, and the gap is mostly one spin-waiting collective:
+#   the FIRST all-reduce of each forward (launch index 0 and 91 of 182) ran 3265
+#   and 2471 us against a 4.6 us median. Ranks do not arm or flush their trace
+#   buffers in lockstep, so the first collective after a perturbation absorbs
+#   the skew. More steps push that cost into a smaller share of the sample.
+#
+# Cost is trace size and profiler teardown time, both linear in steps. Override
+# with PROF_NUM_STEPS=2 to get the old behaviour.
 if [ "$PROF_COMBINED" == "true" ]; then
-    PROF_CMD=(--profile --profile-num-steps "${PROF_NUM_STEPS:-2}")
+    PROF_CMD=(--profile --profile-num-steps "${PROF_NUM_STEPS:-4}")
     COMBINED_SUFFIX="_Combined"
 else
-    PROF_CMD=(--profile --profile-num-steps "${PROF_NUM_STEPS:-2}" --profile-by-stage)
+    PROF_CMD=(--profile --profile-num-steps "${PROF_NUM_STEPS:-4}" --profile-by-stage)
     COMBINED_SUFFIX=""
 fi
 # Optional: pass --profile-stages to restrict which stages profile-by-stage
