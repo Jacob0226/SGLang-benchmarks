@@ -610,30 +610,34 @@ declare -A SHAPE_SERVER_ARGS=()
 if [ "${I70K_MAX_RUNNING_REQUESTS:-$_i70k_cap_default}" != "0" ]; then
     SHAPE_SERVER_ARGS["70000:300"]="--max-running-requests ${I70K_MAX_RUNNING_REQUESTS:-$_i70k_cap_default}"
 fi
-# 4 steps, not 2, because the first captured DECODE step is not usable on ROCm
-# and the second one is disturbed. Measured 2026-09-22 on GLM-5.3-Flash MXFP4
-# TP4, v0.5.19-rocm720-mi35x-20260914, --profile-by-stage:
+# 4 steps rather than 2. It buys real samples on CUDA and none on ROCm, and the
+# reason is worth stating because the ROCm limit is not a tuning problem.
 #
-#   The decode session's GPU-side tracing starts 19-70 ms after its CPU side.
-#   Both conc4 and conc64 traces hold two step[DECODE bs=N] CPU annotations but
-#   only ONE gpu_user_annotation, and exactly one forward's worth of kernels (91
-#   collectives = 2 per layer x 45 + 1). The first step falls entirely inside
-#   that blind window: conc4's first GPU kernel lands +69.95 ms after the first
-#   annotation, 1.5 ms before the second one. Prefill does not lose a step --
-#   its first kernel precedes its first annotation by 0.36 ms, and a 150-200 ms
-#   forward would swallow the latency anyway. It is decode's 2.5-15 ms steps
-#   that are shorter than the arming delay. B200/CUPTI keeps both steps.
+# ROCm, graph-ON decode: you get exactly ONE forward, whatever this is set to.
+# Measured 2026-09-23, GLM-5.3-Flash MXFP4 TP4, v0.5.19-rocm720-mi35x-20260914:
+# at 2 steps and at 5 steps alike, the decode trace holds that many
+# step[DECODE bs=N] CPU annotations but a single gpu_user_annotation and one
+# forward's worth of kernels (91 collectives = 2 per layer x 45 + 1); the other
+# windows carry 10-15 scheduler bookkeeping kernels and no collective at all.
+# It is HIP graph replay, not a profiler warm-up delay: the SAME shape with
+# --disable-cuda-graph captures both forwards at 2 steps (1782 and 1777
+# kernels, 91 collectives each), and prefill, which runs no graph, keeps all of
+# its. B200 keeps all 5 with cuda graphs on, so this is roctracer/kineto's
+# handling of graph replay rather than anything about graphs in general --
+# below sglang, and not fixable from here.
 #
-#   The steps that do survive are also the most disturbed ones. In the same
-#   B200 capture the two decode forwards sit 11.08 ms apart while that run's own
-#   median ITL was 6.08 ms, and the gap is mostly one spin-waiting collective:
-#   the FIRST all-reduce of each forward (launch index 0 and 91 of 182) ran 3265
-#   and 2471 us against a 4.6 us median. Ranks do not arm or flush their trace
-#   buffers in lockstep, so the first collective after a perturbation absorbs
-#   the skew. More steps push that cost into a smaller share of the sample.
+# CUDA: all N steps arrive, and they are worth having. In a 5-step B200 decode
+# capture only ONE of 455 collective launches exceeded 500 us (4971 us at
+# index 91, the first all-reduce of forward 2, while three ranks waited on the
+# fourth); the other four forwards spent 0.29-0.64 ms in collectives. At 2
+# steps both captured forwards happened to contain one of these, which reads as
+# "every forward pays 2.4-3.3 ms" and is wrong. More steps is what makes the
+# disturbed forward identifiable instead of indistinguishable.
 #
-# Cost is trace size and profiler teardown time, both linear in steps. Override
-# with PROF_NUM_STEPS=2 to get the old behaviour.
+# Kept platform-independent on purpose: the cost on ROCm is trace size and
+# teardown time, both linear in steps, and that is cheaper than a GLM.sh branch
+# whose rationale decays the moment roctracer changes. PROF_NUM_STEPS=2 for the
+# old behaviour.
 if [ "$PROF_COMBINED" == "true" ]; then
     PROF_CMD=(--profile --profile-num-steps "${PROF_NUM_STEPS:-4}")
     COMBINED_SUFFIX="_Combined"
