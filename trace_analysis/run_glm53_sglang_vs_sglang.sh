@@ -52,9 +52,18 @@ BENCH=${BENCH:-$HOME/SGLang-benchmarks}
 RES=$BENCH/results
 ANA=$BENCH/analysis_GLM5.3
 
-AMD=$RES/amd_GLM-5.3-Flash-Quark-MXFP4/rocm_sgl-dev-v0.5.19-rocm720-mi35x-20260914/prof-Fixed-MXFP4-TP4-PRstack
-NV=$RES/nvidia_GLM-5.3-Flash-NVFP4/lmsysorg_sglang-v0.5.20-cu130/prof-Fixed-NVFP4-TP4
+# Defaults are the 5-step captures. --forward-pick median only means something
+# once there are more than two forwards to choose between: in the 2-step B200
+# capture BOTH forwards carried a multi-millisecond spin-waiting collective, so
+# every pick was contaminated, while at 5 steps only one of five does and the
+# median is clean. MI355X still yields exactly one decode forward whatever the
+# step count (HIP graph replay -- see GLM.sh), but that one is clean: all 91 of
+# its collectives are under 20 us.
+# Override AMD= / NV= to re-run against the older 2-step directories.
+AMD=${AMD:-$RES/amd_GLM-5.3-Flash-Quark-MXFP4/rocm_sgl-dev-v0.5.19-rocm720-mi35x-20260914/prof-Fixed-MXFP4-TP4-PRstack-steps5-node172}
+NV=${NV:-$RES/nvidia_GLM-5.3-Flash-NVFP4/lmsysorg_sglang-v0.5.20-cu130/prof-Fixed-NVFP4-TP4-steps5}
 MTP_B200=$RES/nvidia_GLM-5.3-Flash-NVFP4/lmsysorg_sglang-v0.5.20-cu130/prof-Fixed-MTP-NVFP4-TP4
+OUT_TAG=${OUT_TAG:-Docker0914_10PR_steps5}
 
 cd "$BENCH"
 
@@ -73,7 +82,7 @@ for CONC in 4 64; do
     64) ON_P=128; OFF_P=64 ;;
     esac
 
-    OUT=$ANA/Docker0914_10PR_SGLang_i8k_conc${CONC}
+    OUT=$ANA/${OUT_TAG}_SGLang_i8k_conc${CONC}
     SBS=$OUT/sidebyside
     mkdir -p "$SBS"
 
