@@ -23,9 +23,9 @@
 #     B200 side stops at 16317, so B200 does 0.41% less work per prefill
 #     forward. Same asymmetry as the GLM-5.2 comparison.
 #
-#  4. B200 kept only TP-0 traces, so the all-reduce skew split (which needs
-#     every rank to separate transport from load imbalance) runs for MI355X
-#     only.
+#  4. (resolved 2026-09-23) B200 used to carry TP-0 only, which made the
+#     all-reduce skew split impossible on that side. Its traces were
+#     re-uploaded with all four ranks, so the split now runs on both.
 #
 # Deliberately NOT using prof-Fixed-MTP-NVFP4-TP4, the B200 directory with
 # speculative decoding on. Its decode forwards are step[VERIFY bs=4] plus
@@ -154,18 +154,32 @@ for CONC in 4 64; do
         done
     } > "$OUT/forward_wall_overlap.txt" 2>&1
 
-    # MI355X only: a collective's duration on one rank is transport plus however
-    # long that rank waited for the slowest one, and splitting those needs all
-    # four ranks. The B200 directory kept TP-0 alone.
+    # A collective's duration on one rank is transport plus however long that
+    # rank waited for the slowest one, and only all four ranks can tell those
+    # apart -- which is the difference between "the interconnect is slow" and
+    # "the ranks are not arriving together". Both sides now carry four ranks
+    # (B200's traces were TP-0 only until the 2026-09-23 re-upload).
+    #
+    # Decode matters as much as prefill here: it is where a single spin-waiting
+    # launch per forward showed up on B200, and the split says it is skew.
     {
-        echo "######## conc${CONC} PREFILL bs=3 all-reduce skew -- MI355X ########"
-        # shellcheck disable=SC2086
-        python3 trace_analysis/diagnostics/comm_skew_split.py \
-            --traces $AMD/prof_in8192_out16_conc${CONC}_p${ON_P}/*-AMD-TP-*-EXTEND.trace.json.gz \
-            --stack sglang --phase prefill --match "EXTEND bs=3"
-        echo
-        echo "######## B200: skipped -- only TP-0 was kept in $NV ########"
-    } > "$OUT/allreduce_skew_prefill.txt" 2>&1
+        for SIDE in MI355X B200; do
+            if [ "$SIDE" = MI355X ]; then DIR=$AMD; TAG=AMD; else DIR=$NV; TAG=NV; fi
+            d=$DIR/prof_in8192_out16_conc${CONC}_p${ON_P}
+            echo "######## conc${CONC} PREFILL bs=3 -- $SIDE ########"
+            # shellcheck disable=SC2086
+            python3 trace_analysis/diagnostics/comm_skew_split.py \
+                --traces $d/*-${TAG}-TP-*-EXTEND.trace.json.gz \
+                --stack sglang --phase prefill --match "EXTEND bs=3"
+            echo
+            echo "######## conc${CONC} DECODE bs=${CONC} -- $SIDE ########"
+            # shellcheck disable=SC2086
+            python3 trace_analysis/diagnostics/comm_skew_split.py \
+                --traces $d/*-${TAG}-TP-*-DECODE.trace.json.gz \
+                --stack sglang --phase decode --match "DECODE bs=${CONC}"
+            echo
+        done
+    } > "$OUT/allreduce_skew.txt" 2>&1
 
     echo ">>> conc${CONC} done -> $OUT"
 done

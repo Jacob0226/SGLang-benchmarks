@@ -26,8 +26,18 @@ from collections import Counter
 # ROCm names first, then the NVIDIA ones: plain NCCL, and the trtllm MNNVL
 # all-reduce SGLang uses on B200 -- including rmsNormLamport, which is the
 # allreduce+rmsnorm fusion and so is part of the collective, not a norm.
+# The decode collectives are NOT the prefill ones, and leaving them out made
+# this tool return "no median for empty data" on every decode run rather than a
+# wrong answer, which is how it went unnoticed: GLM-5.3-Flash decodes through
+# aiter::cross_device_reduce_2stage on ROCm and sglang::all_reduce_1shot_push
+# on B200, while prefill uses quickreduce/allreduce_prototype and the MNNVL
+# path. `cross_device_reduce` is spelled out rather than reusing the
+# reduce_scatter_cross_device pattern, which does not match it.
+# Deliberately NOT a bare /reduce/: splitKreduce is a GEMM epilogue and
+# moeFinalize is a MoE scatter, neither of them collectives.
 COMM_RE = re.compile(
     r"allreduce_prototype|quickreduce|reduce_scatter_cross_device"
+    r"|cross_device_reduce|all_reduce_\d*shot|all_reduce_1shot_push"
     r"|nccldevkernel|mnnvl_allreduce|shotallreduce|rmsnormlamport",
     re.I,
 )
@@ -45,6 +55,13 @@ def comm_seq(path, stack, match, phase, pick):
     kern = [e for e in evs if isinstance(e, dict) and e.get("ph") == "X"
             and str(e.get("cat", "")).lower() == "kernel"]
     dom = Counter((k["pid"], k["tid"]) for k in kern).most_common(1)[0][0]
+    # Two views. Sigma_kernel stays on the dominant stream, which is what it has
+    # always meant here. The collectives have to be searched across ALL streams:
+    # B200 decode runs 47 of them and puts every all-reduce on a stream that is
+    # not the busiest one, so a dominant-stream-only search finds nothing.
+    kern_all = [{"name": k.get("name", "?"), "ts": float(k["ts"]),
+                 "dur": float(k.get("dur", 0.0))} for k in kern]
+    kern_all.sort(key=lambda k: k["ts"])
     kern = [{"name": k.get("name", "?"), "ts": float(k["ts"]),
              "dur": float(k.get("dur", 0.0))}
             for k in kern if (k["pid"], k["tid"]) == dom]
@@ -67,9 +84,10 @@ def comm_seq(path, stack, match, phase, pick):
     j = bisect.bisect_right(mts, s0)
     s1 = mts[j] if j < len(mts) else kts[-1] + kern[-1]["dur"] + 1
     lo, hi = bisect.bisect_left(kts, s0), bisect.bisect_left(kts, s1)
-    win = kern[lo:hi]
-    tot = sum(k["dur"] for k in win)
-    seq = [(k["ts"], k["dur"]) for k in win if COMM_RE.search(k["name"])]
+    tot = sum(k["dur"] for k in kern[lo:hi])
+    kts_all = [k["ts"] for k in kern_all]
+    alo, ahi = bisect.bisect_left(kts_all, s0), bisect.bisect_left(kts_all, s1)
+    seq = [(k["ts"], k["dur"]) for k in kern_all[alo:ahi] if COMM_RE.search(k["name"])]
     return ann[i]["name"], tot, seq
 
 
