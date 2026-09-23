@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-off probe: which sglang the container runs, and what the Quark-MXFP4
 # checkpoint declares. Output goes to ~/glm53_env.txt on the shared home.
-exec > /home/jacchang/glm53_env.txt 2>&1
+exec > /home/jacchang/SGLang-benchmarks/tmp/logs/glm53_env.txt 2>&1
 
 echo "=== /sgl-workspace/sglang ==="
 git -C /sgl-workspace/sglang log --oneline -3 2>&1

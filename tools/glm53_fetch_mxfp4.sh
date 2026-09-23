@@ -10,7 +10,7 @@
 #
 # Output: ~/glm53_fetch.log
 set -uo pipefail
-exec > /home/jacchang/glm53_fetch.log 2>&1
+exec > /home/jacchang/SGLang-benchmarks/tmp/logs/glm53_fetch.log 2>&1
 
 REPO="${REPO:-amd/GLM-5.3-Flash-Quark-MXFP4}"
 DEST="${DEST:-/data/huggingface/hub/amd/GLM-5.3-Flash-Quark-MXFP4}"

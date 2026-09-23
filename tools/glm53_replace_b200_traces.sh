@@ -11,7 +11,7 @@
 #
 # Output: ~/glm53_replace_b200.log
 set -uo pipefail
-exec > /home/jacchang/glm53_replace_b200.log 2>&1
+exec > /home/jacchang/SGLang-benchmarks/tmp/logs/glm53_replace_b200.log 2>&1
 
 STAGE=/home/jacchang/SGLang-benchmarks/tmp/b200_traces
 DEST_ROOT=/home/jacchang/SGLang-benchmarks/results/nvidia_GLM-5.3-Flash-NVFP4/lmsysorg_sglang-v0.5.20-cu130

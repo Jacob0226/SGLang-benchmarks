@@ -6,7 +6,7 @@
 # shared_experts_fusion_disable_reason() refuses.
 # Output: ~/glm53_shared_experts.txt
 SGLANG_SRC="${SGLANG_SRC:-/home/jacchang/PR/glm53-day0-stack}"
-exec > /home/jacchang/glm53_shared_experts.txt 2>&1
+exec > /home/jacchang/SGLang-benchmarks/tmp/logs/glm53_shared_experts.txt 2>&1
 
 export PYTHONPATH="$SGLANG_SRC/python:/sgl-workspace/aiter"
 export PYTHONDONTWRITEBYTECODE=1

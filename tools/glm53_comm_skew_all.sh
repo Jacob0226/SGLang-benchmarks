@@ -11,7 +11,7 @@
 # above that is waiting for a slower peer.
 #
 # Output: ~/comm_skew_all.txt
-exec > /home/jacchang/comm_skew_all.txt 2>&1
+exec > /home/jacchang/SGLang-benchmarks/tmp/logs/comm_skew_all.txt 2>&1
 cd /home/jacchang/SGLang-benchmarks || exit 1
 
 A=results/amd_GLM-5.3-Flash-Quark-MXFP4/rocm_sgl-dev-v0.5.19-rocm720-mi35x-20260914/prof-Fixed-MXFP4-TP4-PRstack

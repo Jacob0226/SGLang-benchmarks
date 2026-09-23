@@ -4,7 +4,7 @@
 # which only exists there, and the cached token is under the container's root
 # $HOME/.cache/huggingface.
 set -uo pipefail
-exec > /home/jacchang/glm53_upload.log 2>&1
+exec > /home/jacchang/SGLang-benchmarks/tmp/logs/glm53_upload.log 2>&1
 
 export PATH=/home/jacchang/.local/bin:$PATH
 REPO="${REPO:-JacobChang/GLM5.3-Flash-FP4}"

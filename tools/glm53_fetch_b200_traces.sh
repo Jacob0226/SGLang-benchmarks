@@ -9,7 +9,7 @@
 #
 # Output: ~/glm53_fetch_b200.log
 set -uo pipefail
-exec > /home/jacchang/glm53_fetch_b200.log 2>&1
+exec > /home/jacchang/SGLang-benchmarks/tmp/logs/glm53_fetch_b200.log 2>&1
 
 REPO="${REPO:-JacobChang/GLM5.3-Flash-FP4}"
 STAGE="${STAGE:-/home/jacchang/SGLang-benchmarks/tmp/b200_traces}"

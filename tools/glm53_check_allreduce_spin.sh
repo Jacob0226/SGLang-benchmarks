@@ -5,7 +5,7 @@
 # nothing -- that is a barrier absorbing rank skew, not transport. Re-check at
 # conc64 on both platforms before quoting any all-reduce comparison.
 # Output: ~/why_conc64.txt
-exec > /home/jacchang/why_conc64.txt 2>&1
+exec > /home/jacchang/SGLang-benchmarks/tmp/logs/why_conc64.txt 2>&1
 cd /home/jacchang/SGLang-benchmarks || exit 1
 
 B=results/nvidia_GLM-5.3-Flash-NVFP4/lmsysorg_sglang-v0.5.20-cu130/prof-Fixed-NVFP4-TP4

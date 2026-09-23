@@ -3,7 +3,7 @@
 # The question is whether a big Sigma means "communication is expensive" or
 # "one launch per forward sat at a barrier waiting for the other ranks".
 # Output: ~/allreduce_hist.txt
-exec > /home/jacchang/allreduce_hist.txt 2>&1
+exec > /home/jacchang/SGLang-benchmarks/tmp/logs/allreduce_hist.txt 2>&1
 cd /home/jacchang/SGLang-benchmarks || exit 1
 
 B=results/nvidia_GLM-5.3-Flash-NVFP4/lmsysorg_sglang-v0.5.20-cu130/prof-Fixed-NVFP4-TP4

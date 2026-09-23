@@ -7,7 +7,7 @@
 # disabled activity domain rather than a hard limit, there may be a flag.
 #
 # Output: ~/kineto_graph_probe.txt
-exec > /home/jacchang/kineto_graph_probe.txt 2>&1
+exec > /home/jacchang/SGLang-benchmarks/tmp/logs/kineto_graph_probe.txt 2>&1
 
 echo "=== torch / kineto build ==="
 python3 - <<'PY'

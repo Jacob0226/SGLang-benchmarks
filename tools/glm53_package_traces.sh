@@ -4,7 +4,7 @@
 # (the other three ranks are ~3x the bytes and say the same thing).
 # Runs inside the container, which owns those root-created files.
 set -uo pipefail
-exec > /home/jacchang/glm53_package.log 2>&1
+exec > /home/jacchang/SGLang-benchmarks/tmp/logs/glm53_package.log 2>&1
 
 RES=/home/jacchang/SGLang-benchmarks/results/amd_GLM-5.3-Flash-Quark-MXFP4/rocm_sgl-dev-v0.5.19-rocm720-mi35x-20260914/prof-Fixed-MXFP4-TP4-PRstack
 OUT=/home/jacchang/SGLang-benchmarks/tmp/Docker0914-10PR.zip

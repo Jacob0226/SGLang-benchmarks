@@ -3,7 +3,7 @@
 # that rank doing? Same-node CUPTI timestamps are on one clock, so the four
 # traces can be laid on a common axis.
 # Output: ~/who_is_late.txt
-exec > /home/jacchang/who_is_late.txt 2>&1
+exec > /home/jacchang/SGLang-benchmarks/tmp/logs/who_is_late.txt 2>&1
 cd /home/jacchang/SGLang-benchmarks || exit 1
 
 D=results/nvidia_GLM-5.3-Flash-NVFP4/lmsysorg_sglang-v0.5.20-cu130/prof-Fixed-NVFP4-TP4-steps5/prof_in8192_out16_conc4_p8

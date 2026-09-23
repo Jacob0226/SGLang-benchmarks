@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Did GLM.sh capture the same number of decode forwards on both platforms?
 # Output: ~/count_forwards.txt
-exec > /home/jacchang/count_forwards.txt 2>&1
+exec > /home/jacchang/SGLang-benchmarks/tmp/logs/count_forwards.txt 2>&1
 cd /home/jacchang/SGLang-benchmarks || exit 1
 
 A=results/amd_GLM-5.3-Flash-Quark-MXFP4/rocm_sgl-dev-v0.5.19-rocm720-mi35x-20260914/prof-Fixed-MXFP4-TP4-PRstack

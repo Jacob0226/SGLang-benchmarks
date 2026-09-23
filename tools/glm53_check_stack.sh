@@ -3,7 +3,7 @@
 # model load. Runs inside the container against the tree in SGLANG_SRC.
 # Output: ~/glm53_stack_check.txt on the shared home.
 SGLANG_SRC="${SGLANG_SRC:-/home/jacchang/PR/glm53-day0-stack}"
-exec > /home/jacchang/glm53_stack_check.txt 2>&1
+exec > /home/jacchang/SGLang-benchmarks/tmp/logs/glm53_stack_check.txt 2>&1
 
 export PYTHONPATH="$SGLANG_SRC/python:/sgl-workspace/aiter"
 export PYTHONDONTWRITEBYTECODE=1

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Dump the Quark-MXFP4 card + the parts of config.json that decide sharding.
-exec > /home/jacchang/glm53_readme.txt 2>&1
+exec > /home/jacchang/SGLang-benchmarks/tmp/logs/glm53_readme.txt 2>&1
 root=/data/huggingface/hub/amd/GLM-5.3-Flash-Quark-MXFP4
 echo "=== README.md ==="
 head -120 "$root/README.md"

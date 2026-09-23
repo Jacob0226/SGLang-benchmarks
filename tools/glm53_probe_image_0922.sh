@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Probe the 0922 ROCm 10 image before porting the Day-0 PR stack onto it.
 # Output: ~/glm53_image0922.txt
-exec > /home/jacchang/glm53_image0922.txt 2>&1
+exec > /home/jacchang/SGLang-benchmarks/tmp/logs/glm53_image0922.txt 2>&1
 
 echo "=== in-tree sglang ==="
 git config --global --add safe.directory /sgl-workspace/sglang 2>/dev/null

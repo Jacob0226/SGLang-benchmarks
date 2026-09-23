@@ -3,7 +3,7 @@
 # A row-parallel MXFP4 weight is [out, in/2] (two fp4 per byte) with a scale
 # [out, in/32], so the per-rank input shard needs in % (TP*32) == 0.
 # Output: ~/glm53_shapes.txt on the shared home.
-exec > /home/jacchang/glm53_shapes.txt 2>&1
+exec > /home/jacchang/SGLang-benchmarks/tmp/logs/glm53_shapes.txt 2>&1
 
 python3 - <<'PY'
 import json, collections, re
