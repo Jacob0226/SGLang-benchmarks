@@ -141,7 +141,14 @@ source "$IX/benchmarks/runtime_settings.sh"
 export INFMAX_CONTAINER_WORKSPACE="$IX"
 export MODEL="$MODEL_ID"
 export MODEL_PATH="$CKPT"
-export MODEL_PREFIX=glm5.3          # selects the unfiltered 1M-context corpus
+# GLM-5.3-Flash is not GLM-5.3, and upstream gives Flash variants their own
+# prefix (DeepSeek-V4-Pro is dsv4, DeepSeek-V4.1-Flash is dsv41flash). The dot
+# has to stay: resolve_trace_source globs glm5.3*, so glm5.3flash still selects
+# the unfiltered 1M-context corpus, where a dotless glm53flash would fall
+# through to the 256k variant without saying so. It also makes golden_length()
+# look for glm5.3flash_mtp.yaml and fail loudly instead of quietly borrowing
+# GLM-5.3's provisional curve.
+export MODEL_PREFIX=glm5.3flash
 export PRECISION=fp4
 export FRAMEWORK=sglang
 export RUNNER_TYPE=b200
