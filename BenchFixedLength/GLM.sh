@@ -498,26 +498,34 @@ export SGLANG_ROCM_FUSED_DECODE_MLA=0
 export ROCM_QUICK_REDUCE_QUANTIZATION="${QUICK_REDUCE_QUANT:-INT4}"
 export AITER_QUICK_REDUCE_QUANTIZATION="${QUICK_REDUCE_QUANT:-INT4}"
 
-# GLM-5.2 DSA decode PAGED top-k routes to the DeepSeek-V4 "topk_v2" kernel, which
-# is JIT-compiled by hipcc at CUDA-graph capture from
-#   python/sglang/jit_kernel/include/sgl_kernel/deepseek_v4/topk_impl.cuh
-# That header #includes <cooperative_groups.h> -- a CUDA header ROCm 7.2 does not
-# ship -> hipcc "ninja exited with status 1 / cooperative_groups.h not found" ->
-# server dies during startup. Disable topk_v2 until the kernel is hipified.
-# STILL REQUIRED on the 0714 docker (v0.5.15.post1-rocm720-mi35x-20260714):
-# empirically re-confirmed 2026-07-16 -- even though `from sgl_kernel import
-# fast_topk_v2` imports (that is only the dispatcher), the real kernel is still the
-# JIT topk_impl.cuh and it fails at capture exactly as before. Do NOT remove.
-# Auto default by platform (while still allowing manual override):
-#   ROCm -> 0 (workaround for topk_v2 JIT compile failure)
-#   CUDA -> 1
-if [ -z "${SGLANG_OPT_USE_TOPK_V2+x}" ]; then
-    if [ -e /dev/kfd ] || command -v rocm-smi >/dev/null 2>&1; then
-        export SGLANG_OPT_USE_TOPK_V2=0
-    else
-        export SGLANG_OPT_USE_TOPK_V2=1
-    fi
-fi
+# SGLANG_OPT_USE_TOPK_V2 is left UNSET on purpose. It used to be forced to 0 on
+# ROCm here, because topk_v2 is JIT-compiled by hipcc at cuda-graph capture from
+# deepseek_v4/topk_impl.cuh, that header #includes <cooperative_groups.h>, and
+# ROCm 7.2 does not ship it -- "ninja exited with status 1" during startup.
+#
+# Dropped 2026-09-24, for two reasons, neither of which is "the build is fixed":
+#
+#   sglang now makes the same decision itself. arg_groups/model_hook.py, the HIP
+#   arm: `if is_deepseek_dsa(hf_config) and not
+#   envs.SGLANG_OPT_USE_TOPK_V2.is_set(): envs.SGLANG_OPT_USE_TOPK_V2.set(False)`
+#   -- "Prefer HIP top-k by default while honoring an explicit selection." So the
+#   export changed nothing except which code owns the decision, and exporting it
+#   (even as 0) marks it "explicitly selected" and takes the choice away from the
+#   place that knows the model.
+#
+#   It also silently disabled #37889. All three v2 dispatches in
+#   dsa/dsa_topk_backend.py gate on should_use_topk_v2(), and the third is
+#   "Packed PAGED extend (GLM DSA prefill), ROCm-only" -- that block IS #37889,
+#   which reports 4.9% better TTFT. #36851 ("Enable topk v2 GLM ROCm") and
+#   #37889 are both in rocm/sgl-dev:v0.5.20-rocm10-mi35x-20260923
+#   (ed122ea984, 3c71bb018a), and GLM-5.3-Flash meets that block's conditions:
+#   index_topk 2048 satisfies `0 < topk <= 2048`, the logits are fp32, and
+#   row_starts / token_to_batch_idx are both present on this path.
+#
+# So: let sglang default it (False on HIP DSA), and opt in explicitly to measure
+#   SGLANG_OPT_USE_TOPK_V2=1 ./GLM.sh ...
+# On ROCm 7.2 images that opt-in may still die in hipcc at capture; the header
+# still carries the cooperative_groups include and a this_cluster() call.
 # Dense-decode "Design A" dual-graph (dense-decode-konly feature): captures BOTH a
 # dense k-only and a sparse decode cuda-graph and dispatches per step on
 # max_kv_len vs index_topk. For short context (kv_len <= index_topk, e.g. i1k) it
@@ -528,11 +536,12 @@ fi
 # decode graphs (more capture time + memory). Only effective on branches that have
 # the dense-decode feature + DSA models (ignored otherwise).
 export SGLANG_DSA_DECODE_DUAL_GRAPH="${SGLANG_DSA_DECODE_DUAL_GRAPH:-1}"
-# DSA indexer query Hadamard + FP8 quant fused into one Triton kernel (PR #30715).
-# Opt-in, shape-guarded (gfx950, head_dim==block_size==128); default OFF in-product,
-# so enable it here to avoid silently benchmarking the two-pass path. Override with
-# SGLANG_DSA_FUSE_HADAMARD_QUANT=0. Ignored on branches without the feature.
-export SGLANG_DSA_FUSE_HADAMARD_QUANT="${SGLANG_DSA_FUSE_HADAMARD_QUANT:-1}"
+# SGLANG_DSA_FUSE_HADAMARD_QUANT used to be exported here for PR #30715 (DSA
+# indexer Hadamard + FP8 quant fused into one Triton kernel). Removed 2026-09-24:
+# that PR is not applied and the variable does not exist in current sglang -- it
+# appears nowhere under python/sglang, and `rotate_activation` on HIP imports
+# fast_hadamard_transform unconditionally, with no gate to flip. The export was
+# inert, and an inert export reads as a knob that was measured.
 # export AITER_ONLINE_TUNE=1
 
 # ===================== GLM-5.3-Flash (ROCm/gfx950, PR #36607) =====================
