@@ -15,7 +15,7 @@ import os
 TCO_PER_CHIP_HR = {"mi355x": 1.50, "b200": 1.73, "b300": 2.26}
 
 
-def load(root, label=None):
+def load(root, label=None, hw="mi355x"):
     rows = []
     for path in glob.glob(os.path.join(root, "**", "*.json"), recursive=True):
         if "aiperf_artifacts" in path:
@@ -39,7 +39,7 @@ def load(root, label=None):
                 "itl_p90_ms": latency["itl"]["p90"] * 1000,
                 "ttft_p90": latency["ttft"]["p90"],
                 "per_gpu_tps": per_gpu,
-                "mtok_per_usd": per_gpu * 3600 / TCO_PER_CHIP_HR["mi355x"] / 1e6,
+                "mtok_per_usd": per_gpu * 3600 / TCO_PER_CHIP_HR[hw] / 1e6,
                 "ok": blob["num_requests_successful"],
                 "total": blob["num_requests_total"],
             }
@@ -51,12 +51,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("dirs", nargs="+")
     parser.add_argument("--label", action="append", default=None)
+    parser.add_argument("--hw", default="mi355x", choices=sorted(TCO_PER_CHIP_HR))
     args = parser.parse_args()
 
     rows = []
     for i, d in enumerate(args.dirs):
         label = args.label[i] if args.label and i < len(args.label) else None
-        rows.extend(load(d, label))
+        rows.extend(load(d, label, args.hw))
     rows.sort(key=lambda r: (r["label"], r["conc"]))
 
     head = (
