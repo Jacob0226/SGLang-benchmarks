@@ -176,7 +176,9 @@ Two things this settles:
   0.4–0.6% the trace predicted. Config alone leaves conc64 flat because above
   M=16 the router GEMM is dispatched through `aiter.tuned_gemm` to hipblaslt.
   0.4% is not worth shipping — see section 5. The scope of this work is
-  therefore **conc <= 16**, where it is worth 9%.
+  therefore **conc <= 8**, where it is worth 9%; conc12/16 land on DEFAULT's
+  `M_LEQ_16`, which does not spill and is already at 7.1 us, so there is only
+  ~1% there.
 
 GSM8K across runs: 96.36 / 96.44 / 96.82 / 96.89 / 97.04 — no trend, spread
 consistent with sampling noise on 1319 questions.
@@ -232,17 +234,26 @@ arms over **conc 4, 8, 16, 24, 32, 64** — `CONC_OVERRIDE="4 8 16 24 32 64"` in
 `tools/run_glm53_bench_0928_stock.sh` and `..._full.sh`. One server start
 covers all six cells; roughly 40 minutes for the pair.
 
-This draws the gate: conc4/8/16 resolve to M<=16 and go through triton, conc24
-and above are dispatched to hipblaslt and must not move. It turns "the scope is
-concurrency <= 16" from an inference into a measurement, and the aiter PR
-guidance asks for exactly this — the whole gated range plus the points just
-outside it that have to stay flat.
+This draws the gate, and the gate is **narrower than it first looks**. What
+matters is not whether a bucket is overridden but whether DEFAULT's entry for
+it spills, and only `M_LEQ_8` does among the reachable ones:
 
-Expected from the kernel numbers: conc8 and conc16 should land near conc4's
--9%. The GEMM is bound by the 2.36 MB weight read, so the absolute saving
-(~0.93 ms per forward, 42 launches x ~22 us) barely changes with M in that
-range, and the conc8 baseline ITL should sit only slightly above conc4's
-9.51 ms.
+| conc | M | bucket | DEFAULT wpe | DEFAULT | tuned | saved per forward | expected |
+|---|---|---|---|---|---|---|---|
+| 1..8 | <=8 | `M_LEQ_8` | **8, spills** | 27.4 us | 5.2 us | **0.93 ms** | **~-9%** |
+| 12, 16 | <=16 | `M_LEQ_16` | 6, clean | 7.1 us | 5.2 us | 0.08 ms | **~-1%** |
+| 24+ | >=24 | (hipblaslt) | — | 8.5 us | — | 0 | flat |
+
+So the end-to-end claim should be **concurrency <= 8**, not <= 16. `M_LEQ_16`
+is the bucket cited elsewhere in this document as evidence that `wpe=6` does
+not spill; its baseline is already healthy, so there is little to win there.
+
+conc12/16 also needs measuring rather than predicting because the two harnesses
+disagree on its *sign*: ours has DEFAULT at 7.12 and the tuned entry at 5.17 us
+(a small win), the other session's has DEFAULT at 4.80 and its ks8 entry at
+5.67 us (a small loss, which is why their notes say `M_LEQ_16` should keep
+DEFAULT). Whichever config ships, check this cell before claiming anything
+about it.
 
 ### Task 3 — open the aiter PR
 

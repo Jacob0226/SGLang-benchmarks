@@ -83,7 +83,9 @@ TTFT is unchanged, as it has to be: prefill runs at M in the thousands and resol
   reasonable at M=64 (8.52 -> 6.48 us). The two JSON entries stay because the
   op benchmark reaches them directly and they are the largest ratios in the
   kernel table; just never claim an end-to-end effect for them. If asked, the
-  end-to-end scope of this PR is concurrency <= 16.
+  end-to-end scope of this PR is concurrency <= 8: conc12/16 resolve to
+  `M_LEQ_16`, whose DEFAULT entry uses `waves_per_eu=6`, does not spill and is
+  already at 7.1 us, so only ~1% is available there.
 - **Not raising `waves_per_eu=8` in `DEFAULT.json` itself.** Every bucket with
   it spills, so this is not specific to N=288, but changing DEFAULT needs far
   wider measurement than one GEMM.
