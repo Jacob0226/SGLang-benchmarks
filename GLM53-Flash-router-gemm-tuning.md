@@ -288,14 +288,76 @@ So "improve conc4..64" needs two different changes:
 
 | concurrency | M | router GEMM path | lever |
 |---|---|---|---|
-| 4..16 | <=16 | triton `gemm_a16w16` | this JSON config (validated) |
-| 24..64 | >=24 | `tuned_gemm` -> hipblaslt | add N=288 rows to `bf16_tuned_gemm.csv` (untested) |
+| 4..16 | <=16 | triton `gemm_a16w16` | the JSON config |
+| 24..64 | >=24 | `tuned_gemm` -> hipblaslt | two rows in `glm53_bf16_tuned_gemm.csv` |
 
-Relevant: `aiter/configs/model_configs/glm53_bf16_tuned_gemm.csv` already holds
-N=288/K=4096 rows at M=2/4/16 with `libtype=triton` (6.76 / 6.83 / 5.39 us),
-but the runtime table `aiter/configs/bf16_tuned_gemm.csv` has none, so that
-tuning never reaches a running server. Our 4.36–6.04 us is faster than the
-6.83 us recorded there for M=4.
+### Routing conc24..64 to triton
+
+`aiter/configs/model_configs/glm53_bf16_tuned_gemm.csv` already holds
+N=288/K=4096 rows at M=2/4/16 with `libtype=triton` (6.76 / 6.83 / 5.39 us).
+`get_config_file` merges every `model_configs/*bf16_tuned_gemm*.csv` into
+`/tmp/aiter_configs/bf16_tuned_gemm.csv`, which is what a running server reads,
+so those three rows *are* live — that is why conc4..16 reaches triton at all.
+There is simply nothing above M=16.
+
+`tuned_gemm` matches on exact M, then `get_padded_m(M,N,K,0)`, then
+`get_padded_m(M,N,K,1)`, so two rows cover the whole range:
+
+| decode bs | exact | padded gl=0 | padded gl=1 | matches |
+|---|---|---|---|---|
+| 24, 32 | 24 / 32 | 32 | 32 | **M=32 row** |
+| 40, 48 | 40 / 48 | 48 | **64** | **M=64 row** |
+| 56, 64 | 56 / 64 | 64 | 64 | **M=64 row** |
+
+`tools/glm53_add_tunedgemm_rows.sh` appends them (`--revert` restores). Since
+`triton_gemm()` calls `gemm_a16w16()` without an explicit config, the tile still
+comes from the JSON above, so the two changes compose. Verified: M=1..64 all
+report `libtype=triton`, M=72/128 deliberately still `torch`.
+
+Trace result at conc64 — the hipblaslt group loses exactly the 42 router
+launches:
+
+| conc64, per forward | stock | + JSON | + JSON + CSV |
+|---|---|---|---|
+| `Cijk_..._MT16x16x1024` | 87 launches, 0.736 ms | 87, 0.732 ms | **45, 0.390 ms** |
+| all `Cijk` | 1.468 ms (200) | 1.468 ms (200) | 1.132 ms (158) |
+| triton `a16w16` K=4096 | 0.549 ms | 0.560 ms | 0.834 ms |
+| **total** | **2.017 ms** | 2.028 ms | **1.966 ms** |
+
+Router GEMM per launch: hipblaslt 8.52 us -> triton **6.48 us**. Net saving
+0.05–0.086 ms per forward, i.e. **0.4–0.6% of a 14.3 ms conc64 ITL**.
+
+That is an order of magnitude less than conc4 gets, and for a clear reason:
+hipblaslt was already doing a reasonable job at M=64 (8.5 us), whereas at M<=16
+the triton DEFAULT path was catastrophic (28 us). The mechanism is right and
+the direction is right, but at conc64 the effect sits at the edge of end-to-end
+noise.
+
+### Same-image trace A/B (0928)
+
+| | conc4 router | conc64 router |
+|---|---|---|
+| stock | 28.04 us (triton DEFAULT) | 8.52 us (hipblaslt) |
+| + JSON | **6.04 us** | 8.48 us (unchanged) |
+| + JSON + CSV | **5.96 us** | **6.48 us** |
+
+### End-to-end
+
+i8k, TP4, 20 requests per cell. The 0928 numbers use the single-kernel JSON
+plus the two CSV rows; the 0923 rows are the earlier split-K JSON and its
+baseline. **There is no same-image 0928 stock e2e baseline yet** — the cluster
+token expired before it could run — so the cross-image comparison below is
+supporting evidence only, and the same-image trace A/B above is the primary
+result.
+
+| image / config | conc4 TPOT | conc4 ITL | conc64 TPOT | conc64 ITL |
+|---|---|---|---|---|
+| 0923 stock | 10.35 ms | 9.75 ms | 26.71 ms | 14.38 ms |
+| 0923 + split-K JSON | 9.49 ms | 8.88 ms | 26.67 ms | 14.35 ms |
+| **0928 + single JSON + CSV** | **9.22 ms** | **8.61 ms** | 26.73 ms | 14.32 ms |
+
+conc4 TTFT is unchanged throughout (237.35 / 231.95 / 237.19 ms), as it must be
+— nothing here touches the prefill M. GSM8K 96.36% / 97.04% / 96.82%.
 
 ## Open
 
