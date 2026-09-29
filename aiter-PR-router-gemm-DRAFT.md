@@ -74,15 +74,16 @@ TTFT is unchanged, as it has to be: prefill runs at M in the thousands and resol
   8.68 vs 6.04 us. The decode graph has a ~3.8 us per-kernel floor and
   `NUM_KSPLIT>1` pays it twice for a reduction over 18 KB. Every shipped entry
   is `NUM_KSPLIT=1`. Worth a reply if a reviewer asks.
-- **`M_LEQ_32` / `M_LEQ_64` are measured but unreachable for this model.** Above
-  M=16 the gate GEMM is dispatched through `aiter.tuned_gemm`, which has no
-  N=288 row above M=16 and falls back to `torch solution:0` (hipblaslt). Fixing
-  that needs two rows in `model_configs/glm53_bf16_tuned_gemm.csv` (M=32 and
-  M=64 cover decode batch 24..64 through `get_padded_m`) and is a separate PR.
-  It is worth only 0.4-0.6% of a 14.3 ms conc64 ITL, because hipblaslt is
-  already reasonable at M=64: 8.52 -> 6.48 us per launch. The entries are still
-  correct for any caller reaching the triton path directly, and `M_LEQ_32` is
-  the largest ratio in the table.
+- **`M_LEQ_32` / `M_LEQ_64` are measured but unreachable for this model**, and
+  that is fine. Above M=16 the gate GEMM is dispatched through
+  `aiter.tuned_gemm`, which has no N=288 row above M=16 and falls back to
+  hipblaslt. Routing it back needs two rows in
+  `model_configs/glm53_bf16_tuned_gemm.csv`; we measured that and dropped it,
+  because it buys 0.4% of a 14.3 ms conc64 ITL -- hipblaslt is already
+  reasonable at M=64 (8.52 -> 6.48 us). The two JSON entries stay because the
+  op benchmark reaches them directly and they are the largest ratios in the
+  kernel table; just never claim an end-to-end effect for them. If asked, the
+  end-to-end scope of this PR is concurrency <= 16.
 - **Not raising `waves_per_eu=8` in `DEFAULT.json` itself.** Every bucket with
   it spills, so this is not specific to N=288, but changing DEFAULT needs far
   wider measurement than one GEMM.

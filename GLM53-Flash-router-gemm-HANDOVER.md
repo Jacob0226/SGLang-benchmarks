@@ -175,6 +175,8 @@ Two things this settles:
 - **conc64 only moves with the CSV rows** (14.38 → 14.32, −0.4%), matching the
   0.4–0.6% the trace predicted. Config alone leaves conc64 flat because above
   M=16 the router GEMM is dispatched through `aiter.tuned_gemm` to hipblaslt.
+  0.4% is not worth shipping — see section 5. The scope of this work is
+  therefore **conc <= 16**, where it is worth 9%.
 
 GSM8K across runs: 96.36 / 96.44 / 96.82 / 96.89 / 97.04 — no trend, spread
 consistent with sampling noise on 1319 questions.
@@ -241,17 +243,15 @@ numbers and the section 4 end-to-end table first.
   `ci:sglang`'s DeepSeek-R1/Qwen3.5 or `ci:atom`'s GPT-OSS.
 - Open as draft until CI is green.
 
-### Task 4 (separate PR) — conc24..64
+### conc24..64 — investigated, deliberately dropped
 
-Two rows in `aiter/configs/model_configs/glm53_bf16_tuned_gemm.csv`:
+**Not doing this.** Recorded here so nobody re-derives it.
 
-```
-gfx950,256,32,288,4096,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,5.27,auto,0.0,14.3,481.2
-gfx950,256,64,288,4096,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,5.56,auto,0.0,27.2,456.1
-```
-
+Above M=16 the router GEMM leaves the triton path: `aiter.tuned_gemm` finds no
+N=288 row above M=16 and falls back to `torch solution:0` (hipblaslt). Two rows
+in `aiter/configs/model_configs/glm53_bf16_tuned_gemm.csv` route it back —
 `tuned_gemm` matches exact M, then `get_padded_m(M,N,K,0)`, then
-`get_padded_m(M,N,K,1)`, so two rows cover decode batch 24..64:
+`get_padded_m(M,N,K,1)`, so M=32 and M=64 cover decode batch 24..64:
 
 | decode bs | exact | gl=0 | gl=1 | matches |
 |---|---|---|---|---|
@@ -259,9 +259,18 @@ gfx950,256,64,288,4096,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,
 | 40, 48 | – | 48 | **64** | M=64 row |
 | 56, 64 | – | 64 | 64 | M=64 row |
 
-`triton_gemm()` calls `gemm_a16w16()` with no explicit config, so the tile still
-comes from the JSON — the two changes compose. Worth only 0.4–0.6% of conc64
-ITL, because hipblaslt is already reasonable at M=64 (8.52 → 6.48 us).
+It works — the hipblaslt group loses exactly its 42 router launches and the
+kernel goes 8.52 → 6.48 us — but it buys **0.4% of conc64 ITL** (14.38 → 14.32
+ms), because hipblaslt is already reasonable at M=64. That is at or below
+end-to-end noise, and not worth a second PR and review cycle.
+`tools/glm53_add_tunedgemm_rows.sh` still has the change if it is ever wanted.
+
+Consequence for the PR: the JSON's `M_LEQ_32` and `M_LEQ_64` entries are then
+unreachable for this model. **Keep them anyway.** The aiter op benchmark in
+Task 2 calls `gemm_a16w16` directly and bypasses `tuned_gemm`, so those two M
+values are measured legitimately (35.2 → 5.3 and 13.7 → 5.6 us), and the
+entries are correct for any caller that does reach the triton path there. Do
+not claim an end-to-end effect for them.
 
 ---
 
