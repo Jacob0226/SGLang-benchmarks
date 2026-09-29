@@ -224,6 +224,26 @@ The command a reviewer would run is:
 python3 op_tests/op_benchmarks/triton/bench_gemm_a16w16.py --shape <M> 288 4096 --metric time
 ```
 
+### Task 2b — sweep concurrency to show where the effect stops
+
+Only conc4 and conc64 have ever been measured end to end, so the table has a
+big win at one end, nothing at the other, and nothing in between. Rerun both
+arms over **conc 4, 8, 16, 24, 32, 64** — `CONC_OVERRIDE="4 8 16 24 32 64"` in
+`tools/run_glm53_bench_0928_stock.sh` and `..._full.sh`. One server start
+covers all six cells; roughly 40 minutes for the pair.
+
+This draws the gate: conc4/8/16 resolve to M<=16 and go through triton, conc24
+and above are dispatched to hipblaslt and must not move. It turns "the scope is
+concurrency <= 16" from an inference into a measurement, and the aiter PR
+guidance asks for exactly this — the whole gated range plus the points just
+outside it that have to stay flat.
+
+Expected from the kernel numbers: conc8 and conc16 should land near conc4's
+-9%. The GEMM is bound by the 2.36 MB weight read, so the absolute saving
+(~0.93 ms per forward, 42 launches x ~22 us) barely changes with M in that
+range, and the conc8 baseline ITL should sit only slightly above conc4's
+9.51 ms.
+
 ### Task 3 — open the aiter PR
 
 ```bash
