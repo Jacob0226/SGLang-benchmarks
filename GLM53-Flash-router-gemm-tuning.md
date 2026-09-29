@@ -22,10 +22,10 @@ It is the entire low-concurrency regression between
 
 Same kernel, same 42 launches, same tile — 8.4 → 28.1 µs per launch (3.35x).
 
-## Root cause
+## Root cause: `waves_per_eu=8` makes the kernel spill registers
 
 gfx950 ships tuned `GEMM-A16W16` configs for N=128/256/384/640/1280/2880/5120
-at various K, but **not for N=288, K=4096**. The lookup falls through to
+at various K, but **not for N=288, K=4096**, so the lookup falls through to
 `DEFAULT.json`'s `M_LEQ_8`:
 
 ```
@@ -33,21 +33,41 @@ BLOCK_SIZE_M=16, BLOCK_SIZE_N=16, BLOCK_SIZE_K=256, NUM_KSPLIT=1,
 num_warps=8, num_stages=3, waves_per_eu=8, cache_modifier=".cg"
 ```
 
-Two problems at M=4:
+An earlier version of this document blamed the tile — `BLOCK_SIZE_M=16` for a
+4-row problem, and a grid of 18 workgroups on 256 CUs. **That was wrong.** The
+tile is fine. Holding it fixed at `BM=16/BN=16/BK=256, NUM_KSPLIT=1` and
+walking only (`num_warps`, `num_stages`, `waves_per_eu`, `cache_modifier`) at
+M=4 (`tools/glm53_ablate_default_knobs.py`, gfx950 / triton 3.8):
 
-- `BLOCK_SIZE_M=16` wastes 12 of every 16 rows — the problem is 4 rows tall.
-- `NUM_KSPLIT=1` with `BLOCK_SIZE_N=16` gives a grid of **18 workgroups on 256
-  CUs**, so 93% of the GPU is idle.
+| warps | stages | waves_per_eu | cache_modifier | us | n_regs | n_spills | |
+|---|---|---|---|---|---|---|---|
+| 8 | 3 | **8** | `.cg` | **27.24** | 64 | **16** | DEFAULT `M_LEQ_8` |
+| 8 | 2 | **8** | None | 25.38 | 64 | **21** | |
+| 4 | 2 | **8** | `.cg` | 22.47 | 64 | **24** | |
+| 4 | 3 | 6 | `.cg` | 7.40 | 80 | 0 | DEFAULT `M_LEQ_16` |
+| 4 | 3 | 0 | None | **5.76** | 82 | 0 | fastest on this tile |
 
-The tuned neighbour `N=128-K=4096` already knows this and uses
-`BLOCK_SIZE_M=4, NUM_KSPLIT=8`.
+Two independent effects, both visible in the table:
 
-Note these are two separate facts. DEFAULT was *always* wrong for this shape
-(even 0914's 8.4 µs is 1.7x off what the hardware can do); something in the
-0923 image then made the same config 3.35x worse again. The image moved ROCm
-7.2→10.0, triton 3.7→3.8, AITER `4ad99832`→`acf8fdf93` and python 3.10→3.12 in
-one step, so which of the four caused the 3.35x is not established. Tuning the
-config makes the question moot.
+1. **`waves_per_eu=8` caps the register budget at 64 and forces 16–24 spills**,
+   costing 3–4x. Every `wpe=8` row spills; every `wpe<=6` row has zero spills
+   and 80–88 registers. This is what makes the router GEMM 27 us.
+2. **`cache_modifier=".cg"` costs a further ~25%** independently of spilling
+   (5.76→7.27, 8.24→11.36, 12.65→15.55).
+
+So the same DEFAULT tile reaches 5.76 us once those two knobs are corrected —
+close to the 5.17 us found by sweeping tiles as well. The fix is about the
+occupancy hint, not the tile shape.
+
+This is not specific to N=288: any shape landing on DEFAULT's `M_LEQ_8` or
+`M_LEQ_32` (both `waves_per_eu=8`) will spill. Measured on the router GEMM
+shape, `M_LEQ_32` is the worst bucket of all at **35.20 us**, and `M_LEQ_16`
+(`waves_per_eu=6`) is 3.8x faster than `M_LEQ_8` on an almost identical tile.
+
+The 0914→0923 image step moved ROCm 7.2→10.0, triton 3.7→3.8, AITER
+`4ad99832`→`acf8fdf93` and python 3.10→3.12 together, so which of the four
+turned the spills from tolerable into 3.35x worse is not established. Removing
+the spills makes the question moot.
 
 ## Microbenchmark
 
@@ -210,10 +230,79 @@ Separately: nothing in aiter reads `configs/model_configs/*.csv` at runtime
 (grep finds zero call sites) — those are offline tuning inputs/outputs. The
 runtime fmoe lookup uses `aiter/configs/tuned_fmoe.csv`.
 
+## 0928 image and the conc24..64 question
+
+Re-checked on `rocm/sgl-dev:v0.5.20-rocm10-mi35x-20260928`: AITER is still
+`acf8fdf93` (#5414), `GEMM-A16W16-N=288-K=4096.json` is still absent, and
+triton/torch/ROCm/python are unchanged from 0923. Only sglang moved
+(`0318a8d0af`). So the gap is still open upstream.
+
+### Per-bucket sweep
+
+`tools/glm53_sweep_router_buckets.py`, N=288/K=4096, one M per bucket, GEMM and
+split-K reduce timed in separate HIP graphs:
+
+| M | bucket | DEFAULT | best (split-K allowed) | best single-kernel |
+|---|---|---|---|---|
+| 4 | `M_LEQ_4` | 27.11 us | 4.72 us (2 kernels) | 5.44 us |
+| 8 | `M_LEQ_8` | 27.41 us | 4.72 us (2 kernels) | 5.19 us |
+| 16 | `M_LEQ_16` | 7.12 us | 4.84 us (2 kernels) | 5.17 us |
+| 32 | `M_LEQ_32` | 35.20 us | 5.04 us (2 kernels) | 5.27 us |
+| 64 | `M_LEQ_64` | 13.68 us | 5.34 us (2 kernels) | 5.56 us |
+
+### Single kernel beats split-K in the model
+
+The decode graph has a soft per-kernel floor of ~3.7–3.9 us
+(`trace_analysis/diagnostics/kernel_duration_floor.py`: 25 of 84 kernels have a
+median under 4 us, but p5/p10 pile up at 3.76/3.84 us). `NUM_KSPLIT>1` pays it
+twice. Trace numbers at conc4:
+
+| config | kernels | in-model |
+|---|---|---|
+| DEFAULT | 1 | 28.04 us |
+| split-K (`BM=4 BK=512 KSPLIT=4`) | 2 | 4.36 + 4.32 = 8.68 us |
+| **single (`BM=1 BK=512 KSPLIT=1`)** | **1** | **6.04 us** |
+
+The microbenchmark had the split-K pair at 4.72 us, below the 8.68 us the trace
+shows, because back-to-back graph nodes pipeline the launch overhead in a
+microbenchmark in a way they do not in the model. Config choice has to be
+confirmed against traces.
+
+### conc24..64 is a different code path
+
+The installed config does nothing for conc64, and not because the lookup is
+wrong. Instrumenting `get_gemm_config` in the running server
+(`tools/glm53_trace_config_lookups.sh`) shows `GEMM-A16W16` is only ever asked
+for N=288 at **M=1, 2, 4, 8, 16** — never at M>=24. Above that the router GEMM
+leaves the triton path and goes through `aiter.tuned_gemm`, which finds no
+N=288 row in `aiter/configs/bf16_tuned_gemm.csv` and falls back to
+`torch solution:0` (hipblaslt). At conc64 it lands in the hipblaslt
+`Cijk_..._MT16x16x1024` group, 87 launches per forward at 8.48 us, 3.66 ms total.
+
+A caution about an earlier reading of the conc64 trace: the triton kernel
+visible there (`BM=64 BN=32 BK=256`, 34 launches per forward) is **not** the
+router. 34 is the KDA linear-attention layer count; the router fires 42 times,
+matching the MoE layer count. It is N=6144/K=4096, a KDA projection.
+
+So "improve conc4..64" needs two different changes:
+
+| concurrency | M | router GEMM path | lever |
+|---|---|---|---|
+| 4..16 | <=16 | triton `gemm_a16w16` | this JSON config (validated) |
+| 24..64 | >=24 | `tuned_gemm` -> hipblaslt | add N=288 rows to `bf16_tuned_gemm.csv` (untested) |
+
+Relevant: `aiter/configs/model_configs/glm53_bf16_tuned_gemm.csv` already holds
+N=288/K=4096 rows at M=2/4/16 with `libtype=triton` (6.76 / 6.83 / 5.39 us),
+but the runtime table `aiter/configs/bf16_tuned_gemm.csv` has none, so that
+tuning never reaches a running server. Our 4.36–6.04 us is faster than the
+6.83 us recorded there for M=4.
+
 ## Open
 
-- Phase-2 sweep of the remaining M buckets (M=64 for conc64, prefill M) —
-  `tools/glm53_bench_router_gemm_allM.py`, not yet run to completion.
-- `aiter.tuned_gemm` separately reports untuned shapes at runtime, e.g.
-  `M:512, N:4096, K:1536 ... not found tuned config in bf16_tuned_gemm.csv,
-  using torch solution:0`. Different lookup table, possibly another easy win.
+- Add N=288/K=4096 rows to the runtime `bf16_tuned_gemm.csv` for M>=24 and
+  measure whether routing them to triton beats hipblaslt's 8.48 us.
+- Propose the `waves_per_eu=8` spilling problem in DEFAULT's `M_LEQ_8` /
+  `M_LEQ_32` upstream. It is shape-independent, so it needs wider measurement
+  than this one GEMM before changing DEFAULT.
+- `aiter.tuned_gemm` reports many other untuned shapes at runtime, e.g.
+  `M:512, N:4096, K:1536 ... using torch solution:0`.
