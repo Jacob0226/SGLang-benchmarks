@@ -24,10 +24,12 @@ def load(root, label=None, hw="mi355x"):
             with open(path) as fh:
                 blob = json.load(fh)
             metrics = blob["request_metrics"]
+            latency, throughput = metrics["latency"], metrics["throughput"]
+            per_gpu = throughput["per_gpu"]["total_tput_tps"]
         except (json.JSONDecodeError, KeyError, OSError):
+            # A point that died mid-warmup still writes a result JSON, but with
+            # no successful requests there is no throughput block to read.
             continue
-        latency, throughput = metrics["latency"], metrics["throughput"]
-        per_gpu = throughput["per_gpu"]["total_tput_tps"]
         rows.append(
             {
                 "label": label or os.path.basename(root.rstrip("/")),
