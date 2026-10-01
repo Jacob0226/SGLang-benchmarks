@@ -13,8 +13,8 @@
 # for every GLM-5.3-Flash-specific backend choice (DSA trtllm, flashinfer_trtllm
 # MoE, fp8 KV, modelopt_fp4).
 #
-# Driven by ix_agentx_glm53flash_b200.sh, which supplies the CI env; it is not
-# meant to be run standalone.
+# Driven by ix_agentx_glm53flash.sh --platform b200, which supplies the CI env;
+# it is not meant to be run standalone.
 #
 # Architecture facts that drive the settings below (config.json):
 #   45 layers, hybrid: 11 DeepSeek-sparse-attention (MLA+DSA) layers at

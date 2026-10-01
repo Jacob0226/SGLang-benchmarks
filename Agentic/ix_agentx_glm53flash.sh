@@ -1,34 +1,30 @@
 #!/usr/bin/env bash
-# InferenceX AgentX sweep for GLM-5.3-Flash NVFP4 on B200 / SGLang, TP4.
+# InferenceX AgentX sweep for GLM-5.3-Flash FP4 on B200 (NVFP4) or MI355X
+# (Quark MXFP4) / SGLang, TP4.
 #
-# Runs recipe_glm53flash_fp4_b200_sglang_mtp.sh once per concurrency with the
-# environment the run-sweep workflow would inject, so the client, the corpus,
-# the result schema and the failure gates are InferenceX's rather than ours.
-# The recipe itself is local: upstream has no GLM-5.3-Flash entry (its only
-# GLM-5.3 config is the full model on MI355X TileRT), so the B200 SGLang shape
-# is modelled on glm5.2-fp4-b200-sglang-agentic-mtp.
+# Runs recipe_glm53flash_fp4_<platform>_sglang_mtp.sh once per concurrency with
+# the environment the run-sweep workflow would inject, so the client, the
+# corpus, the result schema and the failure gates are InferenceX's rather than
+# ours. Both platforms go through this one driver so that everything except the
+# recipe's server flags is the same code; that is what makes a B200 vs MI355X
+# curve a chip comparison. The recipes are local: upstream has no
+# GLM-5.3-Flash entry, so each is modelled on its glm5.2_fp4_<platform>_sglang_mtp.
 #
-# Run this INSIDE the container (jacchang_GLM53-Flash-MTP,
-# lmsysorg/sglang:v0.5.20-cu130). GPU selection comes from CUDA_VISIBLE_DEVICES
-# or --gpus.
+# Run this INSIDE the container (B200: lmsysorg/sglang:v0.5.20-cu130, MI355X:
+# rocm/sgl-dev:v0.5.20-rocm10-mi35x-20260928). --platform defaults to mi355x
+# when rocm-smi is on PATH, else b200. GPU selection comes from
+# CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES or --gpus.
 #
-#   ./ix_agentx_glm53flash_b200.sh                      # TP4, conc 1 4 8 12 16
-#   ./ix_agentx_glm53flash_b200.sh --smoke --conc 4     # plumbing check, ~20 min
-#   ./ix_agentx_glm53flash_b200.sh --quick --conc 16    # A/B iteration, ~30 min
-#   ./ix_agentx_glm53flash_b200.sh --mtp-steps 3 --conc 16    # MTP depth A/B
-#   ./ix_agentx_glm53flash_b200.sh --hicache-size 200         # add a host tier
-#   ./ix_agentx_glm53flash_b200.sh --dry-run            # print the env and exit
+#   ./ix_agentx_glm53flash.sh                      # TP4, conc 1 4 8 12 16
+#   ./ix_agentx_glm53flash.sh --smoke --conc 4     # plumbing check, ~20 min
+#   ./ix_agentx_glm53flash.sh --quick --conc 16    # A/B iteration, ~30 min
+#   ./ix_agentx_glm53flash.sh --mtp-steps 3 --conc 16    # MTP depth A/B
+#   ./ix_agentx_glm53flash.sh --hicache-size 200         # add a host tier
+#   ./ix_agentx_glm53flash.sh --platform b200 --mem-fraction 0.75 --chunked-prefill 8192
+#   ./ix_agentx_glm53flash.sh --dry-run            # print the env and exit
 set -uo pipefail
 
-usage() { sed -n '2,20p' "$0"; exit 1; }
-
-# The sglang cu13 image ships lsof but not psmisc, so fuser is not available.
-kill_port() {
-    local port="$1" pids
-    pids=$(lsof -t -i ":$port" -sTCP:LISTEN 2>/dev/null)
-    [ -n "$pids" ] && kill -9 $pids 2>/dev/null
-    return 0
-}
+usage() { sed -n '2,24p' "$0"; exit 1; }
 
 # Tear down only the server this sweep started. A bare
 # `pkill -f sglang.launch_server` also kills a second sweep running on the
@@ -38,7 +34,7 @@ kill_port() {
 kill_server_on_port() {
     local port="$1" pid pgid
     for pid in $(pgrep -f "launch_server.*--port[ =]$port" 2>/dev/null) \
-               $(lsof -t -i ":$port" -sTCP:LISTEN 2>/dev/null); do
+               $(port_pids "$port"); do
         pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
         [ -n "$pgid" ] && kill -9 -- "-$pgid" 2>/dev/null
     done
@@ -46,14 +42,20 @@ kill_server_on_port() {
     return 0
 }
 
+kill_port() {
+    local pids
+    pids=$(port_pids "$1")
+    [ -n "$pids" ] && kill -9 $pids 2>/dev/null
+    return 0
+}
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_HOME="${BENCH_HOME:-$(dirname "$HERE")}"
 IX="${IX:-/home/jacchang/InferenceX}"
-RECIPE="$HERE/recipe_glm53flash_fp4_b200_sglang_mtp.sh"
 
-DOCKER="${DOCKER:-lmsysorg/sglang:v0.5.20-cu130}"
-MODEL_ID="nvidia/GLM-5.3-Flash-NVFP4"
-CKPT="${CKPT:-/data/huggingface/hub/nvidia/GLM-5.3-Flash-NVFP4}"
+PLATFORM=""
+DOCKER="${DOCKER:-}"
+CKPT="${CKPT:-}"
 
 TAG=""
 TP=4
@@ -85,6 +87,7 @@ declare -a EXTRA_ENV=()
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --platform)   PLATFORM="$2"; shift 2 ;;
         --tag)        TAG="$2"; shift 2 ;;
         --docker)     DOCKER="$2"; shift 2 ;;
         --ckpt)       CKPT="$2"; shift 2 ;;
@@ -117,7 +120,64 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# ---- platform ------------------------------------------------------------
+# Everything that differs between the two chips lives in this block and in the
+# recipe. The rest of the driver must stay platform-neutral.
+if [ -z "$PLATFORM" ]; then
+    if command -v rocm-smi >/dev/null 2>&1; then PLATFORM=mi355x; else PLATFORM=b200; fi
+fi
+case "$PLATFORM" in
+    b200)
+        SMI=nvidia-smi
+        VISIBLE_VAR=CUDA_VISIBLE_DEVICES
+        RUNNER_TYPE=b200
+        DRAM_RUNNER=cluster:b200-nscale
+        PORT_TOOL=lsof
+        : "${DOCKER:=lmsysorg/sglang:v0.5.20-cu130}"
+        MODEL_ID="nvidia/GLM-5.3-Flash-NVFP4"
+        : "${CKPT:=/data/huggingface/hub/nvidia/GLM-5.3-Flash-NVFP4}"
+        gpu_count() { nvidia-smi --query-gpu=index --format=csv,noheader | wc -l; }
+        gpu_mem_used_max_mib() {
+            nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits ${GPUS:+-i "$GPUS"} | sort -rn | head -1
+        }
+        # The sglang cu13 image ships lsof but not psmisc, so fuser is not available.
+        port_pids() { lsof -t -i ":$1" -sTCP:LISTEN 2>/dev/null; }
+        ;;
+    mi355x)
+        SMI=rocm-smi
+        VISIBLE_VAR=HIP_VISIBLE_DEVICES
+        RUNNER_TYPE=mi355x
+        DRAM_RUNNER=cluster:mi355x-amds
+        PORT_TOOL=fuser
+        : "${DOCKER:=rocm/sgl-dev:v0.5.20-rocm10-mi35x-20260928}"
+        MODEL_ID="amd/GLM-5.3-Flash-Quark-MXFP4"
+        : "${CKPT:=/data/huggingface/hub/amd/GLM-5.3-Flash-Quark-MXFP4}"
+        # rocm-smi, like nvidia-smi, lists every device on the node regardless
+        # of the visibility variable: the count sees the whole node, and the
+        # reclaim check filters to --gpus itself.
+        gpu_count() { rocm-smi --showid --csv 2>/dev/null | grep -c '^card'; }
+        gpu_mem_used_max_mib() {
+            rocm-smi --showmeminfo vram --csv 2>/dev/null | awk -F, -v want="$GPUS" '
+                /^card/ {
+                    idx = substr($1, 5) + 0
+                    if (want != "") { keep = 0; n = split(want, w, ","); for (i = 1; i <= n; i++) if (w[i] + 0 == idx) keep = 1; if (!keep) next }
+                    if ($3 > m) m = $3
+                } END { printf "%d\n", m / 1048576 }'
+        }
+        port_pids() { fuser "$1/tcp" 2>/dev/null; }
+        ;;
+    *) echo "ERROR: --platform must be 'b200' or 'mi355x', got '$PLATFORM'" >&2; exit 1 ;;
+esac
+RECIPE="$HERE/recipe_glm53flash_fp4_${PLATFORM}_sglang_mtp.sh"
+
 # ---- preflight -----------------------------------------------------------
+for tool in "$SMI" "$PORT_TOOL"; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        echo "ERROR: --platform $PLATFORM needs '$tool' on PATH." >&2
+        [ "$tool" = fuser ] && echo "       It is in psmisc: apt-get install -y psmisc" >&2
+        exit 1
+    }
+done
 [ -f "$RECIPE" ] || { echo "ERROR: recipe not found at $RECIPE" >&2; exit 1; }
 [ -d "$CKPT" ]   || { echo "ERROR: checkpoint not found at $CKPT" >&2; exit 1; }
 # benchmark_lib.sh's agentic half and the infx result package both moved in the
@@ -132,10 +192,10 @@ for required in "$IX/benchmarks/benchmark_lib.sh" "$IX/benchmarks/runtime_settin
     }
 done
 
-[ -n "$GPUS" ] && export CUDA_VISIBLE_DEVICES="$GPUS"
-NGPU=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
+[ -n "$GPUS" ] && export "$VISIBLE_VAR=$GPUS"
+NGPU=$(gpu_count)
 if [ "$NGPU" -lt "$TP" ]; then
-    echo "ERROR: TP=$TP needs $TP GPUs but only $NGPU are visible (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-all})." >&2
+    echo "ERROR: TP=$TP needs $TP GPUs but only $NGPU are visible ($VISIBLE_VAR=${!VISIBLE_VAR:-all})." >&2
     exit 1
 fi
 
@@ -171,7 +231,7 @@ export MODEL_PATH="$CKPT"
 export MODEL_PREFIX=glm5.3flash
 export PRECISION=fp4
 export FRAMEWORK=sglang
-export RUNNER_TYPE=b200
+export RUNNER_TYPE
 export IMAGE="$DOCKER"
 export SCENARIO_TYPE=agentic-coding
 export THINKING_MODE=thinking_on
@@ -213,15 +273,16 @@ if [ "$HICACHE_SIZE" -gt 0 ]; then
     export KV_OFFLOAD_BACKEND_METADATA='{"name":"hicache"}'
     export HICACHE_SIZE
     # Ask InferenceX's own matrix logic for the node budget instead of
-    # transcribing a number; b200-nscale is the runner whose 2,063,920 MiB
-    # matches this host, and TP4 at dram-utilization 0.80 yields 865 GB.
+    # transcribing a number. At TP4 and dram-utilization 0.80 that is 865 GB on
+    # b200-nscale and 1199 GB on mi355x-amds, so a HiCache A/B across the two
+    # chips is not a like-for-like host tier.
     TOTAL_CPU_DRAM_GB="${TOTAL_CPU_DRAM_GB:-$(cd "$IX" && python3 -c "
 import yaml
 from infx.matrix.generate import agentic_dram_offload_gb
 print(agentic_dram_offload_gb(
     {'dram-utilization': 0.8},
     {'tp': $TP, 'ep': $EP, 'kv-offloading': 'dram'},
-    'cluster:b200-nscale',
+    '$DRAM_RUNNER',
     yaml.safe_load(open('configs/runners.yaml')),
 ))")}"
 else
@@ -282,12 +343,12 @@ mkdir -p "$ROOT"
 SWEEP_LOG="$ROOT/sweep.log"
 
 {
-    echo "=== $(date -Is) GLM-5.3-Flash NVFP4 AgentX ==="
+    echo "=== $(date -Is) GLM-5.3-Flash AgentX platform=$PLATFORM model=$MODEL_ID ==="
     echo "tag=$TAG tp=$TP ep=$EP spec=$SPEC_DECODING steps=$MTP_STEPS acc=$ACC_MODE${GOLDEN_AL:+($GOLDEN_AL)}"
     echo "mem_fraction=$MEM_FRACTION_STATIC chunked_prefill=$CHUNKED_PREFILL_SIZE context=${CONTEXT_LENGTH:-native-1M}"
     echo "kv_offloading=$KV_OFFLOADING hicache_size=${HICACHE_SIZE} total_cpu_dram_gb=$TOTAL_CPU_DRAM_GB"
-    echo "duration=$DURATION conc=($CONC_LIST) gpus=${CUDA_VISIBLE_DEVICES:-all}"
-    echo "ix=$IX image=$DOCKER"
+    echo "duration=$DURATION conc=($CONC_LIST) gpus=${!VISIBLE_VAR:-all}"
+    echo "ix=$IX@$(git -C "$IX" rev-parse --short HEAD 2>/dev/null) image=$DOCKER"
     echo "root=$ROOT"
 } | tee -a "$SWEEP_LOG"
 
@@ -301,7 +362,7 @@ fi
 for CONC in $CONC_LIST; do
     export CONC
     export EXP_NAME="glm5.3flash_tp${TP}_conc${CONC}_kv${KV_OFFLOADING}_spec-${SPEC_DECODING}"
-    export RESULT_FILENAME="${EXP_NAME}_${PRECISION}_${FRAMEWORK}_tp${TP}-pp1-dcp1-pcp1-ep${EP}-dpa${DP_ATTENTION}_disagg-${DISAGG}_spec-${SPEC_DECODING}_conc${CONC}_local-b200"
+    export RESULT_FILENAME="${EXP_NAME}_${PRECISION}_${FRAMEWORK}_tp${TP}-pp1-dcp1-pcp1-ep${EP}-dpa${DP_ATTENTION}_disagg-${DISAGG}_spec-${SPEC_DECODING}_conc${CONC}_local-${RUNNER_TYPE}"
     export RESULT_DIR="$ROOT/$EXP_NAME"
     export AGENTIC_OUTPUT_DIR="$RESULT_DIR"
     export PORT=$((PORT_BASE + CONC))
@@ -318,7 +379,7 @@ for CONC in $CONC_LIST; do
     # share of HBM, and booting on top of it silently halves the KV pool.
     kill_port "$PORT"
     for _ in $(seq 1 60); do
-        busy=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits ${GPUS:+-i "$GPUS"} | sort -rn | head -1)
+        busy=$(gpu_mem_used_max_mib)
         [ "${busy:-0}" -le 1024 ] && break
         echo "    waiting for GPU reclaim (max used=${busy} MiB)" | tee -a "$SWEEP_LOG"
         sleep 15
@@ -341,4 +402,4 @@ for CONC in $CONC_LIST; do
 done
 
 echo "=== $(date -Is) sweep done: $ROOT ===" | tee -a "$SWEEP_LOG"
-echo "Summarize with: $HERE/ix_agentx_summarize.py --hw b200 $ROOT"
+echo "Summarize with: $HERE/ix_agentx_summarize.py --hw $RUNNER_TYPE $ROOT"

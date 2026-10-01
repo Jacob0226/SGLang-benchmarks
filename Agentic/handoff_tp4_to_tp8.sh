@@ -22,7 +22,7 @@ say "conc=8 done"
 # The driver writes the JSON, then logs the memory-pool lines, kills the server
 # and sleeps 30s before the next point. Cut in during that window: killing the
 # loop leader stops it from launching conc=12, and nothing is mid-measurement.
-pkill -f 'ix_agentx_glm53flash_b200.sh' 2>/dev/null
+pkill -f 'ix_agentx_glm53flash.sh' 2>/dev/null
 sleep 5
 pkill -9 -f 'sglang.launch_server' 2>/dev/null
 pkill -9 -f 'sglang::' 2>/dev/null
@@ -38,7 +38,7 @@ say "GPUs free (max used=${busy:-?} MiB)"
 # TP8: every GPU, so no --gpus filter. Same recipe and same knobs as the TP4
 # lane so the only variable between the two curves is the parallelism.
 say "starting TP8 conc=1"
-"$HERE/ix_agentx_glm53flash_b200.sh" --tp 8 --conc 1 > "$LOGS/glm53flash_agentx_tp8_conc1.log" 2>&1
+"$HERE/ix_agentx_glm53flash.sh" --platform b200 --tp 8 --conc 1 > "$LOGS/glm53flash_agentx_tp8_conc1.log" 2>&1
 say "TP8 conc=1 exit=$?"
 
 pkill -9 -f 'sglang.launch_server' 2>/dev/null
@@ -48,5 +48,5 @@ sleep 30
 # Resume the TP4 curve. The driver skips any point whose result JSON already
 # exists, so this fills in 12 and 16 only.
 say "resuming TP4 sweep for conc 12 and 16"
-exec "$HERE/ix_agentx_glm53flash_b200.sh" --conc "1 4 8 12 16" --gpus 0,1,2,3 \
+exec "$HERE/ix_agentx_glm53flash.sh" --platform b200 --conc "1 4 8 12 16" --gpus 0,1,2,3 \
     >> "$LOGS/glm53flash_agentx_tp4_sweep.log" 2>&1
