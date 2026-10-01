@@ -2,6 +2,28 @@
 
 This is the exact setup that gives approximately 97% GSM8K on MI355X with our GLM-5.3-Flash enablement stack, at both TP8 and TP4. `cuda graph` is enabled throughout; nothing here disables it.
 
+> **CORRECTION (2026-10-01): the concurrent-long-prefill trigger was a faulty
+> machine, not a property of this stack.**
+>
+> Everything from "Read this first" down to and including "How this document
+> got it wrong twice" describes a warmup-order effect that was later traced to
+> one bad host. It does not reproduce on healthy MI355X nodes and it is not a
+> ROCm, AITER, SGLang or GLM-5.3-Flash defect. Do not design around it: do not
+> add warmup shims, do not avoid concurrent long prefills, and do not treat the
+> one-short-request mitigation as required.
+>
+> This matters most for anyone writing a long-context or agentic harness, since
+> those open with exactly the pattern described below. InferenceX AgentX warmup,
+> for instance, dispatches hundreds of long prompts at once; that is fine.
+>
+> Two things this correction does **not** cover. The AITER hard-abort in "A
+> separate, still-valid AITER warning" is an independent finding and still
+> stands. And the measurement tables below were not re-run after the host was
+> identified, so the numbers in them say nothing about a healthy machine.
+>
+> The rest of the document — source tree, PR stack, checkpoint loading,
+> environment, launch, evaluation — is unaffected and still current.
+
 **Read this first.** What decides whether you get 97% or garbage is *whether the very first thing the server prefills is several long prompts at once*. It is not the AITER revision, not the source tree, and not the server flags. Send four concurrent requests of roughly a thousand tokens each to a freshly started server, before it has served anything else, and every request after that fails to terminate for the life of the process. Send the same four sequentially, or send anything at all beforehand, and nothing happens. A single long request is safe at any length tested, including 8K.
 
 The mitigation is therefore one line — **have the server answer one short request before it takes real traffic** — but read the rest of this section before relying on it, because the boundaries are only partly mapped.
