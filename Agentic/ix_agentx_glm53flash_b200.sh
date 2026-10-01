@@ -58,6 +58,7 @@ HICACHE_SIZE=0
 CONTEXT_LENGTH=""
 MAMBA_FULL_MEMORY_RATIO=""
 MAX_MAMBA_CACHE_SIZE=""
+CUDA_GRAPH_MAX_BS_CAP=""
 ENABLE_POWER=0
 QUICK=0
 SMOKE=0
@@ -86,6 +87,7 @@ while [[ $# -gt 0 ]]; do
         --context-length)    CONTEXT_LENGTH="$2"; shift 2 ;;
         --mamba-ratio)       MAMBA_FULL_MEMORY_RATIO="$2"; shift 2 ;;
         --max-mamba-cache-size) MAX_MAMBA_CACHE_SIZE="$2"; shift 2 ;;
+        --cuda-graph-max-bs)    CUDA_GRAPH_MAX_BS_CAP="$2"; shift 2 ;;
         --power)      ENABLE_POWER=1; shift ;;
         --quick)      QUICK=1; shift ;;
         --smoke)      SMOKE=1; shift ;;
@@ -173,6 +175,7 @@ export ACC_MODE
 [ -n "$GOLDEN_AL" ] && export GOLDEN_AL
 [ -n "$MAMBA_FULL_MEMORY_RATIO" ] && export MAMBA_FULL_MEMORY_RATIO
 [ -n "$MAX_MAMBA_CACHE_SIZE" ] && export MAX_MAMBA_CACHE_SIZE
+[ -n "$CUDA_GRAPH_MAX_BS_CAP" ] && export CUDA_GRAPH_MAX_BS_CAP
 
 # The client replays the corpus unfiltered when MAX_MODEL_LEN=0. Capping the
 # server without capping the client turns the over-length traces into 4xxs that
@@ -265,7 +268,7 @@ SWEEP_LOG="$ROOT/sweep.log"
 
 if [ "$DRY_RUN" = "1" ]; then
     echo "--- recipe env (dry run) ---"
-    env | grep -E '^(MODEL|TP|EP_SIZE|PP_SIZE|DCP_SIZE|PCP_SIZE|DP_ATTENTION|SPEC_|ACC_MODE|GOLDEN_AL|KV_|HICACHE|TOTAL_CPU_DRAM_GB|MAX_MODEL_LEN|CONTEXT_LENGTH|MAMBA_|MAX_MAMBA|MEM_FRACTION|CHUNKED_|AIPERF_|AGENTIC_|INFMAX_|RUNNER_TYPE|PRECISION|FRAMEWORK|SCENARIO_|DURATION|ENABLE_AGENTX_POWER|REQUIRE_POWER|IS_MULTINODE|DISAGG|EVAL_ONLY|IMAGE|HF_HUB_CACHE)' | sort
+    env | grep -E '^(MODEL|TP|EP_SIZE|PP_SIZE|DCP_SIZE|PCP_SIZE|DP_ATTENTION|SPEC_|ACC_MODE|GOLDEN_AL|KV_|HICACHE|TOTAL_CPU_DRAM_GB|MAX_MODEL_LEN|CONTEXT_LENGTH|MAMBA_|MAX_MAMBA|CUDA_GRAPH|MEM_FRACTION|CHUNKED_|AIPERF_|AGENTIC_|INFMAX_|RUNNER_TYPE|PRECISION|FRAMEWORK|SCENARIO_|DURATION|ENABLE_AGENTX_POWER|REQUIRE_POWER|IS_MULTINODE|DISAGG|EVAL_ONLY|IMAGE|HF_HUB_CACHE)' | sort
     exit 0
 fi
 

@@ -130,8 +130,16 @@ MAX_RUNNING_REQUESTS=$((2 * CONC))
 # --cuda-graph-max-bs-decode counts requests; the spec-decode graph runner
 # scales by --speculative-num-draft-tokens itself. Prefill graphs stay off:
 # SGLang disables them for KDA hybrid linear attention regardless.
+#
+# The cap matters from conc 32 up: max_running_requests is 2*CONC, so a cap of
+# 64 leaves every decode batch above 64 requests on the eager path. Raising it
+# costs capture time and HBM (each captured bs holds buffers for
+# bs * speculative_num_draft_tokens tokens), which is why it is a knob and not
+# just set to MAX_RUNNING_REQUESTS.
 CUDA_GRAPH_MAX_BS=$MAX_RUNNING_REQUESTS
-[ "$CUDA_GRAPH_MAX_BS" -gt 64 ] && CUDA_GRAPH_MAX_BS=64
+if [ "$CUDA_GRAPH_MAX_BS" -gt "${CUDA_GRAPH_MAX_BS_CAP:-64}" ]; then
+    CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS_CAP:-64}"
+fi
 
 CONTEXT_ARGS=()
 if [ -n "${CONTEXT_LENGTH:-}" ]; then
