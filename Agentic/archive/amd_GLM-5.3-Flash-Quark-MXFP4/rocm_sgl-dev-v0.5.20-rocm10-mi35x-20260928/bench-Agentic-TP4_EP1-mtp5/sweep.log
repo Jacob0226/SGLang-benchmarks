@@ -46,3 +46,13 @@ root=/home/jacchang/SGLang-benchmarks/results/amd_GLM-5.3-Flash-Quark-MXFP4/rocm
     Memory pool end. avail mem=52.57 GB
     Memory pool end. avail mem=52.66 GB
 >>> 2026-10-01T08:51:14+00:00 starting conc=16 port=28916 -> /home/jacchang/SGLang-benchmarks/results/amd_GLM-5.3-Flash-Quark-MXFP4/rocm_sgl-dev-v0.5.20-rocm10-mi35x-20260928/bench-Agentic-TP4_EP1-mtp5/glm5.3flash_tp4_conc16_kvnone_spec-mtp
+>>> 2026-10-01T09:59:16+00:00 conc=16 exit=0
+    KV Cache is allocated. dtype: torch.bfloat16, #tokens: 11125504, KV size: 11.98 GB
+    KV Cache is allocated. dtype: torch.bfloat16, #tokens: 11125504, KV size: 131.76 GB
+    Memory pool end. avail mem=40.36 GB
+    Memory pool end. avail mem=40.39 GB
+    Memory pool end. avail mem=40.49 GB
+    Memory pool end. avail mem=52.34 GB
+    Memory pool end. avail mem=52.37 GB
+    Memory pool end. avail mem=52.47 GB
+=== 2026-10-01T09:59:47+00:00 sweep done: /home/jacchang/SGLang-benchmarks/results/amd_GLM-5.3-Flash-Quark-MXFP4/rocm_sgl-dev-v0.5.20-rocm10-mi35x-20260928/bench-Agentic-TP4_EP1-mtp5 ===

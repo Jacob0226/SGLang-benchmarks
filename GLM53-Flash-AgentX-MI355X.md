@@ -1,8 +1,8 @@
 # GLM-5.3-Flash AgentX: MI355X (MXFP4) vs B200 (NVFP4), TP4
 
-**Status: conc 1 / 4 / 8 / 12 done, conc 16 running (ETA 2026-10-01 10:00 UTC).**
+**Status: complete. All five points (conc 1 / 4 / 8 / 12 / 16) finished 2026-10-01 09:59 UTC.**
 
-MI355X lands within 0.3–4% of B200 on throughput per GPU at every point measured so far, and 11–18% behind on P90 interactivity. All four points ran with zero scheduler crashes and zero OOM warnings at `--mem-fraction-static 0.85 --chunked-prefill-size 16384`, the settings B200 had to lower to 0.75 / 8192.
+MI355X lands within 0.3–4% of B200 on throughput per GPU at every point, and 11–18% behind on P90 interactivity. All five points ran with zero scheduler crashes and zero OOM warnings at `--mem-fraction-static 0.85 --chunked-prefill-size 16384`, the settings B200 had to lower to 0.75 / 8192.
 
 ## Performance
 
@@ -12,7 +12,7 @@ MI355X lands within 0.3–4% of B200 on throughput per GPU at every point measur
 | 4 | 8,284 | 8,308 | 1.00 | 180.3 | 210.3 | 0.86 |
 | 8 | 14,607 | 14,801 | 0.99 | 154.8 | 188.2 | 0.82 |
 | 12 | 16,689 | 17,397 | 0.96 | 144.4 | 162.5 | 0.89 |
-| 16 | *running* | 26,977 | | *running* | 120.4 | |
+| 16 | 26,837 | 26,977 | 0.99 | 102.8 | 120.4 | 0.85 |
 
 P90 interactivity is 1 / (P90 of ITL), in tok/s/user.
 
@@ -24,8 +24,9 @@ Latency detail:
 | 4 | 3.53 | 2.87 | 5.55 | 1.74 | 3.13 |
 | 8 | 4.09 | 2.98 | 6.46 | 1.55 | 3.11 |
 | 12 | 4.35 | 3.24 | 6.93 | 1.74 | 3.04 |
+| 16 | 4.77 | 3.65 | 9.72 | 3.06 | 5.03 |
 
-The shape is consistent: MI355X decodes slower per token (ITL p50 +21–37%) but prefills faster (TTFT p90 about half of B200's), and the two roughly cancel in throughput per GPU.
+The shape is consistent: MI355X decodes slower per token (ITL p50 +21–37%) but prefills faster (TTFT p90 50–62% of B200's), and the two roughly cancel in throughput per GPU.
 
 ## Health
 
@@ -35,6 +36,7 @@ The shape is consistent: MI355X decodes slower per token (ITL p50 +21–37%) but
 | 4 | 0 | 0 | 0.3% | 647 / 693 | 4.39 |
 | 8 | 0 | 0 | 0.1% | 1,354 / 1,443 | 4.31 |
 | 12 | 0 | 0 | 0.1% | 1,726 / 1,859 | 4.25 |
+| 16 | 0 | 0 | 0.1% | 2,523 / 2,702 | 4.23 |
 
 The gap between profiled and all is warmup, not failures: warmup runs with `max_tokens=1`, and aiperf files those as `InvalidInferenceResultError`. The error column is `check_health.py`'s profiled-only rate, which is what aiperf's 10% gate applies to.
 
@@ -48,8 +50,9 @@ The AgentX scenario injects `ignore_eos=true` into every request (aiperf logs `i
 | 4 | 354 | 2,625 | 87% | 13% | 0 |
 | 8 | 383 | 2,356 | 88% | 12% | 0 |
 | 12 | 346 | 2,005 | 87% | 13% | 0 |
+| 16 | 325 | 1,794 | 89% | 11% | 0 |
 
-The OSL median falls with concurrency because more lanes sample more subagent turns, which are short. The B200 reference of OSL median 130 / p90 1,789 should be compared at the same concurrency; if it came from a point other than conc 16, B200 stopped short of `max_tokens` far more often than MI355X, and the two platforms generated different token counts. That is checkable from `osl_mismatch_diff_pct` in B200's `profile_export.jsonl`.
+The OSL median falls with concurrency because more lanes sample more subagent turns, which are short. MI355X's conc 16 OSL p90 (1,794) matches the B200 reference p90 (1,789), which suggests that reference came from conc 16. The medians still differ (325 here, 130 on B200), so B200 likely stopped short of `max_tokens` on short turns far more often than MI355X. That is checkable from `osl_mismatch_diff_pct` in B200's `profile_export.jsonl`. That is checkable from `osl_mismatch_diff_pct` in B200's `profile_export.jsonl`.
 
 ## Configuration
 
