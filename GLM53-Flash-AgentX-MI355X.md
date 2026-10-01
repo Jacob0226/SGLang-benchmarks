@@ -29,14 +29,14 @@ The shape is consistent: MI355X decodes slower per token (ITL p50 +21–37%) but
 
 ## Health
 
-| conc | scheduler crashes | OOM warnings | requests ok | MTP acceptance length |
-| --- | ---: | ---: | ---: | ---: |
-| 1 | 0 | 0 | 277 / 289 | 4.57 |
-| 4 | 0 | 0 | 647 / 693 | 4.39 |
-| 8 | 0 | 0 | 1,354 / 1,443 | 4.31 |
-| 12 | 0 | 0 | 1,726 / 1,859 | 4.25 |
+| conc | scheduler crashes | OOM warnings | errors among profiled | profiled / all records | MTP acceptance length |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0 | 0 | 0.4% | 277 / 289 | 4.57 |
+| 4 | 0 | 0 | 0.3% | 647 / 693 | 4.39 |
+| 8 | 0 | 0 | 0.1% | 1,354 / 1,443 | 4.31 |
+| 12 | 0 | 0 | 0.1% | 1,726 / 1,859 | 4.25 |
 
-The missing requests are warmup requests (the warmup sends 1-token turns; when that token is the reasoning opener the `glm45` parser strips it and aiperf records "no content"). aiperf's own error-rate gate over the profiled window reads 0%.
+The gap between profiled and all is warmup, not failures: warmup runs with `max_tokens=1`, and aiperf files those as `InvalidInferenceResultError`. The error column is `check_health.py`'s profiled-only rate, which is what aiperf's 10% gate applies to.
 
 ### Output sanity check: OSL is pinned by `ignore_eos`
 

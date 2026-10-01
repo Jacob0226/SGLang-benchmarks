@@ -28,7 +28,7 @@ say "waiting for the conc=32 baseline (chunk 8192) to land"
 while [ ! -f "$C32" ]; do sleep 20; done
 say "conc=32 baseline done; stopping the sweep before conc=64 starts"
 
-pkill -f 'ix_agentx_glm53flash_b200.sh' 2>/dev/null
+pkill -f 'ix_agentx_glm53flash' 2>/dev/null
 sleep 5
 pkill -9 -f 'sglang.launch_server' 2>/dev/null
 pkill -9 -f 'sglang::' 2>/dev/null
@@ -41,7 +41,7 @@ say "GPUs free (max used=${busy:-?} MiB)"
 
 # Same point, same window, only the prefill chunk differs.
 say "starting conc=32 with chunk 16384"
-exec "$H/ix_agentx_glm53flash_b200.sh" \
+exec "$H/ix_agentx_glm53flash.sh" --platform b200 \
     --conc 32 --gpus 0,1,2,3 --mem-fraction 0.75 --chunked-prefill 16384 \
     --duration 1200 --tag TP4-f75c16k-probe \
     --env AGENTIC_WARMUP_GRACE_PERIOD=3600 \

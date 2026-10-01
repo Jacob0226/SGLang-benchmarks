@@ -122,9 +122,13 @@ MAX_RUNNING_REQUESTS=$((2 * CONC))
 
 # --cuda-graph-max-bs-decode counts requests; the spec-decode graph runner
 # scales by --speculative-num-draft-tokens itself. Prefill graphs stay off:
-# SGLang disables them for KDA hybrid linear attention regardless.
+# SGLang disables them for KDA hybrid linear attention regardless. The cap is a
+# knob (CUDA_GRAPH_MAX_BS_CAP) for the same reason as on B200: above conc 32 a
+# cap of 64 leaves larger decode batches eager.
 CUDA_GRAPH_MAX_BS=$MAX_RUNNING_REQUESTS
-[ "$CUDA_GRAPH_MAX_BS" -gt 64 ] && CUDA_GRAPH_MAX_BS=64
+if [ "$CUDA_GRAPH_MAX_BS" -gt "${CUDA_GRAPH_MAX_BS_CAP:-64}" ]; then
+    CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS_CAP:-64}"
+fi
 
 CONTEXT_ARGS=()
 if [ -n "${CONTEXT_LENGTH:-}" ]; then
@@ -189,6 +193,12 @@ SGLANG_CMD=(
     --watchdog-timeout 1800
     --enable-metrics
 )
+
+# Escape hatch for A/B-ing a flag without editing this file; see the B200 recipe.
+if [ -n "${EXTRA_SERVER_ARGS:-}" ]; then
+    read -r -a _extra <<< "$EXTRA_SERVER_ARGS"
+    SGLANG_CMD+=("${_extra[@]}")
+fi
 
 printf '%q ' "${SGLANG_CMD[@]}" | tee "$RESULT_DIR/sglang_command.txt"
 printf '\n' | tee -a "$RESULT_DIR/sglang_command.txt"
