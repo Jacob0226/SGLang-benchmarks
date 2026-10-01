@@ -233,9 +233,15 @@ else
 fi
 export TOTAL_CPU_DRAM_GB
 
-# /raid is node-local NVMe; the venv rebuild and the ~100 GB WEKA corpus are
-# both far happier there than on the NFS home.
-export AIPERF_RUNTIME_DIR="${AIPERF_RUNTIME_DIR:-/raid/home/jacchang/ix-agentic-runtime}"
+# /raid is node-local NVMe; the venv rebuild and the WEKA corpus are both far
+# happier there than on the NFS home.
+#
+# Keyed by port base so two sweeps sharing the node get separate venvs.
+# install_agentic_deps starts with `rm -rf $AIPERF_VENV`, so a shared runtime
+# dir means the second sweep to start deletes the interpreter the first one is
+# running out of -- which surfaces as an unrelated-looking ModuleNotFoundError
+# inside huggingface_hub, seconds into the run. Same port reuses its warm venv.
+export AIPERF_RUNTIME_DIR="${AIPERF_RUNTIME_DIR:-/raid/home/jacchang/ix-agentic-runtime-${PORT_BASE}}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-/raid/home/jacchang/hf_hub_cache}"
 mkdir -p "$AIPERF_RUNTIME_DIR" "$HF_HUB_CACHE"
 
