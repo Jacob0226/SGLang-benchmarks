@@ -200,6 +200,14 @@ SGLANG_CMD=(
     --enable-metrics
 )
 
+# Escape hatch for A/B-ing a flag without editing this file. Word-split on
+# purpose: EXTRA_SERVER_ARGS='--prefill-max-requests 1 --foo bar'. Anything
+# that earns its place here should graduate into the list above.
+if [ -n "${EXTRA_SERVER_ARGS:-}" ]; then
+    read -r -a _extra <<< "$EXTRA_SERVER_ARGS"
+    SGLANG_CMD+=("${_extra[@]}")
+fi
+
 printf '%q ' "${SGLANG_CMD[@]}" | tee "$RESULT_DIR/sglang_command.txt"
 printf '\n' | tee -a "$RESULT_DIR/sglang_command.txt"
 

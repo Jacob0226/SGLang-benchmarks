@@ -30,6 +30,22 @@ kill_port() {
     return 0
 }
 
+# Tear down only the server this sweep started. A bare
+# `pkill -f sglang.launch_server` also kills a second sweep running on the
+# other four GPUs, which is how parallel A/B screening used to be impossible.
+# The launcher carries --port on its command line; its workers get renamed to
+# sglang::* and lose it, so go via the process group instead.
+kill_server_on_port() {
+    local port="$1" pid pgid
+    for pid in $(pgrep -f "launch_server.*--port[ =]$port" 2>/dev/null) \
+               $(lsof -t -i ":$port" -sTCP:LISTEN 2>/dev/null); do
+        pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+        [ -n "$pgid" ] && kill -9 -- "-$pgid" 2>/dev/null
+    done
+    kill_port "$port"
+    return 0
+}
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_HOME="${BENCH_HOME:-$(dirname "$HERE")}"
 IX="${IX:-/home/jacchang/InferenceX}"
@@ -59,6 +75,7 @@ CONTEXT_LENGTH=""
 MAMBA_FULL_MEMORY_RATIO=""
 MAX_MAMBA_CACHE_SIZE=""
 CUDA_GRAPH_MAX_BS_CAP=""
+EXTRA_SERVER_ARGS=""
 ENABLE_POWER=0
 QUICK=0
 SMOKE=0
@@ -88,6 +105,7 @@ while [[ $# -gt 0 ]]; do
         --mamba-ratio)       MAMBA_FULL_MEMORY_RATIO="$2"; shift 2 ;;
         --max-mamba-cache-size) MAX_MAMBA_CACHE_SIZE="$2"; shift 2 ;;
         --cuda-graph-max-bs)    CUDA_GRAPH_MAX_BS_CAP="$2"; shift 2 ;;
+        --server-arg)           EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS} $2"; shift 2 ;;
         --power)      ENABLE_POWER=1; shift ;;
         --quick)      QUICK=1; shift ;;
         --smoke)      SMOKE=1; shift ;;
@@ -176,6 +194,7 @@ export ACC_MODE
 [ -n "$MAMBA_FULL_MEMORY_RATIO" ] && export MAMBA_FULL_MEMORY_RATIO
 [ -n "$MAX_MAMBA_CACHE_SIZE" ] && export MAX_MAMBA_CACHE_SIZE
 [ -n "$CUDA_GRAPH_MAX_BS_CAP" ] && export CUDA_GRAPH_MAX_BS_CAP
+[ -n "$EXTRA_SERVER_ARGS" ] && export EXTRA_SERVER_ARGS
 
 # The client replays the corpus unfiltered when MAX_MODEL_LEN=0. Capping the
 # server without capping the client turns the over-length traces into 4xxs that
@@ -293,7 +312,7 @@ for CONC in $CONC_LIST; do
     # share of HBM, and booting on top of it silently halves the KV pool.
     kill_port "$PORT"
     for _ in $(seq 1 60); do
-        busy=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | sort -rn | head -1)
+        busy=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits ${GPUS:+-i "$GPUS"} | sort -rn | head -1)
         [ "${busy:-0}" -le 1024 ] && break
         echo "    waiting for GPU reclaim (max used=${busy} MiB)" | tee -a "$SWEEP_LOG"
         sleep 15
@@ -311,9 +330,7 @@ for CONC in $CONC_LIST; do
         "$RESULT_DIR/server.log" 2>/dev/null | sort -u | sed 's/^/    /' | tee -a "$SWEEP_LOG"
 
     # The recipe leaves the server up when it exits non-zero mid-flight.
-    pkill -9 -f 'sglang.launch_server' 2>/dev/null
-    pkill -9 -f 'sglang::' 2>/dev/null
-    kill_port "$PORT"
+    kill_server_on_port "$PORT"
     sleep 30
 done
 
