@@ -43,30 +43,47 @@ def main():
             with open(server_log, errors="ignore") as fh:
                 text = fh.read()
         acct = blob.get("request_accounting", {})
-        total = max(acct.get("records_total", 1), 1)
+        # records_error_dropped counts errors across every record, and warmup
+        # runs with max_tokens=1, which AIPerf files as
+        # InvalidInferenceResultError -- hundreds per run, harmless, and all of
+        # them warmup. The number that matters is errors among *profiled*
+        # records, which is what AIPerf's own 10% gate gates on. Recover it
+        # from the accounting identity rather than from records_error_dropped:
+        #   total = warmup_dropped + profiled + errored_profiled
+        profiled = max(acct.get("records_profiled", 0), 1)
+        errored_profiled = max(
+            acct.get("records_total", 0)
+            - acct.get("records_warmup_dropped", 0)
+            - acct.get("records_profiled", 0),
+            0,
+        )
         rows.append(
             {
                 "conc": blob["conc"],
                 "crash": text.count("Scheduler hit an exception"),
                 "oom": text.count("memory allocation failed with OOM"),
                 "valid": blob.get("submission_valid"),
-                "err_pct": 100.0 * acct.get("records_error_dropped", 0) / total,
-                "ok": blob.get("num_requests_successful"),
-                "total": blob.get("num_requests_total"),
+                "err_pct": 100.0 * errored_profiled / profiled,
+                "profiled": acct.get("records_profiled"),
+                "total": acct.get("records_total"),
             }
         )
     rows.sort(key=lambda r: r["conc"])
 
-    head = f"{'conc':>5}{'crash':>7}{'oom_warn':>10}{'submittable':>13}{'err%':>8}{'requests':>14}"
+    head = f"{'conc':>5}{'crash':>7}{'oom_warn':>10}{'submittable':>13}{'err%':>8}{'profiled/all':>14}"
     print(head)
     print("-" * len(head))
     for r in rows:
-        requests = f"{r['ok']}/{r['total']}"
+        requests = f"{r['profiled']}/{r['total']}"
         print(
             f"{r['conc']:>5}{r['crash']:>7}{r['oom']:>10}{str(r['valid']):>13}"
             f"{r['err_pct']:>7.1f}%{requests:>14}"
         )
-    bad = [r["conc"] for r in rows if r["crash"] or r["valid"] is False]
+    # 10% is AIPerf's own post-run gate (AIPERF_FAILED_REQUEST_THRESHOLD).
+    bad = [
+        r["conc"] for r in rows
+        if r["crash"] or r["valid"] is False or r["err_pct"] > 10.0
+    ]
     print()
     print("全部可用" if not bad else f"有問題的點: conc {bad}")
     return 0

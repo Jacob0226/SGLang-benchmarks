@@ -42,6 +42,9 @@ def load(root, label=None, hw="mi355x"):
                 "ttft_p90": latency["ttft"]["p90"],
                 "per_gpu_tps": per_gpu,
                 "mtok_per_usd": per_gpu * 3600 / TCO_PER_CHIP_HR[hw] / 1e6,
+                # num_requests_total counts warmup records too, so this is
+                # the profiled share, NOT a success rate. Failures show up in
+                # check_health.py instead.
                 "ok": blob["num_requests_successful"],
                 "total": blob["num_requests_total"],
             }
@@ -64,7 +67,7 @@ def main():
 
     head = (
         f"{'run':<26}{'cfg':<10}{'conc':>5}{'ITLp50':>9}{'ITLp90':>9}"
-        f"{'P90 intvty':>12}{'TTFTp90':>9}{'per-GPU':>9}{'Mtok/$':>9}{'req ok':>11}"
+        f"{'P90 intvty':>12}{'TTFTp90':>9}{'per-GPU':>9}{'Mtok/$':>9}{'profiled/all':>14}"
     )
     print(head)
     print("-" * len(head))
@@ -73,7 +76,7 @@ def main():
             f"{r['label']:<26}TP{r['tp']}/EP{r['ep']:<5}{r['conc']:>5}"
             f"{r['itl_p50_ms']:>9.2f}{r['itl_p90_ms']:>9.2f}{r['p90_intvty']:>12.1f}"
             f"{r['ttft_p90']:>9.2f}{r['per_gpu_tps']:>9.0f}{r['mtok_per_usd']:>9.2f}"
-            f"{r['ok']:>7}/{r['total']:<4}"
+            f"{r['ok']:>8}/{r['total']:<4}"
         )
 
 
