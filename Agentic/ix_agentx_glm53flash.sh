@@ -15,7 +15,7 @@
 # when rocm-smi is on PATH, else b200. GPU selection comes from
 # CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES or --gpus.
 #
-#   ./ix_agentx_glm53flash.sh                      # TP4, conc 1 4 8 12 16
+#   ./ix_agentx_glm53flash.sh                      # TP4, conc 1 4 8 16 32 64
 #   ./ix_agentx_glm53flash.sh --smoke --conc 4     # plumbing check, ~20 min
 #   ./ix_agentx_glm53flash.sh --quick --conc 16    # A/B iteration, ~30 min
 #   ./ix_agentx_glm53flash.sh --mtp-steps 3 --conc 16    # MTP depth A/B
@@ -78,7 +78,7 @@ CKPT="${CKPT:-}"
 TAG=""
 TP=4
 EP=1
-CONC_LIST="1 4 8 12 16"
+CONC_LIST="1 4 8 16 32 64"
 DURATION="${DURATION:-3600}"
 GPUS=""
 PORT_BASE=28900
