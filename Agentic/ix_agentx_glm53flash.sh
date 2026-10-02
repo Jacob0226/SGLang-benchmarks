@@ -31,12 +31,30 @@ usage() { sed -n '2,24p' "$0"; exit 1; }
 # other four GPUs, which is how parallel A/B screening used to be impossible.
 # The launcher carries --port on its command line; its workers get renamed to
 # sglang::* and lose it, so go via the process group instead.
+# Depth-first so children die before their parent can reap or re-fork.
+kill_tree() {
+    local pid="$1" child
+    for child in $(pgrep -P "$pid" 2>/dev/null); do kill_tree "$child"; done
+    kill -9 "$pid" 2>/dev/null
+    return 0
+}
+
 kill_server_on_port() {
-    local port="$1" pid pgid
+    local port="$1" pid pgid mypgid
+    # The recipe runs as our child, so the server it launches lands in OUR
+    # process group. Group-killing it therefore kills this driver too, which
+    # ends the sweep after the first concurrency with no error of its own --
+    # the log just stops. Only group-kill when the group is demonstrably not
+    # ours; otherwise walk the process tree.
+    mypgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
     for pid in $(pgrep -f "launch_server.*--port[ =]$port" 2>/dev/null) \
                $(port_pids "$port"); do
         pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
-        [ -n "$pgid" ] && kill -9 -- "-$pgid" 2>/dev/null
+        if [ -n "$pgid" ] && [ -n "$mypgid" ] && [ "$pgid" != "$mypgid" ]; then
+            kill -9 -- "-$pgid" 2>/dev/null
+        else
+            kill_tree "$pid"
+        fi
     done
     kill_port "$port"
     return 0
