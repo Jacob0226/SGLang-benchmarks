@@ -140,6 +140,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# What the caller explicitly passed. Everything below may fill a default, and
+# the b200 table below is per-concurrency, so this is the only record of intent.
+USER_MEM_FRACTION="$MEM_FRACTION_STATIC"
+USER_CHUNK="$CHUNKED_PREFILL_SIZE"
+USER_MAMBA_RATIO="$MAMBA_FULL_MEMORY_RATIO"
+USER_HICACHE="$HICACHE_SIZE"
+
 # ---- platform ------------------------------------------------------------
 # Everything that differs between the two chips lives in this block and in the
 # recipe. The rest of the driver must stay platform-neutral.
@@ -166,10 +173,28 @@ case "$PLATFORM" in
         #   hicache 169 GB/rank even at conc 32, where the device pool is only
         #                       21-24% used, eviction is still happening and the
         #                       host tier catches it (+29% interactivity)
-        : "${MEM_FRACTION_STATIC:=0.75}"
-        : "${CHUNKED_PREFILL_SIZE:=16384}"
-        : "${MAMBA_FULL_MEMORY_RATIO:=1.5}"
-        : "${HICACHE_SIZE:=169}"
+        # Measured per concurrency, because the winner changes. Up to conc 16
+        # the tuned settings are a net loss -- the KV pool runs at 2-9%, so
+        # nothing they buy is reachable, while their costs are not conditional:
+        #   conc   1      4      8     16     (P90 interactivity, tuned vs plain)
+        #        -21%   -19%   -20%   -11%
+        # From conc 32 the same settings win by a wide margin (+29% at conc 32)
+        # because the pool is finally under pressure. Per-concurrency tables
+        # are how upstream's glm5.2_fp4_b200_sglang_mtp.sh handles the same
+        # situation with hicache-size.
+        conc_defaults() {
+            local c="$1"
+            MEM_FRACTION_STATIC="${USER_MEM_FRACTION:-0.75}"
+            if [ "$c" -ge 32 ]; then
+                CHUNKED_PREFILL_SIZE="${USER_CHUNK:-16384}"
+                MAMBA_FULL_MEMORY_RATIO="${USER_MAMBA_RATIO:-1.5}"
+                HICACHE_SIZE="${USER_HICACHE:-169}"
+            else
+                CHUNKED_PREFILL_SIZE="${USER_CHUNK:-8192}"
+                MAMBA_FULL_MEMORY_RATIO="$USER_MAMBA_RATIO"
+                HICACHE_SIZE="${USER_HICACHE:-0}"
+            fi
+        }
         gpu_count() { nvidia-smi --query-gpu=index --format=csv,noheader | wc -l; }
         gpu_mem_used_max_mib() {
             nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits ${GPUS:+-i "$GPUS"} | sort -rn | head -1
@@ -191,9 +216,14 @@ case "$PLATFORM" in
         # reclaim check filters to --gpus itself.
         # Unchanged from before the b200 tuning landed; the MI355X side has
         # not run the same sweep, so these stay at the neutral values.
-        : "${MEM_FRACTION_STATIC:=0.85}"
-        : "${CHUNKED_PREFILL_SIZE:=16384}"
-        : "${HICACHE_SIZE:=0}"
+        # Flat, not per-concurrency: the MI355X side has not run the sweep that
+        # would justify a table, and inheriting B200's would be a guess.
+        conc_defaults() {
+            MEM_FRACTION_STATIC="${USER_MEM_FRACTION:-0.85}"
+            CHUNKED_PREFILL_SIZE="${USER_CHUNK:-16384}"
+            MAMBA_FULL_MEMORY_RATIO="$USER_MAMBA_RATIO"
+            HICACHE_SIZE="${USER_HICACHE:-0}"
+        }
         gpu_count() { rocm-smi --showid --csv 2>/dev/null | grep -c '^card'; }
         gpu_mem_used_max_mib() {
             rocm-smi --showmeminfo vram --csv 2>/dev/null | awk -F, -v want="$GPUS" '
@@ -304,18 +334,23 @@ else
     export MAX_MODEL_LEN=0          # native 1,048,576
 fi
 
-# KV tier. GLM-5.3-Flash only has 11 full-attention layers, so TP4 holds ~12.4M
-# tokens of fp8 KV in HBM and a host tier is opt-in rather than load-bearing.
-if [ "$HICACHE_SIZE" -gt 0 ]; then
-    export KV_OFFLOADING=dram
-    export KV_OFFLOAD_BACKEND=hicache
-    export KV_OFFLOAD_BACKEND_METADATA='{"name":"hicache"}'
-    export HICACHE_SIZE
-    # Ask InferenceX's own matrix logic for the node budget instead of
-    # transcribing a number. At TP4 and dram-utilization 0.80 that is 865 GB on
-    # b200-nscale and 1199 GB on mi355x-amds, so a HiCache A/B across the two
-    # chips is not a like-for-like host tier.
-    TOTAL_CPU_DRAM_GB="${TOTAL_CPU_DRAM_GB:-$(cd "$IX" && python3 -c "
+# KV tier, resolved per concurrency because conc_defaults sets HICACHE_SIZE
+# from a per-conc table. GLM-5.3-Flash has 11 full-attention layers out of 45,
+# so below conc 32 the device pool never fills and a host tier has nothing to
+# catch; from conc 32 up it is what keeps the hit rate from collapsing.
+resolve_kv_tier() {
+    # KV tier. GLM-5.3-Flash only has 11 full-attention layers, so TP4 holds ~12.4M
+    # tokens of fp8 KV in HBM and a host tier is opt-in rather than load-bearing.
+    if [ "$HICACHE_SIZE" -gt 0 ]; then
+        export KV_OFFLOADING=dram
+        export KV_OFFLOAD_BACKEND=hicache
+        export KV_OFFLOAD_BACKEND_METADATA='{"name":"hicache"}'
+        export HICACHE_SIZE
+        # Ask InferenceX's own matrix logic for the node budget instead of
+        # transcribing a number. At TP4 and dram-utilization 0.80 that is 865 GB on
+        # b200-nscale and 1199 GB on mi355x-amds, so a HiCache A/B across the two
+        # chips is not a like-for-like host tier.
+        TOTAL_CPU_DRAM_GB="${TOTAL_CPU_DRAM_GB:-$(cd "$IX" && python3 -c "
 import yaml
 from infx.matrix.generate import agentic_dram_offload_gb
 print(agentic_dram_offload_gb(
@@ -324,14 +359,15 @@ print(agentic_dram_offload_gb(
     '$DRAM_RUNNER',
     yaml.safe_load(open('configs/runners.yaml')),
 ))")}"
-else
-    export KV_OFFLOADING=none
-    # process_agentic_result rejects a result that names a backend it did not use.
-    export KV_OFFLOAD_BACKEND=""
-    export KV_OFFLOAD_BACKEND_METADATA=""
-    TOTAL_CPU_DRAM_GB=0
-fi
-export TOTAL_CPU_DRAM_GB
+    else
+        export KV_OFFLOADING=none
+        # process_agentic_result rejects a result that names a backend it did not use.
+        export KV_OFFLOAD_BACKEND=""
+        export KV_OFFLOAD_BACKEND_METADATA=""
+        TOTAL_CPU_DRAM_GB=0
+    fi
+    export TOTAL_CPU_DRAM_GB
+}
 
 # /raid is node-local NVMe; the venv rebuild and the WEKA corpus are both far
 # happier there than on the NFS home.
@@ -384,15 +420,29 @@ SWEEP_LOG="$ROOT/sweep.log"
 {
     echo "=== $(date -Is) GLM-5.3-Flash AgentX platform=$PLATFORM model=$MODEL_ID ==="
     echo "tag=$TAG tp=$TP ep=$EP spec=$SPEC_DECODING steps=$MTP_STEPS acc=$ACC_MODE${GOLDEN_AL:+($GOLDEN_AL)}"
-    echo "mem_fraction=$MEM_FRACTION_STATIC chunked_prefill=$CHUNKED_PREFILL_SIZE context=${CONTEXT_LENGTH:-native-1M}"
-    echo "kv_offloading=$KV_OFFLOADING hicache_size=${HICACHE_SIZE} total_cpu_dram_gb=$TOTAL_CPU_DRAM_GB"
+    echo "mem_fraction=${USER_MEM_FRACTION:-per-conc} chunked_prefill=${USER_CHUNK:-per-conc} context=${CONTEXT_LENGTH:-native-1M}"
+    echo "hicache_size=${USER_HICACHE:-per-conc} mamba_ratio=${USER_MAMBA_RATIO:-per-conc}"
     echo "duration=$DURATION conc=($CONC_LIST) gpus=${!VISIBLE_VAR:-all}"
     echo "ix=$IX@$(git -C "$IX" rev-parse --short HEAD 2>/dev/null) image=$DOCKER"
     echo "root=$ROOT"
 } | tee -a "$SWEEP_LOG"
 
 if [ "$DRY_RUN" = "1" ]; then
-    echo "--- recipe env (dry run) ---"
+    # The per-concurrency resolvers live inside the sweep loop, so a dry run
+    # has to walk the same list or it prints nothing useful.
+    echo "--- resolved per concurrency ---"
+    printf '%6s %14s %8s %12s %10s %10s\n' conc mem_fraction chunk mamba_ratio kv hicache
+    for CONC in $CONC_LIST; do
+        conc_defaults "$CONC"
+        export CONC MEM_FRACTION_STATIC CHUNKED_PREFILL_SIZE
+        [ -n "$MAMBA_FULL_MEMORY_RATIO" ] && export MAMBA_FULL_MEMORY_RATIO
+        resolve_kv_tier
+        printf '%6s %14s %8s %12s %10s %10s\n' "$CONC" "$MEM_FRACTION_STATIC" \
+            "$CHUNKED_PREFILL_SIZE" "${MAMBA_FULL_MEMORY_RATIO:-default}" \
+            "$KV_OFFLOADING" "$HICACHE_SIZE"
+    done
+    echo
+    echo "--- recipe env (dry run, last concurrency) ---"
     env | grep -E '^(MODEL|TP|EP_SIZE|PP_SIZE|DCP_SIZE|PCP_SIZE|DP_ATTENTION|SPEC_|ACC_MODE|GOLDEN_AL|KV_|HICACHE|TOTAL_CPU_DRAM_GB|MAX_MODEL_LEN|CONTEXT_LENGTH|MAMBA_|MAX_MAMBA|CUDA_GRAPH|MEM_FRACTION|CHUNKED_|AIPERF_|AGENTIC_|INFMAX_|RUNNER_TYPE|PRECISION|FRAMEWORK|SCENARIO_|DURATION|ENABLE_AGENTX_POWER|REQUIRE_POWER|IS_MULTINODE|DISAGG|EVAL_ONLY|IMAGE|HF_HUB_CACHE)' | sort
     exit 0
 fi
@@ -400,6 +450,10 @@ fi
 # ---- sweep ---------------------------------------------------------------
 for CONC in $CONC_LIST; do
     export CONC
+    conc_defaults "$CONC"
+    export MEM_FRACTION_STATIC CHUNKED_PREFILL_SIZE
+    [ -n "$MAMBA_FULL_MEMORY_RATIO" ] && export MAMBA_FULL_MEMORY_RATIO
+    resolve_kv_tier
     export EXP_NAME="glm5.3flash_tp${TP}_conc${CONC}_kv${KV_OFFLOADING}_spec-${SPEC_DECODING}"
     export RESULT_FILENAME="${EXP_NAME}_${PRECISION}_${FRAMEWORK}_tp${TP}-pp1-dcp1-pcp1-ep${EP}-dpa${DP_ATTENTION}_disagg-${DISAGG}_spec-${SPEC_DECODING}_conc${CONC}_local-${RUNNER_TYPE}"
     export RESULT_DIR="$ROOT/$EXP_NAME"
@@ -424,7 +478,8 @@ for CONC in $CONC_LIST; do
         sleep 15
     done
 
-    echo ">>> $(date -Is) starting conc=$CONC port=$PORT -> $RESULT_DIR" | tee -a "$SWEEP_LOG"
+    echo ">>> $(date -Is) starting conc=$CONC port=$PORT mem_fraction=$MEM_FRACTION_STATIC chunk=$CHUNKED_PREFILL_SIZE mamba_ratio=${MAMBA_FULL_MEMORY_RATIO:-default} kv=$KV_OFFLOADING hicache=$HICACHE_SIZE" | tee -a "$SWEEP_LOG"
+    echo "    -> $RESULT_DIR" | tee -a "$SWEEP_LOG"
     bash "$RECIPE" > "$RESULT_DIR/recipe.log" 2>&1
     rc=$?
     echo ">>> $(date -Is) conc=$CONC exit=$rc" | tee -a "$SWEEP_LOG"
