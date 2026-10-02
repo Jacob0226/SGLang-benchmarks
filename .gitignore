@@ -32,3 +32,7 @@ analysis_GLM5.3/
 # Written at runtime by tools/kill_sglang.sh so no pkill pattern ever lands in
 # a shell command line (see the comment in that script)
 tools/.kill_sglang_inner.sh
+
+# NFS silly-rename leftovers: atomically replacing a file that a running
+# script still has open leaves one of these behind until the process exits.
+.nfs*
