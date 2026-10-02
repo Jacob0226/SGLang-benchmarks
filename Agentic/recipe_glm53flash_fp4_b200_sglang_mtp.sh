@@ -212,12 +212,20 @@ SGLANG_CMD=(
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
     # One sequence per prefill batch. The DSA indexer sizes its fp8_mqa_logits
     # buffer as chunked_prefill_size x (sum of full context lengths in the
-    # batch), so without this the buffer grows with concurrency and chunk 16384
-    # OOMs at conc 32 (31.4 GiB wanted, 31.1 GiB free). Capping the batch at one
-    # sequence bounds it by the longest single context instead, ~17 GiB, which
-    # is what makes the 16384 chunk -- and the throughput that comes with it --
-    # reachable at all. Costs little here because long contexts already fill the
-    # chunk budget on their own: the scheduler was logging #new-seq: 1 anyway.
+    # batch), so the buffer tracks how many long contexts happen to land in one
+    # batch rather than anything bounded. At chunk 16384 that killed conc 32:
+    # 31.4 GiB wanted against 31.1 GiB free, i.e. one batch carrying ~1.9M
+    # tokens of context. Capping at one sequence bounds it by the longest
+    # single context, ~17 GiB, and is what makes chunk 16384 -- and the 25%
+    # throughput it buys over 8192 -- reachable at all.
+    #
+    # This is a trade, not a free win. Measured over a conc 32 run, 90% of
+    # prefill batches already held a single sequence, so the cap is a no-op for
+    # them; it binds on the ~10% that held 2-10, which are precisely the
+    # batches that blow the buffer. Serialising those costs ITL p50 (6.88ms
+    # against 5.89ms for the chunk-12288-no-cap alternative) and wins ITL p90
+    # (24.83 vs 25.62) and TTFT p90 (8.10s vs 9.45s). p90 is the board axis, so
+    # this side of the trade is the one worth taking.
     --prefill-max-requests 1
     --mem-fraction-static "$MEM_FRACTION_STATIC"
     --max-running-requests "$MAX_RUNNING_REQUESTS"
