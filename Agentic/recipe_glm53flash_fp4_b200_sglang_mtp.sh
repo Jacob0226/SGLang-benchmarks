@@ -124,7 +124,29 @@ fi
 # AgentX concurrency counts live session trees, not requests: a trajectory can
 # fan out to subagents, so the engine must accept more than CONC in flight or
 # the client's bursts queue behind an artificial cap.
+#
+# This knob has a second job that pulls the other way. The KDA intermediate
+# state buffer is sized from max_running_requests * speculative_num_draft_tokens
+# and comes straight out of the KV pool: 13.3 GB at conc 32, 26.6 GB at conc 64.
+# The two only conflict once the KV pool is tight, which on this model happens
+# at conc 64 and not before (conc 32 peaks at 21-24% pool usage with HiCache on).
+#
+# Measured at conc 64 with HiCache, 1.25x against the 2x default:
+#   2.00x (128): 49,405 tok/s/GPU, TTFT p90 25.5s, intvty 25.3
+#   1.25x  (80): 58,436 tok/s/GPU, TTFT p90 14.1s, intvty 23.7
+# 18% more throughput and 45% better TTFT for 6% of interactivity. Note 1.25x
+# is actively harmful without HiCache (ITL p90 202ms vs 148ms) -- a bigger KV
+# pool does not help when the working set overflows it either way, and the lost
+# scheduling headroom just adds queueing. It only pays once HiCache is catching
+# the overflow.
+#
+# Per-concurrency like upstream's own hicache-size table in
+# glm5.2_fp4_b200_sglang_mtp.sh, rather than one multiplier for the curve.
 MAX_RUNNING_REQUESTS=$((2 * CONC))
+case "$CONC" in
+    64) MAX_RUNNING_REQUESTS=80 ;;
+esac
+[ -n "${MAX_RUNNING_REQUESTS_OVERRIDE:-}" ] && MAX_RUNNING_REQUESTS="$MAX_RUNNING_REQUESTS_OVERRIDE"
 [ "$MAX_RUNNING_REQUESTS" -lt 8 ] && MAX_RUNNING_REQUESTS=8
 
 # --cuda-graph-max-bs-decode counts requests; the spec-decode graph runner
