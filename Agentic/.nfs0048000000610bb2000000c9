@@ -64,17 +64,15 @@ CONC_LIST="1 4 8 12 16"
 DURATION="${DURATION:-3600}"
 GPUS=""
 PORT_BASE=28900
-# Empty so the platform block below can default them per chip without
-# clobbering a value the caller passed on the command line.
-MEM_FRACTION_STATIC=""
-CHUNKED_PREFILL_SIZE=""
+MEM_FRACTION_STATIC=0.85
+CHUNKED_PREFILL_SIZE=16384
 # steps 5 / 6 draft tokens is what the local fixed-length TP4 MTP run used and
 # is the deepest EAGLE ladder GLM-5.3-Flash's single nextn head sustains here.
 MTP_STEPS=5
 SPEC_DECODING=mtp
 ACC_MODE=real
 GOLDEN_AL=""
-HICACHE_SIZE=""
+HICACHE_SIZE=0
 CONTEXT_LENGTH=""
 MAMBA_FULL_MEMORY_RATIO=""
 MAX_MAMBA_CACHE_SIZE=""
@@ -138,20 +136,6 @@ case "$PLATFORM" in
         : "${DOCKER:=lmsysorg/sglang:v0.5.20-cu130}"
         MODEL_ID="nvidia/GLM-5.3-Flash-NVFP4"
         : "${CKPT:=/data/huggingface/hub/nvidia/GLM-5.3-Flash-NVFP4}"
-        # Measured defaults, not guesses. Each was A/B'd at conc 32 against the
-        # value above it; see docs in AgentSkill sglang-benchmark/agentic-benchmark.md.
-        #   mem-fraction 0.75   headroom for the DSA indexer's per-prefill buffer
-        #   chunked-prefill 16k the real high-concurrency bottleneck is prefill
-        #                       budget, not memory; 8k costs 25% throughput
-        #   mamba-ratio 1.5     inverted-U peak: 0.9 starves KDA slots, 2.0
-        #                       starts eating KV the model still needs
-        #   hicache 169 GB/rank even at conc 32, where the device pool is only
-        #                       21-24% used, eviction is still happening and the
-        #                       host tier catches it (+29% interactivity)
-        : "${MEM_FRACTION_STATIC:=0.75}"
-        : "${CHUNKED_PREFILL_SIZE:=16384}"
-        : "${MAMBA_FULL_MEMORY_RATIO:=1.5}"
-        : "${HICACHE_SIZE:=169}"
         gpu_count() { nvidia-smi --query-gpu=index --format=csv,noheader | wc -l; }
         gpu_mem_used_max_mib() {
             nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits ${GPUS:+-i "$GPUS"} | sort -rn | head -1
@@ -171,11 +155,6 @@ case "$PLATFORM" in
         # rocm-smi, like nvidia-smi, lists every device on the node regardless
         # of the visibility variable: the count sees the whole node, and the
         # reclaim check filters to --gpus itself.
-        # Unchanged from before the b200 tuning landed; the MI355X side has
-        # not run the same sweep, so these stay at the neutral values.
-        : "${MEM_FRACTION_STATIC:=0.85}"
-        : "${CHUNKED_PREFILL_SIZE:=16384}"
-        : "${HICACHE_SIZE:=0}"
         gpu_count() { rocm-smi --showid --csv 2>/dev/null | grep -c '^card'; }
         gpu_mem_used_max_mib() {
             rocm-smi --showmeminfo vram --csv 2>/dev/null | awk -F, -v want="$GPUS" '

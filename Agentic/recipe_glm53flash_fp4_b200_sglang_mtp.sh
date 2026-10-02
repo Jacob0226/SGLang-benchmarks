@@ -210,6 +210,15 @@ SGLANG_CMD=(
     --tool-call-parser glm47
     --reasoning-parser glm45
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
+    # One sequence per prefill batch. The DSA indexer sizes its fp8_mqa_logits
+    # buffer as chunked_prefill_size x (sum of full context lengths in the
+    # batch), so without this the buffer grows with concurrency and chunk 16384
+    # OOMs at conc 32 (31.4 GiB wanted, 31.1 GiB free). Capping the batch at one
+    # sequence bounds it by the longest single context instead, ~17 GiB, which
+    # is what makes the 16384 chunk -- and the throughput that comes with it --
+    # reachable at all. Costs little here because long contexts already fill the
+    # chunk budget on their own: the scheduler was logging #new-seq: 1 anyway.
+    --prefill-max-requests 1
     --mem-fraction-static "$MEM_FRACTION_STATIC"
     --max-running-requests "$MAX_RUNNING_REQUESTS"
     --cuda-graph-max-bs-decode "$CUDA_GRAPH_MAX_BS"
