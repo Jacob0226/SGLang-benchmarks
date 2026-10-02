@@ -214,15 +214,24 @@ case "$PLATFORM" in
         # rocm-smi, like nvidia-smi, lists every device on the node regardless
         # of the visibility variable: the count sees the whole node, and the
         # reclaim check filters to --gpus itself.
-        # Unchanged from before the b200 tuning landed; the MI355X side has
-        # not run the same sweep, so these stay at the neutral values.
-        # Flat, not per-concurrency: the MI355X side has not run the sweep that
-        # would justify a table, and inheriting B200's would be a guess.
+        # Measured per concurrency, and not B200's table. Conc 32 without
+        # HiCache: P90 interactivity 55.9, 45,964 tok/s/GPU; HiCache 169 on
+        # that point fell to 51.4. Conc 64 without a host tier collapsed
+        # (2.7, 12,349 tok/s/GPU, KV pool at 100%); HiCache 169 + mamba-ratio
+        # 0.5 recovered 20.6 and 55,272. max-running 80 at conc 64 lives in
+        # the recipe. An explicit --hicache-size / --mamba-ratio still wins
+        # at every point.
         conc_defaults() {
+            local c="$1"
             MEM_FRACTION_STATIC="${USER_MEM_FRACTION:-0.85}"
             CHUNKED_PREFILL_SIZE="${USER_CHUNK:-16384}"
-            MAMBA_FULL_MEMORY_RATIO="$USER_MAMBA_RATIO"
-            HICACHE_SIZE="${USER_HICACHE:-0}"
+            if [ "$c" -ge 64 ]; then
+                MAMBA_FULL_MEMORY_RATIO="${USER_MAMBA_RATIO:-0.5}"
+                HICACHE_SIZE="${USER_HICACHE:-169}"
+            else
+                MAMBA_FULL_MEMORY_RATIO="${USER_MAMBA_RATIO:-0.9}"
+                HICACHE_SIZE="${USER_HICACHE:-0}"
+            fi
         }
         gpu_count() { rocm-smi --showid --csv 2>/dev/null | grep -c '^card'; }
         gpu_mem_used_max_mib() {
@@ -335,13 +344,16 @@ else
 fi
 
 # KV tier, resolved per concurrency because conc_defaults sets HICACHE_SIZE
-# from a per-conc table. GLM-5.3-Flash has 11 full-attention layers out of 45,
-# so below conc 32 the device pool never fills and a host tier has nothing to
-# catch; from conc 32 up it is what keeps the hit rate from collapsing.
+# from a per-conc table. The threshold differs by chip: B200 turns the host
+# tier on at conc 32, MI355X only at conc 64.
+# A lower conc sets TOTAL_CPU_DRAM_GB=0, so the node budget is cached the
+# first time a point actually asks for HiCache. Otherwise the next point
+# would treat that 0 as an already-resolved budget.
+DRAM_BUDGET_GB=""
 resolve_kv_tier() {
     # KV tier. GLM-5.3-Flash only has 11 full-attention layers, so TP4 holds ~12.4M
     # tokens of fp8 KV in HBM and a host tier is opt-in rather than load-bearing.
-    if [ "$HICACHE_SIZE" -gt 0 ]; then
+    if [ "${HICACHE_SIZE:-0}" -gt 0 ]; then
         export KV_OFFLOADING=dram
         export KV_OFFLOAD_BACKEND=hicache
         export KV_OFFLOAD_BACKEND_METADATA='{"name":"hicache"}'
@@ -350,7 +362,11 @@ resolve_kv_tier() {
         # transcribing a number. At TP4 and dram-utilization 0.80 that is 865 GB on
         # b200-nscale and 1199 GB on mi355x-amds, so a HiCache A/B across the two
         # chips is not a like-for-like host tier.
-        TOTAL_CPU_DRAM_GB="${TOTAL_CPU_DRAM_GB:-$(cd "$IX" && python3 -c "
+        if [ -z "$DRAM_BUDGET_GB" ]; then
+            if [ "${TOTAL_CPU_DRAM_GB:-0}" -gt 0 ]; then
+                DRAM_BUDGET_GB="$TOTAL_CPU_DRAM_GB"
+            else
+                DRAM_BUDGET_GB="$(cd "$IX" && python3 -c "
 import yaml
 from infx.matrix.generate import agentic_dram_offload_gb
 print(agentic_dram_offload_gb(
@@ -358,7 +374,10 @@ print(agentic_dram_offload_gb(
     {'tp': $TP, 'ep': $EP, 'kv-offloading': 'dram'},
     '$DRAM_RUNNER',
     yaml.safe_load(open('configs/runners.yaml')),
-))")}"
+))")"
+            fi
+        fi
+        TOTAL_CPU_DRAM_GB="$DRAM_BUDGET_GB"
     else
         export KV_OFFLOADING=none
         # process_agentic_result rejects a result that names a backend it did not use.

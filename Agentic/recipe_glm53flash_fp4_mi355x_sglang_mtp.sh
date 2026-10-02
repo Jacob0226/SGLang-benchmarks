@@ -117,7 +117,17 @@ fi
 # AgentX concurrency counts live session trees, not requests: a trajectory can
 # fan out to subagents, so the engine must accept more than CONC in flight or
 # the client's bursts queue behind an artificial cap.
+#
+# At conc 64 the device KV pool is the wall (100% full, no HiCache). Cutting
+# max-running from 128 to 80 frees the KDA intermediate buffer for KV and,
+# together with HiCache 169 and mamba-ratio 0.5, is the measured winner:
+# interactivity 2.7 -> 20.6 and 12,349 -> 55,272 tok/s/GPU on a 1200s window.
+# Conc 32 peaks at 49% of the pool with 2x and no HiCache, so it stays at 2x.
 MAX_RUNNING_REQUESTS=$((2 * CONC))
+case "$CONC" in
+    64) MAX_RUNNING_REQUESTS=80 ;;
+esac
+[ -n "${MAX_RUNNING_REQUESTS_OVERRIDE:-}" ] && MAX_RUNNING_REQUESTS="$MAX_RUNNING_REQUESTS_OVERRIDE"
 [ "$MAX_RUNNING_REQUESTS" -lt 8 ] && MAX_RUNNING_REQUESTS=8
 
 # --cuda-graph-max-bs-decode counts requests; the spec-decode graph runner
