@@ -515,4 +515,3 @@ for CONC in $CONC_LIST; do
 done
 
 echo "=== $(date -Is) sweep done: $ROOT ===" | tee -a "$SWEEP_LOG"
-echo "Summarize with: $HERE/ix_agentx_summarize.py --hw $RUNNER_TYPE $ROOT"
