@@ -160,7 +160,17 @@ case "$PLATFORM" in
         RUNNER_TYPE=b200
         DRAM_RUNNER=cluster:b200-nscale
         PORT_TOOL=lsof
-        : "${DOCKER:=lmsysorg/sglang:v0.5.20-cu130}"
+        # Prefer what the container actually is over what this file was last
+        # edited to say. A stale default does not fail, it mislabels: results
+        # land under results/<model>/<image>/ and the image field of every
+        # result JSON comes from here, so a v0.5.21 sweep filed itself as
+        # v0.5.20 and would have been compared against itself as a regression.
+        # SGLANG_IMAGE_TAG omits the CUDA suffix the published tag carries, so
+        # restore it rather than recording a tag that does not exist.
+        if [ -n "${SGLANG_IMAGE_TAG:-}" ]; then
+            : "${DOCKER:=${SGLANG_IMAGE_TAG}-cu130}"
+        fi
+        : "${DOCKER:=lmsysorg/sglang:v0.5.21-cu130}"
         MODEL_ID="nvidia/GLM-5.3-Flash-NVFP4"
         : "${CKPT:=/data/huggingface/hub/nvidia/GLM-5.3-Flash-NVFP4}"
         # Measured defaults, not guesses. Each was A/B'd at conc 32 against the
