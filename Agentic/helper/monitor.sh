@@ -5,7 +5,10 @@
 # still being written rather than just the most recent one, and reads each
 # run's GPU set out of its own sweep.log instead of assuming 0-3.
 set -u
-RESULTS="${RESULTS:-/mnt/home/jacchang/SGLang-benchmarks/results/nvidia_GLM-5.3-Flash-NVFP4/lmsysorg_sglang-v0.5.20-cu130}"
+# Model directory, not an image directory. Pinning the image meant the
+# monitor went blind the moment the container moved to a new SGLang tag:
+# it reported "no live sweep" while one was running one directory over.
+RESULTS="${RESULTS:-/mnt/home/jacchang/SGLang-benchmarks/results/nvidia_GLM-5.3-Flash-NVFP4}"
 INTERVAL="${INTERVAL:-60}"
 STALE_MIN="${STALE_MIN:-5}"   # a recipe.log untouched this long is a finished run
 
@@ -55,8 +58,8 @@ report_one() {
 }
 
 while true; do
-    mapfile -t live < <(find "$RESULTS"/bench-Agentic-*/*/ -maxdepth 1 -name recipe.log \
-                        -mmin "-${STALE_MIN}" 2>/dev/null | sort)
+    mapfile -t live < <(find "$RESULTS" -name recipe.log -mmin "-${STALE_MIN}" \
+                        -path '*/bench-Agentic-*' 2>/dev/null | sort)
     if [ "${#live[@]}" -eq 0 ]; then
         echo "PROGRESS $(date -u +%H:%M) 沒有進行中的跑"
     else
