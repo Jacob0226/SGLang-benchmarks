@@ -28,6 +28,7 @@ import argparse
 import bisect
 import gzip
 import json
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -123,13 +124,18 @@ def classify(name: str):
     if name.startswith("nccl") or "reduce_scatter" in key or "all_reduce" in key \
        or "allreduce" in key or "allgather" in key:
         return "comm", name.split(":", 1)[-1]
+    # ATOM leaves the fused TP all-reduce + rmsnorm (reduce_scatter_cross_device
+    # then local_device_load_rmsnorm) under an annotation with an empty name.
+    if name == "":
+        return "comm", "allreduce_rmsnorm"
     # step-level / misc op regions (rmsnorm, prepare_*, ...)
     return name, ""
 
 
 # wrapper annotations that should never be a kernel's "innermost" label
 def _is_wrapper(name: str) -> bool:
-    return name.startswith("decode[") or name.startswith("## Call CompiledFxGraph")
+    return name.startswith(("decode[", "eager_decode[", "propose_eagle[",
+                            "## Call CompiledFxGraph"))
 
 
 def extract(trace):
@@ -177,6 +183,24 @@ def segment_forwards(gann):
                      key=lambda a: a["ts"])
     if dsteps:
         return [(a["ts"], a["ts"] + a["dur"], a["name"]) for a in dsteps], "decode[]"
+    # No-cuda-graph traces: eager_decode[ lands on the stream at the END of the
+    # verify forward (layer 77 runs just before it, the MTP layer 78 after), so
+    # a verify forward spans from the first layer-0 marker after the previous
+    # step marker up to the end of its eager_decode[ marker.
+    marks = sorted([a for a in gann if a["name"].startswith(
+        ("prefill[", "eager_decode[", "propose_eagle["))], key=lambda a: a["ts"])
+    l0ts = sorted(a["ts"] for a in gann if a["name"].startswith("model.layers.0."))
+    if l0ts and any(a["name"].startswith("eager_decode[") for a in marks):
+        segs = []
+        for i, a in enumerate(marks):
+            if not a["name"].startswith("eager_decode[") or i == 0:
+                continue
+            prev_end = marks[i - 1]["ts"] + marks[i - 1]["dur"]
+            j = bisect.bisect_left(l0ts, prev_end)
+            if j < len(l0ts) and l0ts[j] < a["ts"]:
+                segs.append((l0ts[j], a["ts"] + a["dur"], a["name"]))
+        if segs:
+            return segs, "eager_decode[]"
     l0 = sorted([a for a in gann if a["name"].startswith("model.layers.0.")],
                 key=lambda a: a["ts"])
     if not l0:
@@ -277,6 +301,11 @@ def _one_step(trace, step_idx):
     return kin, (s0, s1), gin
 
 
+# DSA indexer kernels that run inside a torch.compile region (a wrapper), so no
+# per-layer annotation encloses them.
+INDEXER_KERNEL = re.compile(r"pa_mqa_logits|select_kernel|radix_topk|indexer_qk_rope|^pack_kernel")
+
+
 def build_struct_map(struct_trace, step_idx):
     """kernel_name -> (section, leaf), from one decode forward of a (no-cuda-graph)
     trace whose annotations wrap the kernels. Majority label per kernel name."""
@@ -285,7 +314,12 @@ def build_struct_map(struct_trace, step_idx):
     votes = defaultdict(Counter)
     for k in kin:
         a = innermost_label(k, gin, lab_ts)
-        lbl = classify(a["name"]) if a else ("(unlabeled)", "")
+        if a:
+            lbl = classify(a["name"])
+        elif INDEXER_KERNEL.search(k["name"]):
+            lbl = (_ATTN, "Indexer (torch.compile)")
+        else:
+            lbl = ("(unlabeled)", "")
         votes[k["name"]][lbl] += 1
     return {name: c.most_common(1)[0][0] for name, c in votes.items()}
 
