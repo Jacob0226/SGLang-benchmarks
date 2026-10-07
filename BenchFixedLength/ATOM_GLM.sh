@@ -8,19 +8,27 @@
 #   ./ATOM_GLM.sh --model /data/huggingface/hub/zai-org/GLM-5-FP8 --tp 8
 #   ./ATOM_GLM.sh --tag MyRun --docker rocm/atom-dev:sglang-v0.5.12-nightly_20260630
 #   ./ATOM_GLM.sh --port 8888                      # HTTP server-port (default 8888)
+#   ./ATOM_GLM.sh --tp 4 --dcp 4 --mtp 4 --acc-len 3.33   # InferenceX conc>=16 arm
+#
+# Recipe knobs (env, unset = ATOM default): MAX_NUM_SEQS, CUDAGRAPH_SIZES,
+# BLOCK_SIZE, INDEX_CACHE_DTYPE, MAX_BATCHED_TOKENS, ENGINE_PORT, PROF_MULT.
 set -euo pipefail
 set -x
 ulimit -n 65535
 
 PROF="false"; MODEL="/data/huggingface/hub/zai-org/GLM-5-FP8"; TP=8
-TAG=""; DOCKER="untagged-docker"; SERVER_PORT="${PORT:-8888}"; ENGINE_PORT=5678
+TAG=""; DOCKER="untagged-docker"; SERVER_PORT="${PORT:-8888}"; ENGINE_PORT="${ENGINE_PORT:-5678}"
+DCP=1; MTP=0; ACC_LEN=""
 while [[ $# -gt 0 ]]; do case $1 in
-  --prof)   PROF="true"; shift;;
-  --model)  MODEL="$2"; shift 2;;
-  --tp)     TP="$2"; shift 2;;
-  --tag)    TAG="-$2"; shift 2;;
-  --docker) DOCKER="$2"; shift 2;;
-  --port)   SERVER_PORT="$2"; shift 2;;
+  --prof)    PROF="true"; shift;;
+  --model)   MODEL="$2"; shift 2;;
+  --tp)      TP="$2"; shift 2;;
+  --dcp)     DCP="$2"; shift 2;;
+  --mtp)     MTP="$2"; shift 2;;      # number of MTP draft tokens
+  --acc-len) ACC_LEN="$2"; shift 2;;  # forced acceptance length (golden AL)
+  --tag)     TAG="-$2"; shift 2;;
+  --docker)  DOCKER="$2"; shift 2;;
+  --port)    SERVER_PORT="$2"; shift 2;;
   *) echo "Unknown option: $1"; exit 1;;
 esac; done
 
@@ -52,7 +60,7 @@ IFS=' ' read -ra concurrencies <<< "${CONC:-4 8 16 32 64}"
 MULT="${MULT:-5}"
 SPECIAL="-bench"
 if [ "$PROF" == "true" ]; then
-    SPECIAL="-prof"; MULT=2
+    SPECIAL="-prof"; MULT="${PROF_MULT:-2}"
     [ -z "${CONC:-}" ] && concurrencies=(4)   # profile: conc 4 only
     # ATOM has no --profile-num-steps: it profiles the WHOLE run, so a long
     # output-len => a giant trace (1024 decode steps ~= 770 MB/rank). Profile
@@ -143,8 +151,24 @@ start_server() {
     # lm_head, embed excluded) — accelerates prefill GEMMs. Disable with
     # ONLINE_QUANT=off.
     if [ "${ONLINE_QUANT:-ptpc_fp8}" != "off" ]; then
-        cmd+=(--online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate", "*expert*"]}')
+        if [ "$MTP" -gt 0 ]; then
+            # The MTP head (model.layers.78) ships in BF16 and must stay out of
+            # online quant, so experts are excluded per layer 0-77 instead of *expert*.
+            cmd+=(--online_quant_config '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*","model.layers.78.*"]}')
+        else
+            cmd+=(--online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate", "*expert*"]}')
+        fi
     fi
+    [ "$DCP" -gt 1 ] && cmd+=(--decode-context-parallel-size "$DCP")
+    if [ "$MTP" -gt 0 ]; then
+        cmd+=(--method mtp --num-speculative-tokens "$MTP")
+        [ -n "$ACC_LEN" ] && cmd+=(--spec-decode-acceptance-length "$ACC_LEN")
+    fi
+    [ -n "${MAX_NUM_SEQS:-}" ]       && cmd+=(--max-num-seqs "$MAX_NUM_SEQS")
+    [ -n "${CUDAGRAPH_SIZES:-}" ]    && cmd+=(--cudagraph-capture-sizes "$CUDAGRAPH_SIZES")
+    [ -n "${BLOCK_SIZE:-}" ]         && cmd+=(--block-size "$BLOCK_SIZE")
+    [ -n "${INDEX_CACHE_DTYPE:-}" ]  && cmd+=(--index_cache_dtype "$INDEX_CACHE_DTYPE")
+    [ -n "${MAX_BATCHED_TOKENS:-}" ] && cmd+=(--max-num-batched-tokens "$MAX_BATCHED_TOKENS")
     if [ "$PROF" == "true" ]; then
         cmd+=(--torch-profiler-dir "$LOG_DIR" --mark-trace)
         [ "${EAGER:-false}" == "true" ] && cmd+=(--enforce-eager)
