@@ -287,6 +287,29 @@ if [ "$NGPU" -lt "$TP" ]; then
     exit 1
 fi
 
+# Without CAP_SYS_NICE the framework logs "User lacks permission to set NUMA
+# affinity" and leaves the TP workers wherever the kernel put them. On a
+# two-socket host that cost up to 18% of P90 interactivity in the 2026-10-07
+# rerun while leaving prefill, batch sizes and accept length untouched, so
+# nothing else in the results hints at it.
+#
+# Read the CapEff bitmask (CAP_SYS_NICE is bit 23) rather than grepping capsh:
+# under --privileged capsh collapses the set to "Current: =ep" without naming
+# it, and "Current IAB:" lists absent capabilities with a "!" prefix, so either
+# spelling of a grep gets the answer backwards.
+has_sys_nice() {
+    local eff
+    eff=$(awk '/^CapEff:/ {print $2}' /proc/self/status 2>/dev/null) || return 0
+    [ -n "$eff" ] || return 0
+    (( (0x$eff >> 23) & 1 ))
+}
+if ! has_sys_nice; then
+    echo "WARNING: cap_sys_nice is not held, so NUMA affinity for the GPU workers" >&2
+    echo "         will be skipped and decode numbers will not be comparable." >&2
+    echo "         Recreate the container with --privileged (or --cap-add SYS_NICE)." >&2
+    [ -n "${ALLOW_NO_SYS_NICE:-}" ] || { echo "         Set ALLOW_NO_SYS_NICE=1 to run anyway." >&2; exit 1; }
+fi
+
 case "$ACC_MODE" in
     real) ;;
     golden)
