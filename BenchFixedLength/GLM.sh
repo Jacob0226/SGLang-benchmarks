@@ -694,6 +694,20 @@ if [ "$PROF_ENABLED" == "true" ]; then
     #   PROF_IN_OUT_OVERRIDE="1024:16" PROF_CONC_OVERRIDE="4 64" ./GLM.sh --prof ...
     if [ -n "${PROF_IN_OUT_OVERRIDE:-}" ]; then read -ra in_out_tokens <<< "$PROF_IN_OUT_OVERRIDE"; fi
     if [ -n "${PROF_CONC_OVERRIDE:-}" ]; then read -ra concurrencies <<< "$PROF_CONC_OVERRIDE"; fi
+    # MTP forces every prof shape to 300 output tokens, overriding the 16 above and
+    # PROF_IN_OUT_OVERRIDE alike. --profile-by-stage closes the DECODE window only
+    # after num_steps+1 consecutive decode batches, and a 16-token request under
+    # MTP (accept len ~5) is done in ~3. The window is then still open when the
+    # next prefill arrives, which stops it under the EXTEND name -- overwriting the
+    # real prefill trace and leaving no DECODE file. Measured 2026-10-08,
+    # GLM-5.3-Flash NVFP4 TP4 i70k: at out16, conc1 and conc64 lost both traces;
+    # at out300 all six cells (conc 1/8/64, graph and eager) came out complete.
+    #   PROF_MTP_OUTPUT_LEN=<n> ./GLM.sh --mtp --prof   # different length
+    if [ "$MTP_ENABLED" == "true" ]; then
+        for _i in "${!in_out_tokens[@]}"; do
+            in_out_tokens[$_i]="${in_out_tokens[$_i]%%:*}:${PROF_MTP_OUTPUT_LEN:-300}"
+        done
+    fi
 fi
 DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
 # Layout: results/<model>/<docker-image>/<mode>-Fixed-<tags>
