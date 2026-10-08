@@ -111,6 +111,39 @@
 #   Forcing tc_piecewise onto the KDA/DSA hybrid would benchmark an unvalidated
 #   path. ENABLE_PIECEWISE_CUDA_GRAPH=1 to measure it deliberately.
 #
+# [prof-overwrite] --profile-by-stage can silently replace the prefill trace
+#   profiler_manager._profile_batch_predicate stops whatever capture is running
+#   when a prefill batch arrives after the EXTEND window, and labels it EXTEND. So
+#   a DECODE capture that a new request's prefill cuts short is written to the
+#   -EXTEND filename, over the real prefill trace, and no -DECODE file appears.
+#   Measured 2026-10-08, GLM-5.3-Flash MXFP4 TP4 + MTP, i70k: at out16 conc1 and
+#   conc64 both "EXTEND" traces held only step[VERIFY ...]. Two things avoid it,
+#   and --prof does both:
+#   - enough decode steps per request. The window needs num_steps+1 uninterrupted
+#     decode steps; with MTP (accept ~3.85, draft 6) out16 is ~4. [mtp-prof-out]
+#   - one server per concurrency with SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS=<conc>,
+#     so decode capture starts only once the batch is full, i.e. after the last
+#     prefill. Without it the conc64 capture opened at bs=47 on the ramp.
+#   check_stage_traces() flags any cell where it still happens.
+#
+# [mtp-mrr] MTP needs --max-running-requests above the concurrency
+#   With speculative decoding sglang auto-sizes max_running_requests -- and with it
+#   the hybrid models' mamba state pool and the decode cuda graphs -- to 48 at TP4,
+#   so conc64 silently ran 48 at a time. Capping at exactly 64 is not enough either:
+#   the in-flight chunked prefill holds one state slot, so the 64th request waits
+#   at "mamba usage: 0.98" and the scheduler decodes the other 63 meanwhile; the
+#   batch peaks at 62-63 and early requests finish before it ever fills. Hence
+#   max(concurrencies) + MTP_MRR_HEADROOM (default 8), graphs at max(concurrencies).
+#
+# [prof-segv] ROCm torch-profiler teardown segfaults; the run must not wait on it
+#   One rank can die inside torch.profiler.stop() closing an eager (no-cuda-graph)
+#   DECODE capture: 2 of 2 attempts at i70k/conc1/MTP with 4 steps (TP0, then TP3),
+#   0 of 1 with PROF_NUM_STEPS=2. The other ranks fail at the barrier, but the HTTP
+#   server stays up, so bench_serving waits on its request forever -- 25 min before
+#   anyone noticed. run_guarded() kills the client when the server log reports a
+#   crashed scheduler, and the cell's traces are set aside as *_CRASHED so a re-run
+#   retries it.
+#
 set -euo pipefail
 set -x
 ulimit -n 65535
@@ -694,14 +727,16 @@ if [ "$PROF_ENABLED" == "true" ]; then
     #   PROF_IN_OUT_OVERRIDE="1024:16" PROF_CONC_OVERRIDE="4 64" ./GLM.sh --prof ...
     if [ -n "${PROF_IN_OUT_OVERRIDE:-}" ]; then read -ra in_out_tokens <<< "$PROF_IN_OUT_OVERRIDE"; fi
     if [ -n "${PROF_CONC_OVERRIDE:-}" ]; then read -ra concurrencies <<< "$PROF_CONC_OVERRIDE"; fi
-    # MTP forces every prof shape to 300 output tokens, overriding the 16 above and
-    # PROF_IN_OUT_OVERRIDE alike. --profile-by-stage closes the DECODE window only
-    # after num_steps+1 consecutive decode batches, and a 16-token request under
-    # MTP (accept len ~5) is done in ~3. The window is then still open when the
+    # [mtp-prof-out] MTP forces every prof shape to 300 output tokens, overriding
+    # the 16 above and PROF_IN_OUT_OVERRIDE alike. --profile-by-stage closes the
+    # DECODE window only after num_steps+1 consecutive decode batches, and a
+    # 16-token request under MTP (accept len ~5) is done in ~3. The window is then still open when the
     # next prefill arrives, which stops it under the EXTEND name -- overwriting the
     # real prefill trace and leaving no DECODE file. Measured 2026-10-08,
     # GLM-5.3-Flash NVFP4 TP4 i70k: at out16, conc1 and conc64 lost both traces;
     # at out300 all six cells (conc 1/8/64, graph and eager) came out complete.
+    # MI355X MXFP4 TP4 i70k also came out complete at out64 once [mtp-mrr] and
+    # the per-concurrency min-bs servers were in; PROF_MTP_OUTPUT_LEN=64 is that shape.
     #   PROF_MTP_OUTPUT_LEN=<n> ./GLM.sh --mtp --prof   # different length
     if [ "$MTP_ENABLED" == "true" ]; then
         for _i in "${!in_out_tokens[@]}"; do
@@ -752,6 +787,38 @@ log_command() {
 
     # Execute command
     "$@" 2>&1 | tee -a "$logfile"
+}
+
+# log_command, but give up on the client once a scheduler has crashed. [prof-segv]
+# Returns 3 in that case. The pkill pattern is bracketed and port-anchored so it
+# can match neither this shell nor a client of another server on the host.
+SCHED_CRASH_PATTERN='Subprocess scheduler_[0-9]+ \(pid=[0-9]+\) crashed'
+run_guarded() {
+    local logfile=$1
+    shift
+    local crashes_before flag="${LOG_DIR}/.sched_crashed"
+    crashes_before=$(grep -cE "$SCHED_CRASH_PATTERN" "$SERVER_LOG" 2>/dev/null || true)
+    rm -f "$flag"
+    (
+        set +x
+        while sleep 10; do
+            if [ "$(grep -cE "$SCHED_CRASH_PATTERN" "$SERVER_LOG" 2>/dev/null || true)" -gt "${crashes_before:-0}" ]; then
+                touch "$flag"
+                pkill -TERM -f "sglang[.]bench_serving --host ${HOST} --port ${PORT}( |$)" || true
+                break
+            fi
+        done
+    ) &
+    local guard_pid=$! rc=0
+    log_command "$logfile" "$@" || rc=$?
+    kill "$guard_pid" 2>/dev/null || true
+    wait "$guard_pid" 2>/dev/null || true
+    if [ -f "$flag" ]; then
+        rm -f "$flag"
+        echo "!!! scheduler crashed during '${logfile}'; client stopped. See ${SERVER_LOG}." | tee -a "$logfile"
+        return 3
+    fi
+    return "$rc"
 }
 
 list_profiler_dirs() {
@@ -845,6 +912,33 @@ rename_profiler_artifacts_by_stage() {
     done
 }
 
+# [prof-overwrite] Read the forward annotations back out of the TP0 traces so a
+# lost capture is reported where it happens instead of during analysis. Older
+# images annotate prefill[/decode[ rather than step[EXTEND/step[DECODE|VERIFY.
+check_stage_traces() {
+    local dir=$1 ext dec msg=""
+    ext=$(ls "${dir}"/*-TP-0-EXTEND*.trace.json.gz 2>/dev/null | head -1 || true)
+    dec=$(ls "${dir}"/*-TP-0-DECODE*.trace.json.gz 2>/dev/null | head -1 || true)
+    if [ -z "$dec" ]; then
+        msg="no DECODE trace"
+    fi
+    # grep -c, not -q: under pipefail an early -q exit SIGPIPEs zcat and the
+    # pipeline reports 141 even on a match.
+    if [ -n "$ext" ]; then
+        local n_prefill
+        n_prefill=$(zcat "$ext" | grep -cE '"(step\[EXTEND|prefill\[)' || true)
+        if [ "${n_prefill:-0}" -eq 0 ]; then
+            msg="${msg:+${msg}; }EXTEND trace holds no prefill step (a decode capture overwrote it)"
+        fi
+    fi
+    if [ -n "$msg" ]; then
+        echo "!!! [prof-check] $(basename "$dir"): ${msg}. See [prof-overwrite] in GLM.sh." \
+            | tee -a "${LOG_DIR}/profile_check.log"
+    else
+        echo ">>> [prof-check] $(basename "$dir"): EXTEND and DECODE OK" | tee -a "${LOG_DIR}/profile_check.log"
+    fi
+}
+
 prof_cmd_has_profile_by_stage() {
     local arg
     for arg in "${PROF_CMD[@]}"; do
@@ -890,6 +984,20 @@ start_server() {
     # Everything model- and platform-specific was resolved up front, in the
     # per-model configuration block. See it for why any particular flag is here.
     cmd+=("${MODEL_SERVER_ARGS[@]}")
+
+    # [mtp-mrr] Ahead of SHAPE_EXTRA_SERVER_ARGS on purpose, so a per-shape
+    # --max-running-requests cap still wins. A graph cap the model block already
+    # set (NVFP4's [nvfp4-graph]) is left alone.
+    if [ "$MTP_ENABLED" == "true" ] && [ "${MTP_MRR_HEADROOM:-8}" != "off" ]; then
+        local _max_c=0 _c
+        for _c in "${concurrencies[@]}"; do
+            if [ "$_c" -gt "$_max_c" ]; then _max_c=$_c; fi
+        done
+        cmd+=(--max-running-requests $((_max_c + ${MTP_MRR_HEADROOM:-8})))
+        if [[ " ${MODEL_SERVER_ARGS[*]} " != *" --cuda-graph-max-bs"* ]]; then
+            cmd+=("$(cuda_graph_max_bs_flag)" "$_max_c")
+        fi
+    fi
 
     if is_rocm_gpu_env && [ "$DUAL_STREAM_ROCM" == "true" ]; then
         # Two independent toggles must both be set for full ROCm dual-stream:
@@ -1341,9 +1449,14 @@ run_benchmarks() {
                         --ready-check-timeout-sec "${READY_CHECK_TIMEOUT_SEC:-600}"
                     )
                     echo ">>> [warmup] JIT warmup for in${input_tokens}_out${output_tokens}_conc${c} (no --profile)"
-                    local _warm_t0=$(date +%s)
-                    log_command "$warmup_cfg_log" "${warmup_cfg_cmd[@]}" \
-                        || echo "[warn] per-config warmup failed; continuing to profiled run."
+                    local _warm_t0=$(date +%s) _warm_rc=0
+                    run_guarded "$warmup_cfg_log" "${warmup_cfg_cmd[@]}" || _warm_rc=$?
+                    if [ "$_warm_rc" -eq 3 ]; then
+                        echo "!!! server died in the warmup for ${logfile}; abandoning this server."
+                        exit 1
+                    elif [ "$_warm_rc" -ne 0 ]; then
+                        echo "[warn] per-config warmup failed; continuing to profiled run."
+                    fi
                     _warm_dur=$(( $(date +%s) - _warm_t0 ))
                 fi
                 local _prof_t0=$(date +%s)
@@ -1357,10 +1470,13 @@ run_benchmarks() {
                 # whole run via `set -e`. The trace is typically already flushed
                 # to disk before the crash, so we still want to fall through to
                 # the rename step below and continue with the next iteration.
-                if ! log_command "$logfile" "${cmd[@]}"; then
+                local _rc=0
+                run_guarded "$logfile" "${cmd[@]}" || _rc=$?
+                if [ "$_rc" -ne 0 ]; then
                     echo "[warn] command exited non-zero for ${logfile} (likely profiler teardown crash); traces may still be present — continuing to rename."
                 fi
-                echo "$logfile" >> "$FINISH_LOG"
+                # A crashed cell is not finished: leave it out so a re-run retries it.
+                [ "$_rc" -eq 3 ] || echo "$logfile" >> "$FINISH_LOG"
 
                 # Record per-config timing: warmup (JIT precompile) vs the profiled
                 # run itself (includes capture + profiler teardown). Written to
@@ -1383,6 +1499,18 @@ run_benchmarks() {
                         rename_profiler_artifacts "${input_tokens}" "${output_tokens}" "${c}" "${num_prompts}" "${profiler_dirs_before}" "${profiler_dirs_after}" \
                             || echo "[warn] rename_profiler_artifacts failed for ${logfile}; raw trace dir left in place — continuing."
                     fi
+                    # [prof-segv] Keep the partial traces (the surviving ranks are
+                    # usually complete) but out of the name the skip check looks for.
+                    if [ "$_rc" -eq 3 ] && [ -d "${prof_dir}" ]; then
+                        mv "${prof_dir}" "${prof_dir}_CRASHED_$(date +%s)"
+                        echo "!!! partial traces moved to $(basename "${prof_dir}")_CRASHED_*; re-run to retry this cell."
+                    elif prof_cmd_has_profile_by_stage && [ -d "${prof_dir}" ]; then
+                        check_stage_traces "${prof_dir}" || true
+                    fi
+                fi
+                # Every later cell would hit the dead server; let the caller move on.
+                if [ "$_rc" -eq 3 ]; then
+                    exit 1
                 fi
             fi
         done
@@ -1657,36 +1785,71 @@ for PROF_MODE in "${PROF_SERVER_MODES[@]}"; do
     # no-cuda-graph) still runs, and the cleanup below always executes.
     (
         build_shape_groups
+        # [prof-overwrite] --prof gives every concurrency its own server, because
+        # the scheduler reads SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS once at launch.
+        # Costs one model load per concurrency. PROF_PER_CONC_SERVER=0 shares one
+        # server as before; PROF_DECODE_MIN_BS=<n> pins the threshold, 0 turns it off.
+        if [ "$PROF_ENABLED" == "true" ] && [ "${PROF_PER_CONC_SERVER:-1}" == "1" ]; then
+            _per_conc=1
+            _conc_sets=("${concurrencies[@]}")
+        else
+            _per_conc=0
+            _conc_sets=("${concurrencies[*]}")
+        fi
+        _first_server=1
         for _gi in "${!_group_args[@]}"; do
             # run_benchmarks / shapes_complete read in_out_tokens, so scope it
             # down to this group's shapes for the lifetime of this server.
             read -ra in_out_tokens <<< "${_group_shapes[$_gi]}"
             SHAPE_EXTRA_SERVER_ARGS="${_group_args[$_gi]}"
-            _tag="${PROF_MODE}"
-            if [ "${#_group_args[@]}" -gt 1 ]; then
-                _tag="${PROF_MODE} server $((_gi + 1))/${#_group_args[@]}"
-                echo ">>> [${_tag}] shapes: ${in_out_tokens[*]} | extra server args: ${SHAPE_EXTRA_SERVER_ARGS:-<none>}"
-            fi
-
-            if shapes_complete; then
-                echo ">>> [${_tag}] all results already present under '${LOG_DIR}' — skipping server launch / warmup / gsm8k."
-                continue
-            fi
-
-            # Each group runs in its own subshell so a fatal error (start_server's
-            # `exit 1`, a profiler teardown crash) only aborts THIS group; the
-            # stop_server below still runs, so the next group gets a free port.
-            (
-                echo ">>> [${_tag}] Starting server and benchmarks..."
-                start_server
-                warmup
-                # Accuracy is shape-independent, so only the first server runs it.
-                if [ "$PROF_MODE" == "default" ] && [ "$_gi" -eq 0 ]; then
-                    accuracy_test
+            for _cs in "${_conc_sets[@]}"; do
+                read -ra concurrencies <<< "$_cs"
+                _tag="${PROF_MODE}"
+                if [ "${#_group_args[@]}" -gt 1 ]; then
+                    _tag="${PROF_MODE} server $((_gi + 1))/${#_group_args[@]}"
+                    echo ">>> [${_tag}] shapes: ${in_out_tokens[*]} | extra server args: ${SHAPE_EXTRA_SERVER_ARGS:-<none>}"
                 fi
-                run_benchmarks
-            ) || echo "[warn] shape group '${in_out_tokens[*]}' aborted (exit $?); continuing."
-            stop_server
+                if [ "$_per_conc" -eq 1 ]; then _tag="${_tag} conc${_cs}"; fi
+
+                if shapes_complete; then
+                    echo ">>> [${_tag}] all results already present under '${LOG_DIR}' — skipping server launch / warmup / gsm8k."
+                    continue
+                fi
+
+                if [ "$_per_conc" -eq 1 ]; then
+                    # A batch can never outgrow a --max-running-requests cap, so
+                    # the threshold is the smaller of the two. The caller's
+                    # SERVER_EXTRA_ARGS is checked last because it wins in argparse.
+                    _min_bs="${PROF_DECODE_MIN_BS:-auto}"
+                    if [ "$_min_bs" == "auto" ]; then
+                        _min_bs="$_cs"
+                        for _a in "${SHAPE_EXTRA_SERVER_ARGS:-}" "${SERVER_EXTRA_ARGS:-}"; do
+                            if [[ "$_a" =~ --max-running-requests[[:space:]]+([0-9]+) ]] \
+                                && [ "${BASH_REMATCH[1]}" -lt "$_cs" ]; then
+                                _min_bs="${BASH_REMATCH[1]}"
+                            fi
+                        done
+                    fi
+                    export SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS="$_min_bs"
+                    echo ">>> [${_tag}] SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS=${_min_bs}"
+                fi
+
+                # Each server runs in its own subshell so a fatal error (start_server's
+                # `exit 1`, a crashed scheduler) only aborts THIS server; the
+                # stop_server below still runs, so the next one gets a free port.
+                (
+                    echo ">>> [${_tag}] Starting server and benchmarks..."
+                    start_server
+                    warmup
+                    # Accuracy is shape-independent, so only the first server runs it.
+                    if [ "$PROF_MODE" == "default" ] && [ "$_first_server" -eq 1 ]; then
+                        accuracy_test
+                    fi
+                    run_benchmarks
+                ) || echo "[warn] server for '${in_out_tokens[*]}' conc '${concurrencies[*]}' aborted (exit $?); continuing."
+                _first_server=0
+                stop_server
+            done
         done
     ) || echo "[warn] profiling mode '${PROF_MODE}' aborted (exit $?); continuing to cleanup and next mode."
 
