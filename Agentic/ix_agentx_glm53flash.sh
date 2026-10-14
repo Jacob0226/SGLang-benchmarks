@@ -523,9 +523,12 @@ for CONC in $CONC_LIST; do
     # A server that outlived the previous point keeps both the port and its
     # share of HBM, and booting on top of it silently halves the KV pool.
     kill_port "$PORT"
+    # 4 GiB, not 1: while a HiCache server (hicache 169) runs on the other
+    # half of the node, these GPUs show ~1.2 GiB used with no process on them.
+    # A leftover server of our own holds ~270 GiB.
     for _ in $(seq 1 60); do
         busy=$(gpu_mem_used_max_mib)
-        [ "${busy:-0}" -le 1024 ] && break
+        [ "${busy:-0}" -le 4096 ] && break
         echo "    waiting for GPU reclaim (max used=${busy} MiB)" | tee -a "$SWEEP_LOG"
         sleep 15
     done
