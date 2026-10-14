@@ -108,7 +108,7 @@ RULES = [
     # must not be caught here, hence the explicit list rather than /reduce/.
     ("all-reduce/comm", [], [
         r"all_?reduce", r"reduce_scatter", r"all_?gather", r"nccl", r"rccl",
-        r"cross_device_reduce", r"quick.*reduce", r"custom_all",
+        r"cross_device_reduce", r"quick.*reduce", r"custom_all", r"\bar_ll_",
     ], None),
 
     # mHC: the 4-stream residual plumbing, 4 kernels per layer on every layer.
@@ -122,14 +122,14 @@ RULES = [
     # transform that expands 512 pools into 2051 tokens, and the k-cache writes.
     ("DSA indexer+kpool", [r"IndexerKPool"], [
         r"mqa_logits", r"kpool", r"topk_transform", r"transform_index",
-        r"index_k", r"indexer", r"fused_store_index",
+        r"index_k", r"indexer", r"fused_store_index", r"hadamard",
     ], None),
 
     # Sparse MLA attention core. RadixAttention is the owning module on both
     # sides; the word boundary keeps RadixLinearAttention (KDA) out.
     ("sparse-MLA attn", [r"(?<!Linear)RadixAttention"], [
         r"sparse_mla", r"\bfmha", r"flash.*mla", r"aiter\d*::mla",
-        r"set_mla_kv_buffer",
+        r"set_mla_kv_buffer", r"prepare_trtllm_.*sparse",
     ], None),
 
     # KDA recurrence core: short conv, chunked gated-delta-rule scan, the gated
@@ -150,19 +150,22 @@ RULES = [
     #   3. B200 carries only the leaf, so fall back to an unambiguous LayerType.
     ("KDA projections", [r"Glm5NextLinearAttention.*Linear"], [], None),
     ("MLA projections", [r"AttentionMLA.*Linear"], [], None),
+    # B200's fused q_a/kv_a projection is a custom op, not a *Linear module.
+    ("MLA projections", [], [r"fused_a_gemm"], None),
     ("shared-expert/dense MLP", [r"DeepseekV2MLP"], [], None),
     ("KDA projections", [r"Linear"], [], KDA_LAYER),
     ("MLA projections", [r"Linear"], [], DSA_LAYER),
 
     # MoE expert GEMMs, split by stage. mfma_moe1/moe2 is MI355X's aiter path,
-    # bmm_E2m1_E2m1/bmm_Bfloat16_E2m1 is B200's trtllm NVFP4 path.
+    # smallm_p1/p2 its small-M (decode) variant, bmm_E2m1_E2m1/bmm_Bfloat16_E2m1
+    # B200's trtllm NVFP4 path.
     ("MoE up/gate GEMM (moe1)", [], [
         r"moe1", r"moe_?stage1", r"silu_mul", r"silu_and_mul", r"gate_?up",
-        r"gemm1_a4w4", r"mxmoe_g1", r"bmm_e2m1_e2m1",
+        r"gemm1_a4w4", r"mxmoe_g1", r"bmm_e2m1_e2m1", r"\bsmallm_p1_",
     ], None),
     ("MoE down GEMM (moe2)", [], [
         r"moe2", r"moe_?stage2", r"down_proj_moe", r"gemm2_a4w4", r"mxmoe_g2",
-        r"bmm_bfloat16_e2m1",
+        r"bmm_bfloat16_e2m1", r"\bsmallm_p2_",
     ], None),
 
     # Routing: 288-expert top-8 gate, the sort/align that builds the expert
@@ -170,11 +173,19 @@ RULES = [
     ("MoE routing/sort", [r"FusedMoE", r"TopK", r"MoEGate"], [
         r"moe_sort", r"moe_align", r"moe_sorting", r"grouped_topk", r"fused_moe",
         r"moefinalize", r"moe_reduction", r"fused_mx_quant_moe", r"topk_softmax",
+        r"append_shared_experts", r"routingindices",
     ], None),
 
     ("embedding/lm_head/sampling", [r"VocabParallel", r"LogitsProcessor", r"Sampler"], [
         r"embedding", r"lm_head", r"argmax", r"sampling", r"top_k_top_p",
     ], None),
+
+    # GEMMs whose names the patterns below would otherwise claim. aiter's Triton
+    # GEMMs bake their constexprs into the name ("_gemm_a16_w16_kernel_...
+    # _activation_NONE_use_activation_0_..."): on MI355X decode that is the MoE
+    # router, the KDA o_proj and the indexer projection, 87 per step. ck_tile's
+    # FP8 blockscale GEMM is a "QuantGemmMultiDKernel", which "quant" would take.
+    ("dense/linear GEMM", [], [r"^_?gemm_a\d+_?w\d+", r"quantgemm"], None),
 
     ("rmsnorm/quant/act", [], [
         r"rms_?norm", r"layernorm", r"layer_norm", r"quant", r"silu", r"gelu",
@@ -183,12 +194,12 @@ RULES = [
 
     ("dense/linear GEMM", [r"Linear"], [
         r"\bgemm", r"cijk_", r"hgemm", r"nvjet", r"cublas", r"cutlass",
-        r"\bbmm", r"ck::kernel_gemm",
+        r"\bbmm", r"ck::kernel_gemm", r"wv_splitk",
     ], None),
 
     ("elementwise/other", [], [
         r"elementwise", r"vectorized", r"copy", r"cat_", r"\bfill", r"index_",
-        r"reduce_kernel", r"splitkreduce", r"memset",
+        r"reduce_kernel", r"splitkreduce", r"memset", r"triton_poi_",
     ], None),
 ]
 
