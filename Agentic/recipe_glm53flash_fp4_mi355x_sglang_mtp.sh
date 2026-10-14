@@ -181,8 +181,10 @@ SGLANG_CMD=(
     # No --quantization: Quark MXFP4 (with its block-FP8 attention and MTP
     # exceptions) is resolved from the checkpoint's quantization_config.
     --kv-cache-dtype bfloat16
-    --dsa-prefill-backend tilelang
-    --dsa-decode-backend tilelang
+    # The driver's --dsa-backend; see its MI355X block for why TileLang is the
+    # default and what triton / aiter_sparse_mla need.
+    --dsa-prefill-backend "${DSA_BACKEND:-tilelang}"
+    --dsa-decode-backend "${DSA_BACKEND:-tilelang}"
     --moe-runner-backend aiter
     # Prefix caching across turns is the whole point of the agentic scenario, so
     # unlike the fixed-length sweeps radix cache stays on, and the KDA half of

@@ -21,10 +21,11 @@
 #   ./ix_agentx_glm53flash.sh --mtp-steps 3 --conc 16    # MTP depth A/B
 #   ./ix_agentx_glm53flash.sh --hicache-size 200         # add a host tier
 #   ./ix_agentx_glm53flash.sh --platform b200 --mem-fraction 0.75 --chunked-prefill 8192
+#   ./ix_agentx_glm53flash.sh --dsa-backend triton # MI355X sparse attention A/B
 #   ./ix_agentx_glm53flash.sh --dry-run            # print the env and exit
 set -uo pipefail
 
-usage() { sed -n '2,24p' "$0"; exit 1; }
+usage() { sed -n '2,25p' "$0"; exit 1; }
 
 # Tear down only the server this sweep started. A bare
 # `pkill -f sglang.launch_server` also kills a second sweep running on the
@@ -97,6 +98,7 @@ CONTEXT_LENGTH=""
 MAMBA_FULL_MEMORY_RATIO=""
 MAX_MAMBA_CACHE_SIZE=""
 CUDA_GRAPH_MAX_BS_CAP=""
+DSA_BACKEND=""
 EXTRA_SERVER_ARGS=""
 ENABLE_POWER=0
 QUICK=0
@@ -128,6 +130,7 @@ while [[ $# -gt 0 ]]; do
         --mamba-ratio)       MAMBA_FULL_MEMORY_RATIO="$2"; shift 2 ;;
         --max-mamba-cache-size) MAX_MAMBA_CACHE_SIZE="$2"; shift 2 ;;
         --cuda-graph-max-bs)    CUDA_GRAPH_MAX_BS_CAP="$2"; shift 2 ;;
+        --dsa-backend)          DSA_BACKEND="$2"; shift 2 ;;
         --server-arg)           EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS} $2"; shift 2 ;;
         --power)      ENABLE_POWER=1; shift ;;
         --quick)      QUICK=1; shift ;;
@@ -171,6 +174,10 @@ case "$PLATFORM" in
             : "${DOCKER:=${SGLANG_IMAGE_TAG}-cu130}"
         fi
         : "${DOCKER:=lmsysorg/sglang:v0.5.21-cu130}"
+        if [ -n "$DSA_BACKEND" ]; then
+            echo "ERROR: --dsa-backend is MI355X-only; the B200 recipe pins trtllm" >&2
+            exit 1
+        fi
         MODEL_ID="nvidia/GLM-5.3-Flash-NVFP4"
         : "${CKPT:=/data/huggingface/hub/nvidia/GLM-5.3-Flash-NVFP4}"
         # Measured defaults, not guesses. Each was A/B'd at conc 32 against the
@@ -219,6 +226,15 @@ case "$PLATFORM" in
         DRAM_RUNNER=cluster:mi355x-amds
         PORT_TOOL=fuser
         : "${DOCKER:=rocm/sgl-dev:v0.5.20-rocm10-mi35x-20260928}"
+        # TileLang is the only DSA backend a stock image's K-pool accepts for
+        # GLM-5.3-Flash. triton and aiter_sparse_mla need sgl-project/sglang
+        # #41615, and that PR keeps an explicit tilelang on TileLang, so a PR
+        # stack run measures #41615 only when it passes one of them here.
+        : "${DSA_BACKEND:=tilelang}"
+        case "$DSA_BACKEND" in
+            tilelang|triton|aiter_sparse_mla) ;;
+            *) echo "ERROR: --dsa-backend must be tilelang, triton or aiter_sparse_mla, got '$DSA_BACKEND'" >&2; exit 1 ;;
+        esac
         MODEL_ID="amd/GLM-5.3-Flash-Quark-MXFP4"
         : "${CKPT:=/data/huggingface/hub/amd/GLM-5.3-Flash-Quark-MXFP4}"
         # rocm-smi, like nvidia-smi, lists every device on the node regardless
@@ -365,6 +381,7 @@ export ACC_MODE
 [ -n "$MAMBA_FULL_MEMORY_RATIO" ] && export MAMBA_FULL_MEMORY_RATIO
 [ -n "$MAX_MAMBA_CACHE_SIZE" ] && export MAX_MAMBA_CACHE_SIZE
 [ -n "$CUDA_GRAPH_MAX_BS_CAP" ] && export CUDA_GRAPH_MAX_BS_CAP
+[ -n "$DSA_BACKEND" ] && export DSA_BACKEND
 [ -n "$EXTRA_SERVER_ARGS" ] && export EXTRA_SERVER_ARGS
 
 # The client replays the corpus unfiltered when MAX_MODEL_LEN=0. Capping the
@@ -438,6 +455,11 @@ for kv in "${EXTRA_ENV[@]:-}"; do [ -n "$kv" ] && export "${kv?}"; done
 # ---- run-length modes ----------------------------------------------------
 [ -n "$TAG" ] || TAG="TP${TP}_EP${EP}-mtp${MTP_STEPS}"
 [ "$SPEC_DECODING" = "none" ] && TAG="TP${TP}_EP${EP}-nospec"
+# A point that already has a result is skipped, so a backend A/B under the
+# default tag would silently reuse the TileLang numbers.
+if [ -n "$DSA_BACKEND" ] && [ "$DSA_BACKEND" != "tilelang" ]; then
+    TAG="${TAG}-dsa-${DSA_BACKEND}"
+fi
 if [ "$FAST" = "1" ]; then
     # 1 warmup request per lane leaves the prefix caches nearly empty, which is
     # exactly what an agentic run is supposed to exercise. Useful only to prove
@@ -471,7 +493,7 @@ SWEEP_LOG="$ROOT/sweep.log"
 
 {
     echo "=== $(date -Is) GLM-5.3-Flash AgentX platform=$PLATFORM model=$MODEL_ID ==="
-    echo "tag=$TAG tp=$TP ep=$EP spec=$SPEC_DECODING steps=$MTP_STEPS acc=$ACC_MODE${GOLDEN_AL:+($GOLDEN_AL)}"
+    echo "tag=$TAG tp=$TP ep=$EP spec=$SPEC_DECODING steps=$MTP_STEPS acc=$ACC_MODE${GOLDEN_AL:+($GOLDEN_AL)} dsa=${DSA_BACKEND:-recipe}"
     echo "mem_fraction=${USER_MEM_FRACTION:-per-conc} chunked_prefill=${USER_CHUNK:-per-conc} context=${CONTEXT_LENGTH:-native-1M}"
     echo "hicache_size=${USER_HICACHE:-per-conc} mamba_ratio=${USER_MAMBA_RATIO:-per-conc}"
     echo "duration=$DURATION conc=($CONC_LIST) gpus=${!VISIBLE_VAR:-all}"
@@ -495,7 +517,7 @@ if [ "$DRY_RUN" = "1" ]; then
     done
     echo
     echo "--- recipe env (dry run, last concurrency) ---"
-    env | grep -E '^(MODEL|TP|EP_SIZE|PP_SIZE|DCP_SIZE|PCP_SIZE|DP_ATTENTION|SPEC_|ACC_MODE|GOLDEN_AL|KV_|HICACHE|TOTAL_CPU_DRAM_GB|MAX_MODEL_LEN|CONTEXT_LENGTH|MAMBA_|MAX_MAMBA|CUDA_GRAPH|MEM_FRACTION|CHUNKED_|AIPERF_|AGENTIC_|INFMAX_|RUNNER_TYPE|PRECISION|FRAMEWORK|SCENARIO_|DURATION|ENABLE_AGENTX_POWER|REQUIRE_POWER|IS_MULTINODE|DISAGG|EVAL_ONLY|IMAGE|HF_HUB_CACHE)' | sort
+    env | grep -E '^(MODEL|TP|EP_SIZE|PP_SIZE|DCP_SIZE|PCP_SIZE|DP_ATTENTION|SPEC_|ACC_MODE|GOLDEN_AL|KV_|HICACHE|TOTAL_CPU_DRAM_GB|MAX_MODEL_LEN|CONTEXT_LENGTH|MAMBA_|MAX_MAMBA|CUDA_GRAPH|DSA_BACKEND|MEM_FRACTION|CHUNKED_|AIPERF_|AGENTIC_|INFMAX_|RUNNER_TYPE|PRECISION|FRAMEWORK|SCENARIO_|DURATION|ENABLE_AGENTX_POWER|REQUIRE_POWER|IS_MULTINODE|DISAGG|EVAL_ONLY|IMAGE|HF_HUB_CACHE)' | sort
     exit 0
 fi
 
@@ -541,8 +563,9 @@ for CONC in $CONC_LIST; do
 
     # The two numbers that decide whether the hybrid memory split is sane: the
     # full-attention token pool and the KDA state slot count. Both move with
-    # --mamba-ratio, and neither appears in the result JSON.
-    grep -hoE 'KV Cache is allocated.*|max_mamba_cache_size=[0-9]+|Memory pool end.*' \
+    # --mamba-ratio, and neither appears in the result JSON. The DSA line is the
+    # backend the server actually resolved, which the flag alone does not prove.
+    grep -hoE 'KV Cache is allocated.*|max_mamba_cache_size=[0-9]+|Memory pool end.*|Set DSA backends.*' \
         "$RESULT_DIR/server.log" 2>/dev/null | sort -u | sed 's/^/    /' | tee -a "$SWEEP_LOG"
 
     # The recipe leaves the server up when it exits non-zero mid-flight.
