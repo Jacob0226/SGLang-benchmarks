@@ -32,13 +32,14 @@ from collections import Counter
 # aiter::cross_device_reduce_2stage on ROCm and sglang::all_reduce_1shot_push
 # on B200, while prefill uses quickreduce/allreduce_prototype and the MNNVL
 # path. `cross_device_reduce` is spelled out rather than reusing the
-# reduce_scatter_cross_device pattern, which does not match it.
+# reduce_scatter_cross_device pattern, which does not match it. Newer aiter
+# images decode through the low-latency aiter::ar_ll_gfx9 instead.
 # Deliberately NOT a bare /reduce/: splitKreduce is a GEMM epilogue and
 # moeFinalize is a MoE scatter, neither of them collectives.
 COMM_RE = re.compile(
     r"allreduce_prototype|quickreduce|reduce_scatter_cross_device"
     r"|cross_device_reduce|all_reduce_\d*shot|all_reduce_1shot_push"
-    r"|nccldevkernel|mnnvl_allreduce|shotallreduce|rmsnormlamport",
+    r"|nccldevkernel|mnnvl_allreduce|shotallreduce|rmsnormlamport|\bar_ll_gfx",
     re.I,
 )
 

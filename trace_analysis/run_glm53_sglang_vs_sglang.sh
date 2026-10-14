@@ -65,6 +65,18 @@ NV=${NV:-$RES/nvidia_GLM-5.3-Flash-NVFP4/lmsysorg_sglang-v0.5.20-cu130/prof-Fixe
 MTP_B200=$RES/nvidia_GLM-5.3-Flash-NVFP4/lmsysorg_sglang-v0.5.20-cu130/prof-Fixed-MTP-NVFP4-TP4
 OUT_TAG=${OUT_TAG:-Docker0914_10PR_steps5}
 
+# Shape knobs, so another capture can reuse the pipeline, e.g. the i70k conc1 run:
+#   CONCS=1 IN_LEN=70000 AMD_OUT_LEN=64 SHAPE_TAG=i70k \
+#   PREFILL_MATCH="EXTEND bs=1 toks=16384" AMD=... NV=... ./run_glm53_sglang_vs_sglang.sh
+# The graph-on capture holds 2*conc prompts and the graph-off one conc prompts.
+CONCS=${CONCS:-4 64}
+IN_LEN=${IN_LEN:-8192}
+AMD_OUT_LEN=${AMD_OUT_LEN:-16}
+NV_OUT_LEN=${NV_OUT_LEN:-16}
+SHAPE_TAG=${SHAPE_TAG:-i8k}
+PREFILL_MATCH=${PREFILL_MATCH:-EXTEND bs=3}
+TITLE_TAIL=${TITLE_TAIL:-"MI355X (amd/GLM-5.3-Flash-Quark-MXFP4, AITER MoE + TileLang DSA, bf16 KV, main@242d8a70c0 + 10 Day-0 PRs) vs B200 (RadixArk/GLM-5.3-Flash-NVFP4 modelopt_fp4, trtllm DSA + flashinfer_trtllm MoE, fp8_e4m3 KV, stock v0.5.20). Both TP=4. Two checkpoints, not one model on two GPUs. MI355X prefill fills 16384 tokens, B200 16317."}
+
 cd "$BENCH"
 
 # analyze <label> <graph-on> <graph-off> <forward-match> <outdir> <tag>
@@ -76,26 +88,25 @@ analyze() {
         --out "$5" --tag "$6" 2>&1 | grep -E "restricted|coverage|ERROR|Error" || true
 }
 
-for CONC in 4 64; do
-    case $CONC in
-    4) ON_P=8; OFF_P=4 ;;
-    64) ON_P=128; OFF_P=64 ;;
-    esac
+for CONC in $CONCS; do
+    ON_P=$((CONC * 2)); OFF_P=$CONC
 
-    OUT=$ANA/${OUT_TAG}_SGLang_i8k_conc${CONC}
+    OUT=$ANA/${OUT_TAG}_SGLang_${SHAPE_TAG}_conc${CONC}
     SBS=$OUT/sidebyside
     mkdir -p "$SBS"
 
-    AMD_ON=$AMD/prof_in8192_out16_conc${CONC}_p${ON_P}/in8192_out16_conc${CONC}_p${ON_P}-AMD-TP-0
-    AMD_OFF=$AMD/no-cuda-graph/prof_in8192_out16_conc${CONC}_p${OFF_P}/in8192_out16_conc${CONC}_p${OFF_P}-AMD-TP-0
-    NV_ON=$NV/prof_in8192_out16_conc${CONC}_p${ON_P}/in8192_out16_conc${CONC}_p${ON_P}-NV-TP-0
-    NV_OFF=$NV/no-cuda-graph/prof_in8192_out16_conc${CONC}_p${OFF_P}/in8192_out16_conc${CONC}_p${OFF_P}-NV-TP-0
+    A_SHAPE=in${IN_LEN}_out${AMD_OUT_LEN}_conc${CONC}
+    N_SHAPE=in${IN_LEN}_out${NV_OUT_LEN}_conc${CONC}
+    AMD_ON=$AMD/prof_${A_SHAPE}_p${ON_P}/${A_SHAPE}_p${ON_P}-AMD-TP-0
+    AMD_OFF=$AMD/no-cuda-graph/prof_${A_SHAPE}_p${OFF_P}/${A_SHAPE}_p${OFF_P}-AMD-TP-0
+    NV_ON=$NV/prof_${N_SHAPE}_p${ON_P}/${N_SHAPE}_p${ON_P}-NV-TP-0
+    NV_OFF=$NV/no-cuda-graph/prof_${N_SHAPE}_p${OFF_P}/${N_SHAPE}_p${OFF_P}-NV-TP-0
 
     echo "======== conc${CONC} PREFILL ========"
     analyze "MI355X prefill" "${AMD_ON}-EXTEND.trace.json.gz" "${AMD_OFF}-EXTEND-NoGraph.trace.json.gz" \
-        "EXTEND bs=3" "$SBS" "_MI355X_prefill"
+        "$PREFILL_MATCH" "$SBS" "_MI355X_prefill"
     analyze "B200 prefill" "${NV_ON}-EXTEND.trace.json.gz" "${NV_OFF}-EXTEND-NoGraph.trace.json.gz" \
-        "EXTEND bs=3" "$SBS" "_B200_prefill"
+        "$PREFILL_MATCH" "$SBS" "_B200_prefill"
 
     # "DECODE bs=" rather than "DECODE bs=$CONC": the same match is applied to
     # the graph-OFF trace too, and each trace holds exactly one decode batch
@@ -106,8 +117,6 @@ for CONC in 4 64; do
         "DECODE bs=" "$SBS" "_MI355X_decode"
     analyze "B200 decode" "${NV_ON}-DECODE.trace.json.gz" "${NV_OFF}-DECODE-NoGraph.trace.json.gz" \
         "DECODE bs=" "$SBS" "_B200_decode"
-
-    TITLE_TAIL="MI355X (amd/GLM-5.3-Flash-Quark-MXFP4, AITER MoE + TileLang DSA, bf16 KV, main@242d8a70c0 + 10 Day-0 PRs) vs B200 (RadixArk/GLM-5.3-Flash-NVFP4 modelopt_fp4, trtllm DSA + flashinfer_trtllm MoE, fp8_e4m3 KV, stock v0.5.20). Both TP=4. Two checkpoints, not one model on two GPUs. MI355X prefill fills 16384 tokens, B200 16317."
 
     for PHASE in prefill decode; do
         echo "---- conc${CONC} $PHASE buckets (step3: decoder layers) ----"
@@ -132,20 +141,20 @@ for CONC in 4 64; do
         # layers are two different kinds.
         echo "---- conc${CONC} $PHASE call-order workbook ----"
         python3 trace_analysis/compare/side_by_side.py --align none \
-            --out "$OUT/callorder_i8k_conc${CONC}_MI355X_vs_B200_${PHASE}.xlsx" \
+            --out "$OUT/callorder_${SHAPE_TAG}_conc${CONC}_MI355X_vs_B200_${PHASE}.xlsx" \
             --src MI355X "$SBS/step3_layer_breakdown_MI355X_${PHASE}.xlsx" \
             --src B200 "$SBS/step3_layer_breakdown_B200_${PHASE}.xlsx" \
             --summary-csv "$OUT/cmp_glm53_${PHASE}_MI355XvsB200.csv" \
-            --title "GLM-5.3-Flash ${PHASE} i8k conc${CONC} — ${TITLE_TAIL} ONE forward per side, call order, NOT aligned."
+            --title "GLM-5.3-Flash ${PHASE} ${SHAPE_TAG} conc${CONC} — ${TITLE_TAIL} ONE forward per side, call order, NOT aligned."
 
         echo "---- conc${CONC} $PHASE lcs workbook ----"
         python3 trace_analysis/compare/side_by_side.py --align lcs \
-            --out "$OUT/compare_i8k_conc${CONC}_MI355X_vs_B200_${PHASE}.xlsx" \
+            --out "$OUT/compare_${SHAPE_TAG}_conc${CONC}_MI355X_vs_B200_${PHASE}.xlsx" \
             --src MI355X "$SBS/step3_layer_breakdown_MI355X_${PHASE}.xlsx" \
             --src B200 "$SBS/step3_layer_breakdown_B200_${PHASE}.xlsx" \
             --trace MI355X "${AMD_ON}-$([ "$PHASE" = prefill ] && echo EXTEND || echo DECODE).trace.json.gz" \
             --trace B200 "${NV_ON}-$([ "$PHASE" = prefill ] && echo EXTEND || echo DECODE).trace.json.gz" \
-            --title "GLM-5.3-Flash ${PHASE} i8k conc${CONC} — ${TITLE_TAIL} ONE forward per side, the median of that side's captured forwards."
+            --title "GLM-5.3-Flash ${PHASE} ${SHAPE_TAG} conc${CONC} — ${TITLE_TAIL} ONE forward per side, the median of that side's captured forwards."
     done
 
     # Bucket tables compare Σ_kernel, which cannot say whether a forward is slow
@@ -154,9 +163,9 @@ for CONC in 4 64; do
     {
         for SIDE in MI355X B200; do
             [ "$SIDE" = MI355X ] && BASE=$AMD_ON || BASE=$NV_ON
-            echo "######## conc${CONC} PREFILL bs=3 -- $SIDE ########"
+            echo "######## conc${CONC} PREFILL $PREFILL_MATCH -- $SIDE ########"
             python3 trace_analysis/diagnostics/forward_overlap.py \
-                "${BASE}-EXTEND.trace.json.gz" --match "EXTEND bs=3"
+                "${BASE}-EXTEND.trace.json.gz" --match "$PREFILL_MATCH"
             echo "######## conc${CONC} DECODE -- $SIDE ########"
             python3 trace_analysis/diagnostics/forward_overlap.py \
                 "${BASE}-DECODE.trace.json.gz" --match "DECODE bs="
@@ -173,13 +182,13 @@ for CONC in 4 64; do
     # launch per forward showed up on B200, and the split says it is skew.
     {
         for SIDE in MI355X B200; do
-            if [ "$SIDE" = MI355X ]; then DIR=$AMD; TAG=AMD; else DIR=$NV; TAG=NV; fi
-            d=$DIR/prof_in8192_out16_conc${CONC}_p${ON_P}
-            echo "######## conc${CONC} PREFILL bs=3 -- $SIDE ########"
+            if [ "$SIDE" = MI355X ]; then d=$AMD/prof_${A_SHAPE}_p${ON_P}; TAG=AMD
+            else d=$NV/prof_${N_SHAPE}_p${ON_P}; TAG=NV; fi
+            echo "######## conc${CONC} PREFILL $PREFILL_MATCH -- $SIDE ########"
             # shellcheck disable=SC2086
             python3 trace_analysis/diagnostics/comm_skew_split.py \
                 --traces $d/*-${TAG}-TP-*-EXTEND.trace.json.gz \
-                --stack sglang --phase prefill --match "EXTEND bs=3"
+                --stack sglang --phase prefill --match "$PREFILL_MATCH"
             echo
             echo "######## conc${CONC} DECODE bs=${CONC} -- $SIDE ########"
             # shellcheck disable=SC2086
