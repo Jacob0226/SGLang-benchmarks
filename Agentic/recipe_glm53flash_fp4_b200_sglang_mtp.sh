@@ -153,14 +153,16 @@ esac
 # scales by --speculative-num-draft-tokens itself. Prefill graphs stay off:
 # SGLang disables them for KDA hybrid linear attention regardless.
 #
-# The cap matters from conc 32 up: max_running_requests is 2*CONC, so a cap of
-# 64 leaves every decode batch above 64 requests on the eager path. Raising it
-# costs capture time and HBM (each captured bs holds buffers for
-# bs * speculative_num_draft_tokens tokens), which is why it is a knob and not
-# just set to MAX_RUNNING_REQUESTS.
+# The decode graphs must cover max_running_requests: a decode batch wider than
+# the largest captured bs runs eager, which is slower and, on MI355X, exhausts
+# HBM. CUDA_GRAPH_MAX_BS_CAP may only raise the captured size.
 CUDA_GRAPH_MAX_BS=$MAX_RUNNING_REQUESTS
-if [ "$CUDA_GRAPH_MAX_BS" -gt "${CUDA_GRAPH_MAX_BS_CAP:-64}" ]; then
-    CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS_CAP:-64}"
+if [ -n "${CUDA_GRAPH_MAX_BS_CAP:-}" ]; then
+    if [ "$CUDA_GRAPH_MAX_BS_CAP" -lt "$MAX_RUNNING_REQUESTS" ]; then
+        echo "Error: --cuda-graph-max-bs $CUDA_GRAPH_MAX_BS_CAP is below max_running_requests $MAX_RUNNING_REQUESTS; wider decode batches would run eager." >&2
+        exit 1
+    fi
+    CUDA_GRAPH_MAX_BS=$CUDA_GRAPH_MAX_BS_CAP
 fi
 
 CONTEXT_ARGS=()

@@ -132,12 +132,19 @@ esac
 
 # --cuda-graph-max-bs-decode counts requests; the spec-decode graph runner
 # scales by --speculative-num-draft-tokens itself. Prefill graphs stay off:
-# SGLang disables them for KDA hybrid linear attention regardless. The cap is a
-# knob (CUDA_GRAPH_MAX_BS_CAP) for the same reason as on B200: above conc 32 a
-# cap of 64 leaves larger decode batches eager.
+# SGLang disables them for KDA hybrid linear attention regardless.
+#
+# The decode graphs must cover max_running_requests. A decode batch wider than
+# the largest captured bs runs eager, and on MI355X the eager draft/verify path
+# grows the torch cache by ~20 GB until RCCL cannot get kernel scratch (HSA
+# OUT_OF_RESOURCES). CUDA_GRAPH_MAX_BS_CAP may only raise the captured size.
 CUDA_GRAPH_MAX_BS=$MAX_RUNNING_REQUESTS
-if [ "$CUDA_GRAPH_MAX_BS" -gt "${CUDA_GRAPH_MAX_BS_CAP:-64}" ]; then
-    CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS_CAP:-64}"
+if [ -n "${CUDA_GRAPH_MAX_BS_CAP:-}" ]; then
+    if [ "$CUDA_GRAPH_MAX_BS_CAP" -lt "$MAX_RUNNING_REQUESTS" ]; then
+        echo "Error: --cuda-graph-max-bs $CUDA_GRAPH_MAX_BS_CAP is below max_running_requests $MAX_RUNNING_REQUESTS; wider decode batches would run eager." >&2
+        exit 1
+    fi
+    CUDA_GRAPH_MAX_BS=$CUDA_GRAPH_MAX_BS_CAP
 fi
 
 CONTEXT_ARGS=()
