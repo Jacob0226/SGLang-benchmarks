@@ -118,13 +118,15 @@ fi
 # holds ~3.7x the tokens. It needs the DSA DCP branch
 # (Jacob0226/sglang jacob/glm53-1012-prstack-dcp42618, via --env PYTHONPATH);
 # a stock image rejects --dcp-size for the k-pool indexer.
-# The headroom keeps 4 GiB outside the torch cache once serving starts: the
+# The headroom keeps HBM outside the torch cache once serving starts: the
 # cache otherwise grows into all free HBM and the first Triton load or HIP
 # scratch allocation mid-run dies with HSA_STATUS_ERROR_OUT_OF_RESOURCES.
-# Without it DCP4 conc128 crashed 12-25 min in; with it, 3600 s clean.
+# Non-torch use grows ~5.7 GiB during a DCP4 conc128 run (new prefill GEMM
+# shapes and kernels load lazily), so 4 GiB still crashed in warmup; 8 GiB
+# ran 3600 s clean with >= 2.3 GiB free.
 if [ "${DCP_SIZE:-1}" -gt 1 ]; then
     PARALLEL_ARGS+=(--dcp-size "$DCP_SIZE")
-    export SGLANG_SERVING_DEVICE_MEM_HEADROOM_GB="${SGLANG_SERVING_DEVICE_MEM_HEADROOM_GB:-4}"
+    export SGLANG_SERVING_DEVICE_MEM_HEADROOM_GB="${SGLANG_SERVING_DEVICE_MEM_HEADROOM_GB:-8}"
 fi
 
 # AgentX concurrency counts live session trees, not requests: a trajectory can
