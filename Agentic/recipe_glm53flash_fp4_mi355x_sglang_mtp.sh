@@ -113,6 +113,19 @@ if [ "$DP_ATTENTION" = "true" ]; then
     echo "Error: DP attention is not wired for this recipe; GLM-5.3-Flash at TP4 is the low-latency arm." >&2
     exit 1
 fi
+# DCP shards the 11 MLA layers' latent KV by token across the TP group (the
+# KDA state is already head-sharded by TP and stays as is), so the same HBM
+# holds ~3.7x the tokens. It needs the DSA DCP branch
+# (Jacob0226/sglang jacob/glm53-1012-prstack-dcp42618, via --env PYTHONPATH);
+# a stock image rejects --dcp-size for the k-pool indexer.
+# The headroom keeps 4 GiB outside the torch cache once serving starts: the
+# cache otherwise grows into all free HBM and the first Triton load or HIP
+# scratch allocation mid-run dies with HSA_STATUS_ERROR_OUT_OF_RESOURCES.
+# Without it DCP4 conc128 crashed 12-25 min in; with it, 3600 s clean.
+if [ "${DCP_SIZE:-1}" -gt 1 ]; then
+    PARALLEL_ARGS+=(--dcp-size "$DCP_SIZE")
+    export SGLANG_SERVING_DEVICE_MEM_HEADROOM_GB="${SGLANG_SERVING_DEVICE_MEM_HEADROOM_GB:-4}"
+fi
 
 # AgentX concurrency counts live session trees, not requests: a trajectory can
 # fan out to subagents, so the engine must accept more than CONC in flight or
@@ -123,9 +136,13 @@ fi
 # together with HiCache 169 and mamba-ratio 0.5, is the measured winner:
 # interactivity 2.7 -> 20.6 and 12,349 -> 55,272 tok/s/GPU on a 1200s window.
 # Conc 32 peaks at 49% of the pool with 2x and no HiCache, so it stays at 2x.
+# At conc 128 running requests peak at ~122, and every slot costs ~207 MB of
+# MTP intermediate KDA state per GPU (6 draft positions x 34 layers), so 192
+# (39.6 GB) rather than 2x (256, 53 GB).
 MAX_RUNNING_REQUESTS=$((2 * CONC))
 case "$CONC" in
     64) MAX_RUNNING_REQUESTS=80 ;;
+    128) MAX_RUNNING_REQUESTS=192 ;;
 esac
 [ -n "${MAX_RUNNING_REQUESTS_OVERRIDE:-}" ] && MAX_RUNNING_REQUESTS="$MAX_RUNNING_REQUESTS_OVERRIDE"
 [ "$MAX_RUNNING_REQUESTS" -lt 8 ] && MAX_RUNNING_REQUESTS=8

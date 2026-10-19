@@ -22,10 +22,12 @@
 #   ./ix_agentx_glm53flash.sh --hicache-size 200         # add a host tier
 #   ./ix_agentx_glm53flash.sh --platform b200 --mem-fraction 0.75 --chunked-prefill 8192
 #   ./ix_agentx_glm53flash.sh --dsa-backend triton # MI355X sparse attention A/B
+#   ./ix_agentx_glm53flash.sh --dsa-backend triton --conc 128 --dcp 4 \
+#       --env PYTHONPATH=<dcp branch>/python      # MI355X conc 128 (DCP4)
 #   ./ix_agentx_glm53flash.sh --dry-run            # print the env and exit
 set -uo pipefail
 
-usage() { sed -n '2,25p' "$0"; exit 1; }
+usage() { sed -n '2,27p' "$0"; exit 1; }
 
 # Tear down only the server this sweep started. A bare
 # `pkill -f sglang.launch_server` also kills a second sweep running on the
@@ -79,6 +81,7 @@ CKPT="${CKPT:-}"
 TAG=""
 TP=4
 EP=1
+DCP=1
 CONC_LIST="1 4 8 16 32 64"
 DURATION="${DURATION:-3600}"
 GPUS=""
@@ -115,6 +118,7 @@ while [[ $# -gt 0 ]]; do
         --ckpt)       CKPT="$2"; shift 2 ;;
         --tp)         TP="$2"; shift 2 ;;
         --ep)         EP="$2"; shift 2 ;;
+        --dcp)        DCP="$2"; shift 2 ;;
         --conc)       CONC_LIST="$2"; shift 2 ;;
         --duration)   DURATION="$2"; shift 2 ;;
         --gpus)       GPUS="$2"; shift 2 ;;
@@ -176,6 +180,10 @@ case "$PLATFORM" in
         : "${DOCKER:=lmsysorg/sglang:v0.5.21-cu130}"
         if [ -n "$DSA_BACKEND" ]; then
             echo "ERROR: --dsa-backend is MI355X-only; the B200 recipe pins trtllm" >&2
+            exit 1
+        fi
+        if [ "$DCP" -gt 1 ]; then
+            echo "ERROR: --dcp is MI355X-only; the B200 recipe has no DCP lane" >&2
             exit 1
         fi
         MODEL_ID="nvidia/GLM-5.3-Flash-NVFP4"
@@ -247,6 +255,16 @@ case "$PLATFORM" in
         # 0.5 recovered 20.6 and 55,272. max-running 80 at conc 64 lives in
         # the recipe. An explicit --hicache-size / --mamba-ratio still wins
         # at every point.
+        #
+        # Conc 128 is past TP4's KV capacity (working set >= 15.6M tokens vs
+        # 12.3M device + host), so it is a DCP point. 3600 s, HiCache 169,
+        # max-running 192, triton DSA:
+        #   TP4  mf 0.85 mamba 0.5   P90 intvty  5.7    770 out tok/s  hit 65%
+        #   DCP4 mf 0.80 mamba 1.0   P90 intvty 12.0  2,434 out tok/s  hit 94%
+        # DCP cuts the per-token KV to ~1/3.7, so the split moves toward the
+        # KDA state pool (mamba 1.0 from conc 64), and mf 0.80 keeps ~24 GB
+        # free after graph capture for the 192-wide MTP buffers. At conc 64
+        # DCP4 only ties TP4 (+1.7% tok/s/GPU): the cache is not the wall yet.
         conc_defaults() {
             local c="$1"
             MEM_FRACTION_STATIC="${USER_MEM_FRACTION:-0.85}"
@@ -258,6 +276,11 @@ case "$PLATFORM" in
                 MAMBA_FULL_MEMORY_RATIO="${USER_MAMBA_RATIO:-0.9}"
                 HICACHE_SIZE="${USER_HICACHE:-0}"
             fi
+            if [ "$DCP" -gt 1 ] && [ "$c" -ge 64 ]; then
+                MAMBA_FULL_MEMORY_RATIO="${USER_MAMBA_RATIO:-1.0}"
+                [ "$c" -ge 128 ] && MEM_FRACTION_STATIC="${USER_MEM_FRACTION:-0.80}"
+            fi
+            return 0
         }
         gpu_count() { rocm-smi --showid --csv 2>/dev/null | grep -c '^card'; }
         gpu_mem_used_max_mib() {
@@ -366,7 +389,7 @@ export SPEC_DECODING
 export DISAGG=false
 export IS_MULTINODE=false
 export EVAL_ONLY=false
-export TP EP_SIZE="$EP" PP_SIZE=1 DCP_SIZE=1 PCP_SIZE=1
+export TP EP_SIZE="$EP" PP_SIZE=1 DCP_SIZE="$DCP" PCP_SIZE=1
 export DP_ATTENTION=false
 export REQUIRE_POWER=0
 export ENABLE_AGENTX_POWER="$ENABLE_POWER"
@@ -460,6 +483,7 @@ for kv in "${EXTRA_ENV[@]:-}"; do [ -n "$kv" ] && export "${kv?}"; done
 if [ -n "$DSA_BACKEND" ] && [ "$DSA_BACKEND" != "tilelang" ]; then
     TAG="${TAG}-dsa-${DSA_BACKEND}"
 fi
+[ "$DCP" -gt 1 ] && TAG="${TAG}-dcp${DCP}"
 if [ "$FAST" = "1" ]; then
     # 1 warmup request per lane leaves the prefix caches nearly empty, which is
     # exactly what an agentic run is supposed to exercise. Useful only to prove
@@ -493,7 +517,7 @@ SWEEP_LOG="$ROOT/sweep.log"
 
 {
     echo "=== $(date -Is) GLM-5.3-Flash AgentX platform=$PLATFORM model=$MODEL_ID ==="
-    echo "tag=$TAG tp=$TP ep=$EP spec=$SPEC_DECODING steps=$MTP_STEPS acc=$ACC_MODE${GOLDEN_AL:+($GOLDEN_AL)} dsa=${DSA_BACKEND:-recipe}"
+    echo "tag=$TAG tp=$TP ep=$EP dcp=$DCP spec=$SPEC_DECODING steps=$MTP_STEPS acc=$ACC_MODE${GOLDEN_AL:+($GOLDEN_AL)} dsa=${DSA_BACKEND:-recipe}"
     echo "mem_fraction=${USER_MEM_FRACTION:-per-conc} chunked_prefill=${USER_CHUNK:-per-conc} context=${CONTEXT_LENGTH:-native-1M}"
     echo "hicache_size=${USER_HICACHE:-per-conc} mamba_ratio=${USER_MAMBA_RATIO:-per-conc}"
     echo "duration=$DURATION conc=($CONC_LIST) gpus=${!VISIBLE_VAR:-all}"
@@ -529,7 +553,7 @@ for CONC in $CONC_LIST; do
     [ -n "$MAMBA_FULL_MEMORY_RATIO" ] && export MAMBA_FULL_MEMORY_RATIO
     resolve_kv_tier
     export EXP_NAME="glm5.3flash_tp${TP}_conc${CONC}_kv${KV_OFFLOADING}_spec-${SPEC_DECODING}"
-    export RESULT_FILENAME="${EXP_NAME}_${PRECISION}_${FRAMEWORK}_tp${TP}-pp1-dcp1-pcp1-ep${EP}-dpa${DP_ATTENTION}_disagg-${DISAGG}_spec-${SPEC_DECODING}_conc${CONC}_local-${RUNNER_TYPE}"
+    export RESULT_FILENAME="${EXP_NAME}_${PRECISION}_${FRAMEWORK}_tp${TP}-pp1-dcp${DCP}-pcp1-ep${EP}-dpa${DP_ATTENTION}_disagg-${DISAGG}_spec-${SPEC_DECODING}_conc${CONC}_local-${RUNNER_TYPE}"
     export RESULT_DIR="$ROOT/$EXP_NAME"
     export AGENTIC_OUTPUT_DIR="$RESULT_DIR"
     export PORT=$((PORT_BASE + CONC))
