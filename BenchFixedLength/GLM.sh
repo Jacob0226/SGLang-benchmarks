@@ -132,8 +132,15 @@
 #   so conc64 silently ran 48 at a time. Capping at exactly 64 is not enough either:
 #   the in-flight chunked prefill holds one state slot, so the 64th request waits
 #   at "mamba usage: 0.98" and the scheduler decodes the other 63 meanwhile; the
-#   batch peaks at 62-63 and early requests finish before it ever fills. Hence
-#   max(concurrencies) + MTP_MRR_HEADROOM (default 8), graphs at max(concurrencies).
+#   batch peaks at 62-63 and early requests finish before it ever fills.
+#   The value is the Agentic recipe's (recipe_glm53flash_fp4_*_sglang_mtp.sh):
+#   2 x max(concurrencies), 80 at conc64, 192 at conc128 on MI355X only (the B200
+#   recipe has no conc128 entry), never below 8. MRR also sizes the KDA
+#   intermediate state buffer (MRR x draft tokens, taken from the KV pool), so a
+#   different rule here would give fixed-length traces a different memory split
+#   than the agentic runs they are read against. Decode graphs stay at
+#   max(concurrencies): a fixed-length batch never exceeds it.
+#   MTP_MRR_OVERRIDE=<n> to pin it, MTP_MRR_OVERRIDE=off to let sglang auto-size.
 #
 # [prof-segv] ROCm torch-profiler teardown segfaults; the run must not wait on it
 #   One rank can die inside torch.profiler.stop() closing an eager (no-cuda-graph)
@@ -988,12 +995,19 @@ start_server() {
     # [mtp-mrr] Ahead of SHAPE_EXTRA_SERVER_ARGS on purpose, so a per-shape
     # --max-running-requests cap still wins. A graph cap the model block already
     # set (NVFP4's [nvfp4-graph]) is left alone.
-    if [ "$MTP_ENABLED" == "true" ] && [ "${MTP_MRR_HEADROOM:-8}" != "off" ]; then
-        local _max_c=0 _c
+    if [ "$MTP_ENABLED" == "true" ] && [ "${MTP_MRR_OVERRIDE:-}" != "off" ]; then
+        local _max_c=0 _c _mrr
         for _c in "${concurrencies[@]}"; do
             if [ "$_c" -gt "$_max_c" ]; then _max_c=$_c; fi
         done
-        cmd+=(--max-running-requests $((_max_c + ${MTP_MRR_HEADROOM:-8})))
+        _mrr=$((2 * _max_c))
+        case "$_max_c" in
+            64) _mrr=80 ;;
+            128) is_rocm_gpu_env && _mrr=192 ;;
+        esac
+        [ "$_mrr" -lt 8 ] && _mrr=8
+        [ -n "${MTP_MRR_OVERRIDE:-}" ] && _mrr="$MTP_MRR_OVERRIDE"
+        cmd+=(--max-running-requests "$_mrr")
         if [[ " ${MODEL_SERVER_ARGS[*]} " != *" --cuda-graph-max-bs"* ]]; then
             cmd+=("$(cuda_graph_max_bs_flag)" "$_max_c")
         fi
