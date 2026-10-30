@@ -174,13 +174,16 @@ case "$PLATFORM" in
         VISIBLE_VAR=CUDA_VISIBLE_DEVICES
         RUNNER_TYPE=b200
         DRAM_RUNNER=cluster:b200-nscale
-        # SGLang places each rank's HiCache host pools on its GPU's NUMA node,
-        # and on dgx-019 GPUs 4-7 share one ~1008 GiB node. 4 x 240 GB/rank
-        # plus the DSA indexer pool (~8 GB/rank) and process memory left ~4 GB
-        # free there at the end of conc 64; 256 GB/rank was OOM-killed at
-        # startup. InferenceX's b200-nscale budget (865 GB) would cap TP4 at
-        # 216 GB/rank, so this host budget replaces it.
-        HOST_DRAM_BUDGET_GB=960
+        # SGLang starts each TP worker under numactl --membind=<GPU's node>, so
+        # a rank's HiCache host pools can only live on that NUMA node (~1,082
+        # GB on dgx-019/023/025), and running out of it is an OOM kill rather
+        # than a spill. 4 x 240 GB/rank plus the DSA indexer pool (~8 GB/rank)
+        # and ~85 GB of process and kernel memory left ~6 GB free on the node
+        # at conc 64; with conc 32 running on the other node at the same time,
+        # one rank was OOM-killed (dgx-023, v0.5.23). 216 GB/rank, which is
+        # InferenceX's b200-nscale budget (865 GB / TP4), leaves ~100 GB, so
+        # conc 32 and conc 64 can share one host.
+        HOST_DRAM_BUDGET_GB=865
         PORT_TOOL=lsof
         # Prefer what the container actually is over what this file was last
         # edited to say. A stale default does not fail, it mislabels: results
@@ -222,13 +225,13 @@ case "$PLATFORM" in
         #                       budget, not memory; 8k costs 25% throughput
         #   mamba-ratio 1.5     inverted-U peak: 0.9 starves KDA slots, 2.0
         #                       starts eating KV the model still needs
-        #   hicache 240 GB/rank even at conc 32, where the device pool is only
+        #   hicache 216 GB/rank even at conc 32, where the device pool is only
         #                       21-24% used, eviction is still happening and the
         #                       host tier catches it (+29% interactivity with
-        #                       169). 240 is close to MI355X's 256 and is the
-        #                       most that fits the GPUs' NUMA node (see
-        #                       HOST_DRAM_BUDGET_GB); against 169 it measured
-        #                       P90 interactivity -7% at conc 32, -2% at conc 64
+        #                       169). 240 measured P90 interactivity -7% at conc
+        #                       32 and -2% at conc 64 against 169, but left no
+        #                       room to run two HiCache points at once (see
+        #                       HOST_DRAM_BUDGET_GB); 216 is not A/B'd yet
         # Measured per concurrency, because the winner changes. Up to conc 16
         # the tuned settings are a net loss -- the KV pool runs at 2-9%, so
         # nothing they buy is reachable, while their costs are not conditional:
@@ -244,7 +247,7 @@ case "$PLATFORM" in
             if [ "$c" -ge 32 ]; then
                 CHUNKED_PREFILL_SIZE="${USER_CHUNK:-16384}"
                 MAMBA_FULL_MEMORY_RATIO="${USER_MAMBA_RATIO:-1.5}"
-                HICACHE_SIZE="${USER_HICACHE:-240}"
+                HICACHE_SIZE="${USER_HICACHE:-216}"
             else
                 CHUNKED_PREFILL_SIZE="${USER_CHUNK:-8192}"
                 MAMBA_FULL_MEMORY_RATIO="$USER_MAMBA_RATIO"
