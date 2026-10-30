@@ -19,6 +19,7 @@
 #   ./ix_agentx_glm53flash.sh --smoke --conc 4     # plumbing check, ~20 min
 #   ./ix_agentx_glm53flash.sh --quick --conc 16    # A/B iteration, ~30 min
 #   ./ix_agentx_glm53flash.sh --mtp-steps 3 --conc 16    # MTP depth A/B
+#   ./ix_agentx_glm53flash.sh --platform b200 --target-only-verify  # B200 MTP verify A/B
 #   ./ix_agentx_glm53flash.sh --hicache-size 200         # add a host tier
 #   ./ix_agentx_glm53flash.sh --platform b200 --mem-fraction 0.75 --chunked-prefill 8192
 #   ./ix_agentx_glm53flash.sh --dsa-backend triton # MI355X sparse attention A/B
@@ -27,7 +28,7 @@
 #   ./ix_agentx_glm53flash.sh --dry-run            # print the env and exit
 set -uo pipefail
 
-usage() { sed -n '2,27p' "$0"; exit 1; }
+usage() { sed -n '2,28p' "$0"; exit 1; }
 
 # Tear down only the server this sweep started. A bare
 # `pkill -f sglang.launch_server` also kills a second sweep running on the
@@ -103,6 +104,7 @@ MAX_MAMBA_CACHE_SIZE=""
 CUDA_GRAPH_MAX_BS_CAP=""
 DSA_BACKEND=""
 EXTRA_SERVER_ARGS=""
+TARGET_ONLY_VERIFY=0
 ENABLE_POWER=0
 QUICK=0
 SMOKE=0
@@ -136,6 +138,7 @@ while [[ $# -gt 0 ]]; do
         --cuda-graph-max-bs)    CUDA_GRAPH_MAX_BS_CAP="$2"; shift 2 ;;
         --dsa-backend)          DSA_BACKEND="$2"; shift 2 ;;
         --server-arg)           EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS} $2"; shift 2 ;;
+        --target-only-verify)   TARGET_ONLY_VERIFY=1; shift ;;
         --power)      ENABLE_POWER=1; shift ;;
         --quick)      QUICK=1; shift ;;
         --smoke)      SMOKE=1; shift ;;
@@ -195,6 +198,15 @@ case "$PLATFORM" in
         fi
         MODEL_ID="nvidia/GLM-5.3-Flash-NVFP4"
         : "${CKPT:=/data/huggingface/hub/nvidia/GLM-5.3-Flash-NVFP4}"
+        # Verify MTP drafts by rejection sampling against the request's
+        # sampling params instead of SGLang's CUDA default, target-only. ROCm
+        # turns it on by itself, so this also makes both chips verify the same
+        # way. On dgx-025 against the target-only v0.5.22 line (dgx-019) it raised
+        # acceptance length by ~0.4 and P90 interactivity by 7-20% at every
+        # concurrency, with throughput -1.5% to +6%.
+        if [ "$SPEC_DECODING" = mtp ] && [ "$TARGET_ONLY_VERIFY" = 0 ]; then
+            EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS} --speculative-use-rejection-sampling"
+        fi
         # Measured defaults, not guesses. Each was A/B'd at conc 32 against the
         # value above it; see docs in AgentSkill sglang-benchmark/agentic-benchmark.md.
         #   mem-fraction 0.75   headroom for the DSA indexer's per-prefill buffer
@@ -554,7 +566,7 @@ if [ "$DRY_RUN" = "1" ]; then
     done
     echo
     echo "--- recipe env (dry run, last concurrency) ---"
-    env | grep -E '^(MODEL|TP|EP_SIZE|PP_SIZE|DCP_SIZE|PCP_SIZE|DP_ATTENTION|SPEC_|ACC_MODE|GOLDEN_AL|KV_|HICACHE|TOTAL_CPU_DRAM_GB|MAX_MODEL_LEN|CONTEXT_LENGTH|MAMBA_|MAX_MAMBA|CUDA_GRAPH|DSA_BACKEND|MEM_FRACTION|CHUNKED_|AIPERF_|AGENTIC_|INFMAX_|RUNNER_TYPE|PRECISION|FRAMEWORK|SCENARIO_|DURATION|ENABLE_AGENTX_POWER|REQUIRE_POWER|IS_MULTINODE|DISAGG|EVAL_ONLY|IMAGE|HF_HUB_CACHE)' | sort
+    env | grep -E '^(MODEL|TP|EP_SIZE|PP_SIZE|DCP_SIZE|PCP_SIZE|DP_ATTENTION|SPEC_|ACC_MODE|GOLDEN_AL|KV_|HICACHE|TOTAL_CPU_DRAM_GB|MAX_MODEL_LEN|CONTEXT_LENGTH|MAMBA_|MAX_MAMBA|CUDA_GRAPH|DSA_BACKEND|MEM_FRACTION|CHUNKED_|AIPERF_|AGENTIC_|INFMAX_|RUNNER_TYPE|PRECISION|FRAMEWORK|SCENARIO_|DURATION|ENABLE_AGENTX_POWER|REQUIRE_POWER|IS_MULTINODE|DISAGG|EVAL_ONLY|IMAGE|HF_HUB_CACHE|EXTRA_SERVER_ARGS)' | sort
     exit 0
 fi
 
