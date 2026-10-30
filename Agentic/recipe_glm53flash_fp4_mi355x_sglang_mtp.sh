@@ -252,6 +252,7 @@ SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
 
 wait_for_server_ready --port "$PORT" --server-log "$SERVER_LOG" --server-pid "$SERVER_PID"
+bash "$(dirname "$0")/log_numa_policy.sh" "$SERVER_PID" "$RESULT_DIR/numa_policy.txt" || true
 
 if [ "${EVAL_ONLY}" = "true" ]; then
     export SWEBENCH_AGENT_STEP_LIMIT=150

@@ -24,6 +24,7 @@
 #   ./ix_agentx_glm53flash.sh --mtp-steps 3 --conc 16    # MTP depth A/B
 #   ./ix_agentx_glm53flash.sh --acc real           # real verification (measured AL)
 #   ./ix_agentx_glm53flash.sh --acc real --platform b200 --target-only-verify  # B200 MTP verify A/B
+#   ./ix_agentx_glm53flash.sh --keep-numa-balancing  # leave kernel NUMA auto-balancing as found
 #   ./ix_agentx_glm53flash.sh --hicache-size 200         # add a host tier
 #   ./ix_agentx_glm53flash.sh --platform b200 --mem-fraction 0.75 --chunked-prefill 8192
 #   ./ix_agentx_glm53flash.sh --dsa-backend triton # MI355X sparse attention A/B
@@ -32,7 +33,7 @@
 #   ./ix_agentx_glm53flash.sh --dry-run            # print the env and exit
 set -uo pipefail
 
-usage() { sed -n '2,32p' "$0"; exit 1; }
+usage() { sed -n '2,33p' "$0"; exit 1; }
 
 # Tear down only the server this sweep started. A bare
 # `pkill -f sglang.launch_server` also kills a second sweep running on the
@@ -75,6 +76,9 @@ kill_port() {
     return 0
 }
 
+NUMA_BALANCING_FILE=/proc/sys/kernel/numa_balancing
+numa_balancing_state() { cat "$NUMA_BALANCING_FILE" 2>/dev/null || echo n/a; }
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_HOME="${BENCH_HOME:-$(dirname "$HERE")}"
 IX="${IX:-/home/jacchang/InferenceX}"
@@ -110,6 +114,7 @@ CUDA_GRAPH_MAX_BS_CAP=""
 DSA_BACKEND=""
 EXTRA_SERVER_ARGS=""
 TARGET_ONLY_VERIFY=0
+KEEP_NUMA_BALANCING=0
 ENABLE_POWER=0
 QUICK=0
 SMOKE=0
@@ -144,6 +149,7 @@ while [[ $# -gt 0 ]]; do
         --dsa-backend)          DSA_BACKEND="$2"; shift 2 ;;
         --server-arg)           EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS} $2"; shift 2 ;;
         --target-only-verify)   TARGET_ONLY_VERIFY=1; shift ;;
+        --keep-numa-balancing)  KEEP_NUMA_BALANCING=1; shift ;;
         --power)      ENABLE_POWER=1; shift ;;
         --quick)      QUICK=1; shift ;;
         --smoke)      SMOKE=1; shift ;;
@@ -574,6 +580,7 @@ SWEEP_LOG="$ROOT/sweep.log"
     echo "duration=$DURATION conc=($CONC_LIST) gpus=${!VISIBLE_VAR:-all}"
     echo "ix=$IX@$(git -C "$IX" rev-parse --short HEAD 2>/dev/null) image=$DOCKER"
     echo "root=$ROOT"
+    echo "numa_balancing=$(numa_balancing_state)"
 } | tee -a "$SWEEP_LOG"
 
 if [ "$DRY_RUN" = "1" ]; then
@@ -594,6 +601,20 @@ if [ "$DRY_RUN" = "1" ]; then
     echo "--- recipe env (dry run, last concurrency) ---"
     env | grep -E '^(MODEL|TP|EP_SIZE|PP_SIZE|DCP_SIZE|PCP_SIZE|DP_ATTENTION|SPEC_|ACC_MODE|GOLDEN_AL|KV_|HICACHE|TOTAL_CPU_DRAM_GB|MAX_MODEL_LEN|CONTEXT_LENGTH|MAMBA_|MAX_MAMBA|CUDA_GRAPH|DSA_BACKEND|MEM_FRACTION|CHUNKED_|AIPERF_|AGENTIC_|INFMAX_|RUNNER_TYPE|PRECISION|FRAMEWORK|SCENARIO_|DURATION|ENABLE_AGENTX_POWER|REQUIRE_POWER|IS_MULTINODE|DISAGG|EVAL_ONLY|IMAGE|HF_HUB_CACHE|EXTRA_SERVER_ARGS)' | sort
     exit 0
+fi
+
+# ---- kernel NUMA auto-balancing ------------------------------------------
+# AMD's ROCm system validation asks for numa_balancing=0, and the knob is the
+# Linux kernel's, so it applies to the B200 hosts too. It is host-wide and
+# lasts until reboot, so it changes the node for everyone on it. Hosts give
+# no sudo; a --privileged container's root can write it. A run that cannot
+# set it still goes ahead, and every point records the value it ran under.
+if [ "$KEEP_NUMA_BALANCING" = 0 ] && [ "$(numa_balancing_state)" = 1 ]; then
+    if (echo 0 > "$NUMA_BALANCING_FILE") 2>/dev/null; then
+        echo "numa_balancing 1 -> $(numa_balancing_state) (host-wide; --keep-numa-balancing skips this)" | tee -a "$SWEEP_LOG"
+    else
+        echo "WARNING: numa_balancing is 1 and could not be set to 0 (needs root in a --privileged container)" | tee -a "$SWEEP_LOG" >&2
+    fi
 fi
 
 # ---- sweep ---------------------------------------------------------------
@@ -630,7 +651,7 @@ for CONC in $CONC_LIST; do
         sleep 15
     done
 
-    echo ">>> $(date -Is) starting conc=$CONC port=$PORT mem_fraction=$MEM_FRACTION_STATIC chunk=$CHUNKED_PREFILL_SIZE mamba_ratio=${MAMBA_FULL_MEMORY_RATIO:-default} kv=$KV_OFFLOADING hicache=$HICACHE_SIZE" | tee -a "$SWEEP_LOG"
+    echo ">>> $(date -Is) starting conc=$CONC port=$PORT mem_fraction=$MEM_FRACTION_STATIC chunk=$CHUNKED_PREFILL_SIZE mamba_ratio=${MAMBA_FULL_MEMORY_RATIO:-default} kv=$KV_OFFLOADING hicache=$HICACHE_SIZE numa_balancing=$(numa_balancing_state)" | tee -a "$SWEEP_LOG"
     echo "    -> $RESULT_DIR" | tee -a "$SWEEP_LOG"
     bash "$RECIPE" > "$RESULT_DIR/recipe.log" 2>&1
     rc=$?
