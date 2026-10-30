@@ -608,13 +608,22 @@ fi
 # Linux kernel's, so it applies to the B200 hosts too. It is host-wide and
 # lasts until reboot, so it changes the node for everyone on it. Hosts give
 # no sudo; a --privileged container's root can write it. A run that cannot
-# set it still goes ahead, and every point records the value it ran under.
-if [ "$KEEP_NUMA_BALANCING" = 0 ] && [ "$(numa_balancing_state)" = 1 ]; then
-    if (echo 0 > "$NUMA_BALANCING_FILE") 2>/dev/null; then
-        echo "numa_balancing 1 -> $(numa_balancing_state) (host-wide; --keep-numa-balancing skips this)" | tee -a "$SWEEP_LOG"
-    else
-        echo "WARNING: numa_balancing is 1 and could not be set to 0 (needs root in a --privileged container)" | tee -a "$SWEEP_LOG" >&2
+# set it stops here rather than producing numbers under the wrong setting;
+# --keep-numa-balancing is the explicit opt-out.
+NUMA_BALANCING_WAS=$(numa_balancing_state)
+if [ "$KEEP_NUMA_BALANCING" = 0 ] && [ "$NUMA_BALANCING_WAS" != 0 ] && [ "$NUMA_BALANCING_WAS" != n/a ]; then
+    (echo 0 > "$NUMA_BALANCING_FILE") 2>/dev/null
+    if [ "$(numa_balancing_state)" != 0 ]; then
+        {
+            echo "ERROR: $NUMA_BALANCING_FILE is $NUMA_BALANCING_WAS and this run could not set it to 0."
+            echo "  Set it first, as root in a --privileged container on this host:"
+            echo "    docker exec <container> sh -c 'echo 0 > $NUMA_BALANCING_FILE'"
+            echo "  or on the host: sudo sh -c 'echo 0 > $NUMA_BALANCING_FILE'"
+            echo "  To run with it on deliberately, pass --keep-numa-balancing."
+        } | tee -a "$SWEEP_LOG" >&2
+        exit 1
     fi
+    echo "numa_balancing $NUMA_BALANCING_WAS -> 0 (host-wide; --keep-numa-balancing skips this)" | tee -a "$SWEEP_LOG"
 fi
 
 # ---- sweep ---------------------------------------------------------------
