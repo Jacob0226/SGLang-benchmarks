@@ -15,11 +15,15 @@
 # when rocm-smi is on PATH, else b200. GPU selection comes from
 # CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES or --gpus.
 #
+# MTP acceptance is simulated at the golden AL in golden_al/glm5.3flash_mtp.yaml
+# by default, so a run-to-run difference is the system's, not the drafter's.
+#
 #   ./ix_agentx_glm53flash.sh                      # TP4, conc 1 4 8 16 32 64
 #   ./ix_agentx_glm53flash.sh --smoke --conc 4     # plumbing check, ~20 min
 #   ./ix_agentx_glm53flash.sh --quick --conc 16    # A/B iteration, ~30 min
 #   ./ix_agentx_glm53flash.sh --mtp-steps 3 --conc 16    # MTP depth A/B
-#   ./ix_agentx_glm53flash.sh --platform b200 --target-only-verify  # B200 MTP verify A/B
+#   ./ix_agentx_glm53flash.sh --acc real           # real verification (measured AL)
+#   ./ix_agentx_glm53flash.sh --acc real --platform b200 --target-only-verify  # B200 MTP verify A/B
 #   ./ix_agentx_glm53flash.sh --hicache-size 200         # add a host tier
 #   ./ix_agentx_glm53flash.sh --platform b200 --mem-fraction 0.75 --chunked-prefill 8192
 #   ./ix_agentx_glm53flash.sh --dsa-backend triton # MI355X sparse attention A/B
@@ -28,7 +32,7 @@
 #   ./ix_agentx_glm53flash.sh --dry-run            # print the env and exit
 set -uo pipefail
 
-usage() { sed -n '2,28p' "$0"; exit 1; }
+usage() { sed -n '2,32p' "$0"; exit 1; }
 
 # Tear down only the server this sweep started. A bare
 # `pkill -f sglang.launch_server` also kills a second sweep running on the
@@ -95,8 +99,9 @@ CHUNKED_PREFILL_SIZE=""
 # is the deepest EAGLE ladder GLM-5.3-Flash's single nextn head sustains here.
 MTP_STEPS=5
 SPEC_DECODING=mtp
-ACC_MODE=real
+ACC_MODE=golden
 GOLDEN_AL=""
+GOLDEN_CURVE="$HERE/golden_al/glm5.3flash_mtp.yaml"
 HICACHE_SIZE=""
 CONTEXT_LENGTH=""
 MAMBA_FULL_MEMORY_RATIO=""
@@ -198,13 +203,16 @@ case "$PLATFORM" in
         fi
         MODEL_ID="nvidia/GLM-5.3-Flash-NVFP4"
         : "${CKPT:=/data/huggingface/hub/nvidia/GLM-5.3-Flash-NVFP4}"
-        # Verify MTP drafts by rejection sampling against the request's
-        # sampling params instead of SGLang's CUDA default, target-only. ROCm
-        # turns it on by itself, so this also makes both chips verify the same
-        # way. On dgx-025 against the target-only v0.5.22 line (dgx-019) it raised
-        # acceptance length by ~0.4 and P90 interactivity by 7-20% at every
-        # concurrency, with throughput -1.5% to +6%.
-        if [ "$SPEC_DECODING" = mtp ] && [ "$TARGET_ONLY_VERIFY" = 0 ]; then
+        # With real verification, verify MTP drafts by rejection sampling
+        # against the request's sampling params instead of SGLang's CUDA
+        # default, target-only. ROCm turns it on by itself, so this also makes
+        # both chips verify the same way. On dgx-025 against the target-only
+        # v0.5.22 line (dgx-019) it raised acceptance length by ~0.4 and P90
+        # interactivity by 7-20% at every concurrency, with throughput -1.5% to
+        # +6%. Under golden AL the verify outcome is overwritten, so rejection
+        # sampling would only cost time (it disables the sparse top-k sampling
+        # path); golden runs keep the default, as InferenceX's own B200 lanes do.
+        if [ "$SPEC_DECODING" = mtp ] && [ "$ACC_MODE" = real ] && [ "$TARGET_ONLY_VERIFY" = 0 ]; then
             EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS} --speculative-use-rejection-sampling"
         fi
         # Measured defaults, not guesses. Each was A/B'd at conc 32 against the
@@ -372,13 +380,25 @@ if ! has_sys_nice; then
     [ -n "${ALLOW_NO_SYS_NICE:-}" ] || { echo "         Set ALLOW_NO_SYS_NICE=1 to run anyway." >&2; exit 1; }
 fi
 
+[ "$SPEC_DECODING" = none ] && ACC_MODE=real
 case "$ACC_MODE" in
-    real) ;;
+    real) GOLDEN_AL="" ;;
     golden)
+        # InferenceX has no GLM-5.3-Flash curve, so the default is the local
+        # SPEED-Bench measurement (speedbench_glm53flash_b200_sglang.sh).
+        # --golden-al still overrides it.
+        if [ -z "$GOLDEN_AL" ]; then
+            GOLDEN_AL=$(python3 - "$GOLDEN_CURVE" "$MTP_STEPS" <<'EOF'
+import sys, yaml
+[(model, modes)] = yaml.safe_load(open(sys.argv[1])).items()
+print(modes["thinking_on"][int(sys.argv[2])])
+EOF
+            ) || GOLDEN_AL=""
+        fi
         [ -n "$GOLDEN_AL" ] || {
-            echo "ERROR: --acc golden needs --golden-al <AL>. golden_al_distribution/glm5.3_mtp.yaml" >&2
-            echo "       carries only glm-5.3-fp8 at K=3 (2.99, itself marked PROVISIONAL and copied" >&2
-            echo "       from GLM-5.2); there is no measured curve for GLM-5.3-Flash at any depth." >&2
+            echo "ERROR: no golden AL for MTP steps $MTP_STEPS in $GOLDEN_CURVE." >&2
+            echo "       Measure it with speedbench_glm53flash_b200_sglang.sh --mtp-list $MTP_STEPS," >&2
+            echo "       or pass --golden-al <AL> / --acc real." >&2
             exit 1
         } ;;
     *) echo "ERROR: --acc must be 'real' or 'golden', got '$ACC_MODE'" >&2; exit 1 ;;
@@ -503,6 +523,9 @@ for kv in "${EXTRA_ENV[@]:-}"; do [ -n "$kv" ] && export "${kv?}"; done
 # ---- run-length modes ----------------------------------------------------
 [ -n "$TAG" ] || TAG="TP${TP}_EP${EP}-mtp${MTP_STEPS}"
 [ "$SPEC_DECODING" = "none" ] && TAG="TP${TP}_EP${EP}-nospec"
+# Golden and real points must not share a directory, or the skip-if-done
+# check below would hand back the other mode's result.
+[ "$ACC_MODE" = golden ] && TAG="${TAG}-golden${GOLDEN_AL}"
 # A point that already has a result is skipped, so a backend A/B under the
 # default tag would silently reuse the TileLang numbers.
 if [ -n "$DSA_BACKEND" ] && [ "$DSA_BACKEND" != "tilelang" ]; then

@@ -97,9 +97,8 @@ if [ "$SPEC_DECODING" = "mtp" ]; then
     )
 fi
 
-# Acceptance policy: see the B200 recipe. There is no golden AL curve for
-# GLM-5.3-Flash at any K, so ACC_MODE=real is the default and these are tuning
-# numbers, not submittable ones.
+# Acceptance policy: see the B200 recipe. Both chips simulate the same local
+# golden AL by default. Simulation skips ROCm's automatic rejection sampling.
 if [ "${EVAL_ONLY}" != "true" ] && [ "${ACC_MODE:-real}" = "golden" ]; then
     check_env_vars GOLDEN_AL
     export SGLANG_SIMULATE_ACC_LEN="$GOLDEN_AL"

@@ -102,11 +102,10 @@ fi
 # Acceptance policy. InferenceX requires a spec-decode AgentX point to pin
 # acceptance to the committed golden AL for the model, thinking mode and draft
 # length, so throughput is not a function of how lucky the drafter got on this
-# corpus. golden_al_distribution/glm5.3_mtp.yaml only carries glm-5.3-fp8 at
-# K=3, and it is itself flagged PROVISIONAL (copied from GLM-5.2). There is no
-# curve for GLM-5.3-*Flash* at any K, so ACC_MODE=real is the default here and
-# these numbers are tuning numbers, not submittable ones. ACC_MODE=golden with
-# GOLDEN_AL set reproduces the board's methodology once a curve exists.
+# corpus. InferenceX commits no curve for GLM-5.3-*Flash* (glm5.3_mtp.yaml is
+# glm-5.3-fp8 at K=3 only, PROVISIONAL), so the driver defaults GOLDEN_AL to the
+# local SPEED-Bench curve in golden_al/glm5.3flash_mtp.yaml. ACC_MODE=real runs
+# real verification instead.
 if [ "${EVAL_ONLY}" != "true" ] && [ "${ACC_MODE:-real}" = "golden" ]; then
     check_env_vars GOLDEN_AL
     export SGLANG_SIMULATE_ACC_LEN="$GOLDEN_AL"
