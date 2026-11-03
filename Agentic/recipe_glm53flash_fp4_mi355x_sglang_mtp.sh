@@ -72,12 +72,20 @@ if require_agentic_kv_offload_backend hicache; then
         echo "Error: KV_OFFLOADING=dram was requested but HICACHE_SIZE is 0" >&2
         exit 1
     fi
-    echo "HiCache CPU tier: ${HICACHE_SIZE} GB/rank, node budget ${TOTAL_CPU_DRAM_GB} GB, write_back / direct / page_first_direct"
+    # The kernel backend gathers many pages per launch; it cannot read the
+    # page_first_direct layout, so each backend brings its own layout.
+    HICACHE_IO="${HICACHE_IO:-direct}"
+    case "$HICACHE_IO" in
+        direct) HICACHE_MEM_LAYOUT=page_first_direct ;;
+        kernel) HICACHE_MEM_LAYOUT=page_first ;;
+        *) echo "Error: HICACHE_IO must be direct or kernel, got $HICACHE_IO" >&2; exit 1 ;;
+    esac
+    echo "HiCache CPU tier: ${HICACHE_SIZE} GB/rank, node budget ${TOTAL_CPU_DRAM_GB} GB, write_back / $HICACHE_IO / $HICACHE_MEM_LAYOUT"
     CACHE_ARGS=(
         --enable-hierarchical-cache
         --hicache-write-policy write_back
-        --hicache-io-backend direct
-        --hicache-mem-layout page_first_direct
+        --hicache-io-backend "$HICACHE_IO"
+        --hicache-mem-layout "$HICACHE_MEM_LAYOUT"
         --hicache-size "$HICACHE_SIZE"
     )
 fi

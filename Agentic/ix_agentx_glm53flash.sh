@@ -26,6 +26,7 @@
 #   ./ix_agentx_glm53flash.sh --acc real --platform b200 --target-only-verify  # B200 MTP verify A/B
 #   ./ix_agentx_glm53flash.sh --keep-numa-balancing  # leave kernel NUMA auto-balancing as found
 #   ./ix_agentx_glm53flash.sh --hicache-size 200         # add a host tier
+#   ./ix_agentx_glm53flash.sh --hicache-io kernel        # host tier copies via kernel, not direct
 #   ./ix_agentx_glm53flash.sh --platform b200 --mem-fraction 0.75 --chunked-prefill 8192
 #   ./ix_agentx_glm53flash.sh --dsa-backend triton # MI355X sparse attention A/B
 #   ./ix_agentx_glm53flash.sh --dsa-backend triton --conc 128 --dcp 4 \
@@ -33,7 +34,7 @@
 #   ./ix_agentx_glm53flash.sh --dry-run            # print the env and exit
 set -uo pipefail
 
-usage() { sed -n '2,33p' "$0"; exit 1; }
+usage() { sed -n '2,34p' "$0"; exit 1; }
 
 # Tear down only the server this sweep started. A bare
 # `pkill -f sglang.launch_server` also kills a second sweep running on the
@@ -107,6 +108,7 @@ ACC_MODE=golden
 GOLDEN_AL=""
 GOLDEN_CURVE="$HERE/golden_al/glm5.3flash_mtp.yaml"
 HICACHE_SIZE=""
+HICACHE_IO=""
 CONTEXT_LENGTH=""
 MAMBA_FULL_MEMORY_RATIO=""
 MAX_MAMBA_CACHE_SIZE=""
@@ -142,6 +144,7 @@ while [[ $# -gt 0 ]]; do
         --acc)        ACC_MODE="$2"; shift 2 ;;
         --golden-al)  GOLDEN_AL="$2"; ACC_MODE=golden; shift 2 ;;
         --hicache-size)      HICACHE_SIZE="$2"; shift 2 ;;
+        --hicache-io)        HICACHE_IO="$2"; shift 2 ;;
         --context-length)    CONTEXT_LENGTH="$2"; shift 2 ;;
         --mamba-ratio)       MAMBA_FULL_MEMORY_RATIO="$2"; shift 2 ;;
         --max-mamba-cache-size) MAX_MAMBA_CACHE_SIZE="$2"; shift 2 ;;
@@ -167,6 +170,10 @@ USER_MEM_FRACTION="$MEM_FRACTION_STATIC"
 USER_CHUNK="$CHUNKED_PREFILL_SIZE"
 USER_MAMBA_RATIO="$MAMBA_FULL_MEMORY_RATIO"
 USER_HICACHE="$HICACHE_SIZE"
+case "$HICACHE_IO" in
+    ""|direct|kernel) ;;
+    *) echo "--hicache-io must be direct or kernel, got $HICACHE_IO" >&2; exit 1 ;;
+esac
 
 # ---- platform ------------------------------------------------------------
 # Everything that differs between the two chips lives in this block and in the
@@ -292,9 +299,11 @@ case "$PLATFORM" in
         # HiCache: P90 interactivity 55.9, 45,964 tok/s/GPU; HiCache 169 on
         # that point fell to 51.4. Conc 64 without a host tier collapsed
         # (2.7, 12,349 tok/s/GPU, KV pool at 100%); HiCache 169 + mamba-ratio
-        # 0.5 recovered 20.6 and 55,272. max-running 80 at conc 64 lives in
-        # the recipe. An explicit --hicache-size / --mamba-ratio still wins
-        # at every point.
+        # 0.5 recovered 20.6 and 55,272. Conc 64 HiCache is 216 GB/rank, the
+        # same as B200: each NUMA node holds 1378 GiB for its four GPUs, so
+        # two 216 GB/rank servers fit on one node. max-running 80 at conc 64
+        # lives in the recipe. An explicit --hicache-size / --mamba-ratio
+        # still wins at every point.
         #
         # Conc 128 is past TP4's KV capacity (working set >= 15.6M tokens vs
         # 12.3M device + host), so it is a DCP point. 3600 s, HiCache 169,
@@ -311,7 +320,7 @@ case "$PLATFORM" in
             CHUNKED_PREFILL_SIZE="${USER_CHUNK:-16384}"
             if [ "$c" -ge 64 ]; then
                 MAMBA_FULL_MEMORY_RATIO="${USER_MAMBA_RATIO:-0.5}"
-                HICACHE_SIZE="${USER_HICACHE:-169}"
+                HICACHE_SIZE="${USER_HICACHE:-216}"
             else
                 MAMBA_FULL_MEMORY_RATIO="${USER_MAMBA_RATIO:-0.9}"
                 HICACHE_SIZE="${USER_HICACHE:-0}"
@@ -483,6 +492,7 @@ resolve_kv_tier() {
         export KV_OFFLOAD_BACKEND=hicache
         export KV_OFFLOAD_BACKEND_METADATA='{"name":"hicache"}'
         export HICACHE_SIZE
+        [ -n "$HICACHE_IO" ] && export HICACHE_IO
         # Without a host budget from the platform block, ask InferenceX's own
         # matrix logic for the node budget instead of transcribing a number. At
         # TP4 and dram-utilization 0.80 that is 865 GB on b200-nscale and
@@ -576,7 +586,7 @@ SWEEP_LOG="$ROOT/sweep.log"
     echo "=== $(date -Is) GLM-5.3-Flash AgentX platform=$PLATFORM model=$MODEL_ID ==="
     echo "tag=$TAG tp=$TP ep=$EP dcp=$DCP spec=$SPEC_DECODING steps=$MTP_STEPS acc=$ACC_MODE${GOLDEN_AL:+($GOLDEN_AL)} dsa=${DSA_BACKEND:-recipe}"
     echo "mem_fraction=${USER_MEM_FRACTION:-per-conc} chunked_prefill=${USER_CHUNK:-per-conc} context=${CONTEXT_LENGTH:-native-1M}"
-    echo "hicache_size=${USER_HICACHE:-per-conc} mamba_ratio=${USER_MAMBA_RATIO:-per-conc}"
+    echo "hicache_size=${USER_HICACHE:-per-conc} hicache_io=${HICACHE_IO:-direct} mamba_ratio=${USER_MAMBA_RATIO:-per-conc}"
     echo "duration=$DURATION conc=($CONC_LIST) gpus=${!VISIBLE_VAR:-all}"
     echo "ix=$IX@$(git -C "$IX" rev-parse --short HEAD 2>/dev/null) image=$DOCKER"
     echo "root=$ROOT"
