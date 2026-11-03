@@ -26,7 +26,7 @@
 #   ./ix_agentx_glm53flash.sh --acc real --platform b200 --target-only-verify  # B200 MTP verify A/B
 #   ./ix_agentx_glm53flash.sh --keep-numa-balancing  # leave kernel NUMA auto-balancing as found
 #   ./ix_agentx_glm53flash.sh --hicache-size 200         # add a host tier
-#   ./ix_agentx_glm53flash.sh --hicache-io kernel        # host tier copies via kernel, not direct
+#   ./ix_agentx_glm53flash.sh --hicache-io direct        # host tier copies via direct, not kernel
 #   ./ix_agentx_glm53flash.sh --platform b200 --mem-fraction 0.75 --chunked-prefill 8192
 #   ./ix_agentx_glm53flash.sh --dsa-backend triton # MI355X sparse attention A/B
 #   ./ix_agentx_glm53flash.sh --dsa-backend triton --conc 128 --dcp 4 \
@@ -586,7 +586,7 @@ SWEEP_LOG="$ROOT/sweep.log"
     echo "=== $(date -Is) GLM-5.3-Flash AgentX platform=$PLATFORM model=$MODEL_ID ==="
     echo "tag=$TAG tp=$TP ep=$EP dcp=$DCP spec=$SPEC_DECODING steps=$MTP_STEPS acc=$ACC_MODE${GOLDEN_AL:+($GOLDEN_AL)} dsa=${DSA_BACKEND:-recipe}"
     echo "mem_fraction=${USER_MEM_FRACTION:-per-conc} chunked_prefill=${USER_CHUNK:-per-conc} context=${CONTEXT_LENGTH:-native-1M}"
-    echo "hicache_size=${USER_HICACHE:-per-conc} hicache_io=${HICACHE_IO:-direct} mamba_ratio=${USER_MAMBA_RATIO:-per-conc}"
+    echo "hicache_size=${USER_HICACHE:-per-conc} hicache_io=${HICACHE_IO:-kernel} mamba_ratio=${USER_MAMBA_RATIO:-per-conc}"
     echo "duration=$DURATION conc=($CONC_LIST) gpus=${!VISIBLE_VAR:-all}"
     echo "ix=$IX@$(git -C "$IX" rev-parse --short HEAD 2>/dev/null) image=$DOCKER"
     echo "root=$ROOT"

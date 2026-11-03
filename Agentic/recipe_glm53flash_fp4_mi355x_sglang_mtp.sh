@@ -74,7 +74,7 @@ if require_agentic_kv_offload_backend hicache; then
     fi
     # The kernel backend gathers many pages per launch; it cannot read the
     # page_first_direct layout, so each backend brings its own layout.
-    HICACHE_IO="${HICACHE_IO:-direct}"
+    HICACHE_IO="${HICACHE_IO:-kernel}"
     case "$HICACHE_IO" in
         direct) HICACHE_MEM_LAYOUT=page_first_direct ;;
         kernel) HICACHE_MEM_LAYOUT=page_first ;;
