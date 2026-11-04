@@ -196,6 +196,11 @@ export SGLANG_TIMEOUT_KEEP_ALIVE=900
 # --mem-fraction-static sizes. On ROCm it is budgeted as this fraction of free
 # HBM (and capped at aiter's 2 GiB); 0.04 is what the GLM-5.2 MI355X lane runs.
 export SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION="${SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION:-0.04}"
+# The image bakes in INT8 quick-reduce, so a dedicated knob is needed to
+# override it (as in BenchFixedLength/GLM.sh). Conc 64, two runs each: INT4 vs
+# INT8 out/GPU 547 vs 541, interactivity P90 49.4 vs 47.5; GSM8K 96.82%.
+export ROCM_QUICK_REDUCE_QUANTIZATION="${QUICK_REDUCE_QUANT:-INT4}"
+export AITER_QUICK_REDUCE_QUANTIZATION="${QUICK_REDUCE_QUANT:-INT4}"
 
 # aiter's JIT baton records the builder's pid in the lock file and only breaks
 # the lock when that pid is gone. A server killed mid-build leaves the lock
@@ -213,7 +218,11 @@ SGLANG_CMD=(
     "${PARALLEL_ARGS[@]}"
     # No --quantization: Quark MXFP4 (with its block-FP8 attention and MTP
     # exceptions) is resolved from the checkpoint's quantization_config.
-    --kv-cache-dtype bfloat16
+    # fp8_e4m3 matches B200. GLM-5.3-Flash needs --dsa-backend triton and an
+    # SGLang with the FP8 Triton sparse-MLA gate (glm53-1103-fp8kv-triton);
+    # conc 64 vs bfloat16: out/GPU 562 vs 543, interactivity P90 52.8 vs 49.3,
+    # GSM8K 97.04%.
+    --kv-cache-dtype fp8_e4m3
     # The driver's --dsa-backend; see its MI355X block for why TileLang is the
     # default and what triton / aiter_sparse_mla need.
     --dsa-prefill-backend "${DSA_BACKEND:-tilelang}"
