@@ -9,6 +9,8 @@
 # ./GLM.sh --tp 4 --tag 0507_TP4    # tensor parallel size (auto: TP=4 for FP4 models, TP=8 for FP8)
 # ./GLM.sh --docker rocm/sgl-dev:v0.5.10rc0-rocm720-mi35x-20260412   # tag results dir with docker image
 # ./GLM.sh --port 8600              # change server port (default 8552; also: PORT=8600 ./GLM.sh)
+# ./GLM.sh --mtp --mono             # sgl-amd-mono at low concurrency, per-concurrency MTP steps [mono]
+# ./GLM.sh --mtp --golden-al        # simulate the golden accept length of each server's MTP steps [golden-al]
 # ALLOW_LOCKED_CLOCKS=1 ./GLM.sh    # skip the GPU application-clock check (see check_gpu_clocks)
 #
 # GLM-5 / GLM-5.1 FP4 examples (auto-detects quant scheme from model name;
@@ -151,6 +153,24 @@
 #   crashed scheduler, and the cell's traces are set aside as *_CRASHED so a re-run
 #   retries it.
 #
+# [mono] --mono serves only small verify batches, so it is a per-concurrency choice
+#   --enable-amd-monokernel (sgl-amd-mono, needs the package on PYTHONPATH) builds
+#   widths of up to 16 rows and serves a target_verify step only when the whole
+#   batch fits: batch 1-2 at MTP5 (6 tokens a request), 1-4 at MTP3 (4 tokens).
+#   Everything else -- draft, prefill, larger verify batches -- runs the standard
+#   path, as the server log's "monokernel ... runs target_verify steps of batch
+#   size [...]" line states. A fixed-length cell holds its batch at the
+#   concurrency, so conc8 at MTP3 never reaches the monokernel. MONO_MTP_STEPS
+#   maps each mono concurrency to its MTP steps (default "1:5 4:3 8:3", the
+#   Agentic choice); unlisted concurrencies run MTP steps as usual with mono
+#   off. Every concurrency gets its own server, bench mode included.
+#
+# [golden-al] --golden-al pins the accept length to the Agentic golden curve
+#   Same env as Agentic/recipe_glm53flash_fp4_mi355x_sglang_mtp.sh: the verify
+#   outcome is simulated at the AL that golden_al/glm5.3flash_mtp.yaml lists for
+#   the server's MTP steps (3: 2.99, 5: 3.56), so traces line up with the golden
+#   Agentic lines. GOLDEN_AL=<al> pins one value for every server.
+#
 set -euo pipefail
 set -x
 ulimit -n 65535
@@ -160,7 +180,11 @@ MTP_ENABLED="false"
 PROF_ENABLED="false"
 PROF_COMBINED="false"   # if true: single combined trace (no --profile-by-stage)
 DUAL_STREAM_ROCM="false"
+MONO_ENABLED="false"
+GOLDEN_AL_ENABLED="false"
 MTP_TAG=""
+MONO_TAG=""
+GOLDEN_TAG=""
 USER_TAG=""
 # TP_SIZE="auto" means: pick from MODEL_NAME after --model is parsed.
 # FP4 models (MXFP4 / NVFP4) default to TP=4 so MI355X and B200 profiles
@@ -194,6 +218,16 @@ while [[ $# -gt 0 ]]; do
         DUAL_STREAM_ROCM="true"
         shift 1
         ;;
+    --mono)
+        MONO_ENABLED="true"
+        MONO_TAG="-Mono"
+        shift 1
+        ;;
+    --golden-al)
+        GOLDEN_AL_ENABLED="true"
+        GOLDEN_TAG="-GoldenAL"
+        shift 1
+        ;;
     --model)
         MODEL_PATH="$2"
         shift 2
@@ -220,6 +254,10 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+if [ "$MTP_ENABLED" != "true" ] && { [ "$MONO_ENABLED" == "true" ] || [ "$GOLDEN_AL_ENABLED" == "true" ]; }; then
+    echo "!!! ERROR: --mono and --golden-al act on MTP verify steps; add --mtp." >&2
+    exit 1
+fi
 # Use the last two path components joined with '_' so the org is kept, e.g.
 #   /data/huggingface/hub/amd/GLM-5.1-MXFP4    -> amd_GLM-5.1-MXFP4
 #   /data/huggingface/hub/nvidia/GLM-5-NVFP4   -> nvidia_GLM-5-NVFP4
@@ -710,6 +748,14 @@ if [ -n "${PROF_STAGES_OVERRIDE:-}" ]; then
     PROF_CMD+=(--profile-stages "${_prof_stages[@]}")
 fi
 
+# bench_serving sends greedy requests by default. Agentic traffic samples with the
+# model's generation_config (GLM-5.3: temperature 1.0, top_p 0.95), and on ROCm that
+# takes the rejection-sampling draft/verify path, so BENCH_TEMPERATURE=1.0
+# BENCH_TOP_P=0.95 profiles the decode step Agentic actually runs.
+BENCH_SAMPLING_ARGS=()
+[ -n "${BENCH_TEMPERATURE:-}" ] && BENCH_SAMPLING_ARGS+=(--temperature "$BENCH_TEMPERATURE")
+[ -n "${BENCH_TOP_P:-}" ] && BENCH_SAMPLING_ARGS+=(--top-p "$BENCH_TOP_P")
+
 # Vendor tag inserted into profiler trace filenames (e.g. ..._p8-AMD-TP-0-...).
 # Auto-detect: AMD on ROCm, NV otherwise. Override with: VENDOR_TAG=AMD ./GLM.sh ...
 if [ -z "${VENDOR_TAG:-}" ]; then
@@ -758,7 +804,7 @@ DOCKER_FILENAME=$(echo "$DOCKER" | sed 's/\//_/g; s/:/-/g')
 # it apart from the agentic replay runs.
 # MTP stays in the path so an MTP run and its non-MTP twin can share a --tag
 # without overwriting each other.
-LEAF_TAG="${SPECIAL_TAG#-}-Fixed${MTP_TAG}${USER_TAG}"
+LEAF_TAG="${SPECIAL_TAG#-}-Fixed${MTP_TAG}${MONO_TAG}${GOLDEN_TAG}${USER_TAG}"
 LOG_DIR="$HOME/SGLang-benchmarks/results/${MODEL_NAME}/$DOCKER_FILENAME/${LEAF_TAG}"
 FINISH_LOG="$LOG_DIR/Finish.log"
 # Single continuous server log. Exported so log_command() can stamp a banner into
@@ -1114,12 +1160,50 @@ start_server() {
             *GLM-5.3*) _spec_steps=5; _spec_draft=6 ;;
             *)         _spec_steps=3; _spec_draft=4 ;;
         esac
+        _spec_steps="${SPEC_NUM_STEPS:-$_spec_steps}"
+        _spec_draft="${SPEC_DRAFT_TOKENS:-$_spec_draft}"
+        # [mono] One server per concurrency, so concurrencies holds exactly one value.
+        local _mono_on=0 _pair
+        if [ "$MONO_ENABLED" == "true" ]; then
+            for _pair in ${MONO_MTP_STEPS:-1:5 4:3 8:3}; do
+                if [ "${_pair%%:*}" = "${concurrencies[0]}" ]; then
+                    _mono_on=1
+                    _spec_steps="${_pair#*:}"
+                    _spec_draft=$((_spec_steps + 1))
+                fi
+            done
+        fi
         cmd+=(
             --speculative-algorithm EAGLE
-            --speculative-num-draft-tokens "${SPEC_DRAFT_TOKENS:-$_spec_draft}"
-            --speculative-num-steps "${SPEC_NUM_STEPS:-$_spec_steps}"
+            --speculative-num-draft-tokens "$_spec_draft"
+            --speculative-num-steps "$_spec_steps"
             --speculative-eagle-topk "${SPEC_TOPK:-1}"
         )
+        if [ "$_mono_on" -eq 1 ]; then
+            cmd+=(--enable-amd-monokernel)
+        fi
+        echo ">>> conc ${concurrencies[*]}: MTP${_spec_steps}, monokernel $([ "$_mono_on" -eq 1 ] && echo on || echo off)" | tee -a "$logfile"
+
+        # [golden-al]
+        if [ "$GOLDEN_AL_ENABLED" == "true" ]; then
+            local _al="${GOLDEN_AL:-}"
+            if [ -z "$_al" ]; then
+                _al=$(python3 - "${GOLDEN_AL_CURVE:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../Agentic/golden_al/glm5.3flash_mtp.yaml}" "$_spec_steps" <<'EOF'
+import sys, yaml
+[(model, modes)] = yaml.safe_load(open(sys.argv[1])).items()
+print(modes["thinking_on"][int(sys.argv[2])])
+EOF
+                ) || _al=""
+            fi
+            if [ -z "$_al" ]; then
+                echo "!!! ERROR: no golden AL for MTP${_spec_steps}; set GOLDEN_AL=<al>." | tee -a "$logfile"
+                exit 1
+            fi
+            export SGLANG_SIMULATE_ACC_LEN="$_al"
+            export SGLANG_SIMULATE_ACC_METHOD=match-expected
+            export SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token
+            echo ">>> golden AL ${_al} (SGLANG_SIMULATE_ACC_LEN)" | tee -a "$logfile"
+        fi
     fi
 
     if [ ${#EXTRA_SERVER_ARGS[@]} -gt 0 ]; then
@@ -1412,6 +1496,7 @@ run_benchmarks() {
                 --num-prompt "${num_prompts}"
                 --output-file /dev/null
                 --ready-check-timeout-sec "${READY_CHECK_TIMEOUT_SEC:-600}"
+                "${BENCH_SAMPLING_ARGS[@]}"
             )
             
             # Add profiling args
@@ -1461,6 +1546,7 @@ run_benchmarks() {
                         --max-concurrency "${c}" --num-prompt "${num_prompts}"
                         --output-file /dev/null
                         --ready-check-timeout-sec "${READY_CHECK_TIMEOUT_SEC:-600}"
+                        "${BENCH_SAMPLING_ARGS[@]}"
                     )
                     echo ">>> [warmup] JIT warmup for in${input_tokens}_out${output_tokens}_conc${c} (no --profile)"
                     local _warm_t0=$(date +%s) _warm_rc=0
@@ -1803,7 +1889,8 @@ for PROF_MODE in "${PROF_SERVER_MODES[@]}"; do
         # the scheduler reads SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS once at launch.
         # Costs one model load per concurrency. PROF_PER_CONC_SERVER=0 shares one
         # server as before; PROF_DECODE_MIN_BS=<n> pins the threshold, 0 turns it off.
-        if [ "$PROF_ENABLED" == "true" ] && [ "${PROF_PER_CONC_SERVER:-1}" == "1" ]; then
+        if { [ "$PROF_ENABLED" == "true" ] && [ "${PROF_PER_CONC_SERVER:-1}" == "1" ]; } \
+            || [ "$MONO_ENABLED" == "true" ]; then
             _per_conc=1
             _conc_sets=("${concurrencies[@]}")
         else
@@ -1830,7 +1917,7 @@ for PROF_MODE in "${PROF_SERVER_MODES[@]}"; do
                     continue
                 fi
 
-                if [ "$_per_conc" -eq 1 ]; then
+                if [ "$_per_conc" -eq 1 ] && [ "$PROF_ENABLED" == "true" ]; then
                     # A batch can never outgrow a --max-running-requests cap, so
                     # the threshold is the smaller of the two. The caller's
                     # SERVER_EXTRA_ARGS is checked last because it wins in argparse.
