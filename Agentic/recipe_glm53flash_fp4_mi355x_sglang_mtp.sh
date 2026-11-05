@@ -157,8 +157,7 @@ esac
 [ "$MAX_RUNNING_REQUESTS" -lt 8 ] && MAX_RUNNING_REQUESTS=8
 
 # --cuda-graph-max-bs-decode counts requests; the spec-decode graph runner
-# scales by --speculative-num-draft-tokens itself. Prefill graphs stay off:
-# SGLang disables them for KDA hybrid linear attention regardless.
+# scales by --speculative-num-draft-tokens itself.
 #
 # The decode graphs must cover max_running_requests. A decode batch wider than
 # the largest captured bs runs eager, and on MI355X the eager draft/verify path
@@ -239,6 +238,14 @@ SGLANG_CMD=(
     --mem-fraction-static "$MEM_FRACTION_STATIC"
     --max-running-requests "$MAX_RUNNING_REQUESTS"
     --cuda-graph-max-bs-decode "$CUDA_GRAPH_MAX_BS"
+    # Breakable prefill graphs (B200's default; ROCm defaults to none) cut a
+    # small extend on a cached prefix from ~100 to 40-55 ms, since eager it is
+    # bound by launching ~1,600 kernels. They only replay with an SGLang whose
+    # ROCm prefix gate sees DSA inside the hybrid KDA backend
+    # (glm53-1105-bcg-hybrid-dsa); without it they are captured (17.6 GB) and
+    # never used. Conc 64 on one node: total/GPU 75,203 vs 73,098, P90
+    # interactivity 58.9 vs 54.0; GSM8K 96.44%.
+    --cuda-graph-backend-prefill breakable
     --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 32}'
     "${CONTEXT_ARGS[@]}"
     "${MAMBA_ARGS[@]}"
