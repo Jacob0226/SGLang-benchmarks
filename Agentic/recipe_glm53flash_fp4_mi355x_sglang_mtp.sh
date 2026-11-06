@@ -246,6 +246,14 @@ SGLANG_CMD=(
     # never used. Conc 64 on one node: total/GPU 75,203 vs 73,098, P90
     # interactivity 58.9 vs 54.0; GSM8K 96.44%.
     --cuda-graph-backend-prefill breakable
+    # Graphs only up to 2,560 tokens. From ~3K new tokens an eager extend is
+    # already GPU-bound (95 ms GPU vs 88 ms CPU at 3,072), so a graph saves
+    # nothing there and its bucket padding costs 2-4 ms. Small extends on a
+    # cached 100K prefix match the better of graph and eager at every size;
+    # conc 64 on one node, run side by side: total/GPU 75,797 vs 75,353, P90
+    # interactivity 59.7 vs 59.1. B200 keeps every bucket: capped, its eager
+    # 3K-6K extends lose 30-70 ms.
+    --cuda-graph-max-bs-prefill 2560
     --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 32}'
     "${CONTEXT_ARGS[@]}"
     "${MAMBA_ARGS[@]}"
