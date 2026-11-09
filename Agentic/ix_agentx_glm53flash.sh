@@ -173,6 +173,7 @@ done
 USER_MEM_FRACTION="$MEM_FRACTION_STATIC"
 USER_CHUNK="$CHUNKED_PREFILL_SIZE"
 USER_MAMBA_RATIO="$MAMBA_FULL_MEMORY_RATIO"
+USER_MAMBA_SLOTS="$MAX_MAMBA_CACHE_SIZE"
 USER_HICACHE="$HICACHE_SIZE"
 case "$REPLAYSSM_MODE" in
     "") USER_REPLAYSSM="" ;;
@@ -266,15 +267,21 @@ case "$PLATFORM" in
         # situation with hicache-size.
         #
         # ReplaySSM (--enable-linear-replayssm-spec, see the recipe) at conc 16
-        # and 32 only. 3600 s, golden AL, base and ReplaySSM side by side on one
+        # to 64. 3600 s, golden AL, base and ReplaySSM side by side on one
         # host (dgx-021, v0.5.23), P90 interactivity:
         #   conc 16  229.6 -> 256.8 (+11.9%)    conc 32  142.3 -> 164.4 (+15.5%)
         #   conc 64   62.6 ->  58.1  (-7.3%), total/GPU -11.2%
         # At conc 64 the KV pool shrank from 7.21M to 5.47M tokens: under the
         # ratio split the memory the intermediate SSM cache no longer needs
-        # went to KDA slots (657 -> 1,065, peak use 228). The prefix hit rate
-        # fell from 95.2% to 94.2%, prefill grew 8%, and conc 64 here is
-        # prefill-bound.
+        # went to KDA slots (657 -> 1,065), each 13.4 MB heavier for the
+        # 16-token replay ring. The prefix hit rate fell from 95.2% to 94.2%,
+        # prefill grew 8%, and conc 64 here is prefill-bound.
+        # So conc 64 sets the slot count instead of a ratio: running requests
+        # hold 4 slots each (peak 300 at a decode batch of 75) and the rest
+        # keep the sessions' prefix states. 518 slots, same pairing (dgx-022):
+        #   P90 59.7 -> 59.3 (-0.7%)  P50 102.2 -> 120.6 (+18%)
+        #   total/GPU 88,669 -> 93,074 (+5.0%)  KV 7.21M -> 9.68M tokens
+        #   prefix hit 95.2% -> 95.0%  queue non-empty 15% -> 2% of steps
         # Decode cycles at matched batch sizes were equal or faster throughout.
         conc_defaults() {
             local c="$1"
@@ -288,10 +295,16 @@ case "$PLATFORM" in
                 MAMBA_FULL_MEMORY_RATIO="$USER_MAMBA_RATIO"
                 HICACHE_SIZE="${USER_HICACHE:-0}"
             fi
-            if [ "$c" -ge 16 ] && [ "$c" -le 32 ]; then
+            if [ "$c" -ge 16 ] && [ "$c" -le 64 ]; then
                 REPLAYSSM="${USER_REPLAYSSM:-1}"
             else
                 REPLAYSSM="${USER_REPLAYSSM:-0}"
+            fi
+            MAX_MAMBA_CACHE_SIZE="$USER_MAMBA_SLOTS"
+            if [ "$c" -eq 64 ] && [ "$REPLAYSSM" = 1 ] && [ "$SPEC_DECODING" = mtp ] \
+                && [ -z "$USER_MAMBA_SLOTS" ] && [ -z "$USER_MAMBA_RATIO" ]; then
+                MAX_MAMBA_CACHE_SIZE=518
+                MAMBA_FULL_MEMORY_RATIO=""
             fi
         }
         gpu_count() { nvidia-smi --query-gpu=index --format=csv,noheader | wc -l; }
@@ -646,15 +659,15 @@ if [ "$DRY_RUN" = "1" ]; then
     # The per-concurrency resolvers live inside the sweep loop, so a dry run
     # has to walk the same list or it prints nothing useful.
     echo "--- resolved per concurrency ---"
-    printf '%6s %14s %8s %12s %10s %10s %10s\n' conc mem_fraction chunk mamba_ratio kv hicache replayssm
+    printf '%6s %14s %8s %12s %12s %10s %10s %10s\n' conc mem_fraction chunk mamba_ratio mamba_slots kv hicache replayssm
     for CONC in $CONC_LIST; do
         conc_defaults "$CONC"
         resolve_replayssm
-        export CONC MEM_FRACTION_STATIC CHUNKED_PREFILL_SIZE
+        export CONC MEM_FRACTION_STATIC CHUNKED_PREFILL_SIZE MAX_MAMBA_CACHE_SIZE
         [ -n "$MAMBA_FULL_MEMORY_RATIO" ] && export MAMBA_FULL_MEMORY_RATIO
         resolve_kv_tier
-        printf '%6s %14s %8s %12s %10s %10s %10s\n' "$CONC" "$MEM_FRACTION_STATIC" \
-            "$CHUNKED_PREFILL_SIZE" "${MAMBA_FULL_MEMORY_RATIO:-default}" \
+        printf '%6s %14s %8s %12s %12s %10s %10s %10s\n' "$CONC" "$MEM_FRACTION_STATIC" \
+            "$CHUNKED_PREFILL_SIZE" "${MAMBA_FULL_MEMORY_RATIO:-default}" "${MAX_MAMBA_CACHE_SIZE:-ratio}" \
             "$KV_OFFLOADING" "$HICACHE_SIZE" "$REPLAYSSM"
     done
     echo
@@ -691,7 +704,7 @@ for CONC in $CONC_LIST; do
     export CONC
     conc_defaults "$CONC"
     resolve_replayssm
-    export MEM_FRACTION_STATIC CHUNKED_PREFILL_SIZE
+    export MEM_FRACTION_STATIC CHUNKED_PREFILL_SIZE MAX_MAMBA_CACHE_SIZE
     [ -n "$MAMBA_FULL_MEMORY_RATIO" ] && export MAMBA_FULL_MEMORY_RATIO
     resolve_kv_tier
     export EXP_NAME="glm5.3flash_tp${TP}_conc${CONC}_kv${KV_OFFLOADING}_spec-${SPEC_DECODING}"
@@ -721,7 +734,7 @@ for CONC in $CONC_LIST; do
         sleep 15
     done
 
-    echo ">>> $(date -Is) starting conc=$CONC port=$PORT mem_fraction=$MEM_FRACTION_STATIC chunk=$CHUNKED_PREFILL_SIZE mamba_ratio=${MAMBA_FULL_MEMORY_RATIO:-default} kv=$KV_OFFLOADING hicache=$HICACHE_SIZE replayssm=$REPLAYSSM numa_balancing=$(numa_balancing_state)" | tee -a "$SWEEP_LOG"
+    echo ">>> $(date -Is) starting conc=$CONC port=$PORT mem_fraction=$MEM_FRACTION_STATIC chunk=$CHUNKED_PREFILL_SIZE mamba_ratio=${MAMBA_FULL_MEMORY_RATIO:-default} mamba_slots=${MAX_MAMBA_CACHE_SIZE:-ratio} kv=$KV_OFFLOADING hicache=$HICACHE_SIZE replayssm=$REPLAYSSM numa_balancing=$(numa_balancing_state)" | tee -a "$SWEEP_LOG"
     echo "    -> $RESULT_DIR" | tee -a "$SWEEP_LOG"
     bash "$RECIPE" > "$RESULT_DIR/recipe.log" 2>&1
     rc=$?
