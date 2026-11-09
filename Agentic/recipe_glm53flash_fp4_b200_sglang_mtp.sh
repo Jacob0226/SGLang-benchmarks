@@ -187,6 +187,16 @@ MAMBA_ARGS=()
 [ -n "${MAMBA_FULL_MEMORY_RATIO:-}" ] && MAMBA_ARGS+=(--mamba-full-memory-ratio "$MAMBA_FULL_MEMORY_RATIO")
 [ -n "${MAX_MAMBA_CACHE_SIZE:-}" ] && MAMBA_ARGS+=(--max-mamba-cache-size "$MAX_MAMBA_CACHE_SIZE")
 
+# ReplaySSM MTP verify. Instead of an fp32 KDA state snapshot per draft token,
+# verify records the drafts' raw k / v / gate / beta in a ring and, once the
+# accepted length is known, folds only the accepted prefix into the checkpoint.
+# That drops the intermediate SSM cache (6.6 GB/rank at conc 16) and the
+# per-draft state writes. It needs topk 1 and a KDA verify kernel that writes
+# the ring (nv_cutedsl here) and forces --mamba-ssm-dtype float32, which is
+# already what this model resolves to. The driver picks it per concurrency.
+REPLAY_ARGS=()
+[ "${REPLAYSSM:-0}" = 1 ] && REPLAY_ARGS=(--enable-linear-replayssm-spec)
+
 export PYTHONNOUSERSITE=1
 export TORCH_CUDA_ARCH_LIST=10.0
 # Agentic warmup dispatches hundreds of long prompts at once; allow up to 15
@@ -243,6 +253,7 @@ SGLANG_CMD=(
     "${CONTEXT_ARGS[@]}"
     "${MAMBA_ARGS[@]}"
     "${SPEC_ARGS[@]}"
+    "${REPLAY_ARGS[@]}"
     "${CACHE_ARGS[@]}"
     --watchdog-timeout 1800
     --enable-metrics

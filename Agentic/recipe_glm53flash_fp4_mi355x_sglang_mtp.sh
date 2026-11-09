@@ -184,6 +184,11 @@ MAMBA_ARGS=()
 [ -n "${MAMBA_FULL_MEMORY_RATIO:-}" ] && MAMBA_ARGS+=(--mamba-full-memory-ratio "$MAMBA_FULL_MEMORY_RATIO")
 [ -n "${MAX_MAMBA_CACHE_SIZE:-}" ] && MAMBA_ARGS+=(--max-mamba-cache-size "$MAX_MAMBA_CACHE_SIZE")
 
+# ReplaySSM MTP verify; see the B200 recipe. On ROCm the KDA verify kernel that
+# writes the ring is triton, which extra_buffer already requires here.
+REPLAY_ARGS=()
+[ "${REPLAYSSM:-0}" = 1 ] && REPLAY_ARGS=(--enable-linear-replayssm-spec)
+
 export PYTHONNOUSERSITE=1
 # Agentic warmup dispatches hundreds of long prompts at once; allow up to 15
 # minutes of TCP progress before AIPerf calls a connection dead, and keep
@@ -258,6 +263,7 @@ SGLANG_CMD=(
     "${CONTEXT_ARGS[@]}"
     "${MAMBA_ARGS[@]}"
     "${SPEC_ARGS[@]}"
+    "${REPLAY_ARGS[@]}"
     "${CACHE_ARGS[@]}"
     --watchdog-timeout 1800
     --enable-metrics

@@ -31,10 +31,11 @@
 #   ./ix_agentx_glm53flash.sh --dsa-backend triton # MI355X sparse attention A/B
 #   ./ix_agentx_glm53flash.sh --dsa-backend triton --conc 128 --dcp 4 \
 #       --env PYTHONPATH=<dcp branch>/python      # MI355X conc 128 (DCP4)
+#   ./ix_agentx_glm53flash.sh --replayssm off      # ReplaySSM A/B (default is per conc)
 #   ./ix_agentx_glm53flash.sh --dry-run            # print the env and exit
 set -uo pipefail
 
-usage() { sed -n '2,34p' "$0"; exit 1; }
+usage() { sed -n '2,35p' "$0"; exit 1; }
 
 # Tear down only the server this sweep started. A bare
 # `pkill -f sglang.launch_server` also kills a second sweep running on the
@@ -113,6 +114,8 @@ CONTEXT_LENGTH=""
 MAMBA_FULL_MEMORY_RATIO=""
 MAX_MAMBA_CACHE_SIZE=""
 CUDA_GRAPH_MAX_BS_CAP=""
+# on | off; empty takes the per-concurrency table in the platform block.
+REPLAYSSM_MODE=""
 DSA_BACKEND=""
 EXTRA_SERVER_ARGS=""
 TARGET_ONLY_VERIFY=0
@@ -149,6 +152,7 @@ while [[ $# -gt 0 ]]; do
         --mamba-ratio)       MAMBA_FULL_MEMORY_RATIO="$2"; shift 2 ;;
         --max-mamba-cache-size) MAX_MAMBA_CACHE_SIZE="$2"; shift 2 ;;
         --cuda-graph-max-bs)    CUDA_GRAPH_MAX_BS_CAP="$2"; shift 2 ;;
+        --replayssm)            REPLAYSSM_MODE="$2"; shift 2 ;;
         --dsa-backend)          DSA_BACKEND="$2"; shift 2 ;;
         --server-arg)           EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS} $2"; shift 2 ;;
         --target-only-verify)   TARGET_ONLY_VERIFY=1; shift ;;
@@ -170,6 +174,12 @@ USER_MEM_FRACTION="$MEM_FRACTION_STATIC"
 USER_CHUNK="$CHUNKED_PREFILL_SIZE"
 USER_MAMBA_RATIO="$MAMBA_FULL_MEMORY_RATIO"
 USER_HICACHE="$HICACHE_SIZE"
+case "$REPLAYSSM_MODE" in
+    "") USER_REPLAYSSM="" ;;
+    on) USER_REPLAYSSM=1 ;;
+    off) USER_REPLAYSSM=0 ;;
+    *) echo "--replayssm must be on or off, got $REPLAYSSM_MODE" >&2; exit 1 ;;
+esac
 case "$HICACHE_IO" in
     ""|direct|kernel) ;;
     *) echo "--hicache-io must be direct or kernel, got $HICACHE_IO" >&2; exit 1 ;;
@@ -254,6 +264,18 @@ case "$PLATFORM" in
         # because the pool is finally under pressure. Per-concurrency tables
         # are how upstream's glm5.2_fp4_b200_sglang_mtp.sh handles the same
         # situation with hicache-size.
+        #
+        # ReplaySSM (--enable-linear-replayssm-spec, see the recipe) at conc 16
+        # and 32 only. 3600 s, golden AL, base and ReplaySSM side by side on one
+        # host (dgx-021, v0.5.23), P90 interactivity:
+        #   conc 16  229.6 -> 256.8 (+11.9%)    conc 32  142.3 -> 164.4 (+15.5%)
+        #   conc 64   62.6 ->  58.1  (-7.3%), total/GPU -11.2%
+        # At conc 64 the KV pool shrank from 7.21M to 5.47M tokens: under the
+        # ratio split the memory the intermediate SSM cache no longer needs
+        # went to KDA slots (657 -> 1,065, peak use 228). The prefix hit rate
+        # fell from 95.2% to 94.2%, prefill grew 8%, and conc 64 here is
+        # prefill-bound.
+        # Decode cycles at matched batch sizes were equal or faster throughout.
         conc_defaults() {
             local c="$1"
             MEM_FRACTION_STATIC="${USER_MEM_FRACTION:-0.75}"
@@ -265,6 +287,11 @@ case "$PLATFORM" in
                 CHUNKED_PREFILL_SIZE="${USER_CHUNK:-8192}"
                 MAMBA_FULL_MEMORY_RATIO="$USER_MAMBA_RATIO"
                 HICACHE_SIZE="${USER_HICACHE:-0}"
+            fi
+            if [ "$c" -ge 16 ] && [ "$c" -le 32 ]; then
+                REPLAYSSM="${USER_REPLAYSSM:-1}"
+            else
+                REPLAYSSM="${USER_REPLAYSSM:-0}"
             fi
         }
         gpu_count() { nvidia-smi --query-gpu=index --format=csv,noheader | wc -l; }
@@ -314,6 +341,16 @@ case "$PLATFORM" in
         # KDA state pool (mamba 1.0 from conc 64), and mf 0.80 keeps ~24 GB
         # free after graph capture for the 192-wide MTP buffers. At conc 64
         # DCP4 only ties TP4 (+1.7% tok/s/GPU): the cache is not the wall yet.
+        #
+        # ReplaySSM (see the recipe) at conc 16-64 on TP4. 3600 s, golden AL,
+        # triton DSA, 1106 image + PR stack, base and ReplaySSM side by side on
+        # one node, P90 interactivity (conc 16/32 mean of two runs):
+        #   conc 16 220.6 -> 225.7 (+2.3%)   conc 32 138.0 -> 145.2 (+5.2%)
+        #   conc 64  58.6 ->  64.3 (+9.7%), total/GPU +4.7%
+        # Unlike B200 the prefix hit rate held at conc 64 (95.0% vs 95.3%): the
+        # KV pool fell from 23.8M to 20.8M tokens, still 3x B200's. Those runs
+        # also carried the decode kernel changes in glm53-1108-agentic-opt;
+        # without ReplaySSM those alone moved quick-mode P90 by -2% to +1%.
         conc_defaults() {
             local c="$1"
             MEM_FRACTION_STATIC="${USER_MEM_FRACTION:-0.85}"
@@ -328,6 +365,11 @@ case "$PLATFORM" in
             if [ "$DCP" -gt 1 ] && [ "$c" -ge 64 ]; then
                 MAMBA_FULL_MEMORY_RATIO="${USER_MAMBA_RATIO:-1.0}"
                 [ "$c" -ge 128 ] && MEM_FRACTION_STATIC="${USER_MEM_FRACTION:-0.80}"
+            fi
+            if [ "$c" -ge 16 ] && [ "$c" -le 64 ] && [ "$DCP" -eq 1 ]; then
+                REPLAYSSM="${USER_REPLAYSSM:-1}"
+            else
+                REPLAYSSM="${USER_REPLAYSSM:-0}"
             fi
             return 0
         }
@@ -477,6 +519,13 @@ else
     export MAX_MODEL_LEN=0          # native 1,048,576
 fi
 
+# ReplaySSM rewrites how MTP verify keeps KDA state, so it has nothing to do
+# without speculative decoding.
+resolve_replayssm() {
+    [ "$SPEC_DECODING" = none ] && REPLAYSSM=0
+    export REPLAYSSM
+}
+
 # KV tier, resolved per concurrency because conc_defaults sets HICACHE_SIZE
 # from a per-conc table. The threshold differs by chip: B200 turns the host
 # tier on at conc 32, MI355X only at conc 64.
@@ -586,7 +635,7 @@ SWEEP_LOG="$ROOT/sweep.log"
     echo "=== $(date -Is) GLM-5.3-Flash AgentX platform=$PLATFORM model=$MODEL_ID ==="
     echo "tag=$TAG tp=$TP ep=$EP dcp=$DCP spec=$SPEC_DECODING steps=$MTP_STEPS acc=$ACC_MODE${GOLDEN_AL:+($GOLDEN_AL)} dsa=${DSA_BACKEND:-recipe}"
     echo "mem_fraction=${USER_MEM_FRACTION:-per-conc} chunked_prefill=${USER_CHUNK:-per-conc} context=${CONTEXT_LENGTH:-native-1M}"
-    echo "hicache_size=${USER_HICACHE:-per-conc} hicache_io=${HICACHE_IO:-kernel} mamba_ratio=${USER_MAMBA_RATIO:-per-conc}"
+    echo "hicache_size=${USER_HICACHE:-per-conc} hicache_io=${HICACHE_IO:-kernel} mamba_ratio=${USER_MAMBA_RATIO:-per-conc} replayssm=${REPLAYSSM_MODE:-per-conc}"
     echo "duration=$DURATION conc=($CONC_LIST) gpus=${!VISIBLE_VAR:-all}"
     echo "ix=$IX@$(git -C "$IX" rev-parse --short HEAD 2>/dev/null) image=$DOCKER"
     echo "root=$ROOT"
@@ -597,19 +646,20 @@ if [ "$DRY_RUN" = "1" ]; then
     # The per-concurrency resolvers live inside the sweep loop, so a dry run
     # has to walk the same list or it prints nothing useful.
     echo "--- resolved per concurrency ---"
-    printf '%6s %14s %8s %12s %10s %10s\n' conc mem_fraction chunk mamba_ratio kv hicache
+    printf '%6s %14s %8s %12s %10s %10s %10s\n' conc mem_fraction chunk mamba_ratio kv hicache replayssm
     for CONC in $CONC_LIST; do
         conc_defaults "$CONC"
+        resolve_replayssm
         export CONC MEM_FRACTION_STATIC CHUNKED_PREFILL_SIZE
         [ -n "$MAMBA_FULL_MEMORY_RATIO" ] && export MAMBA_FULL_MEMORY_RATIO
         resolve_kv_tier
-        printf '%6s %14s %8s %12s %10s %10s\n' "$CONC" "$MEM_FRACTION_STATIC" \
+        printf '%6s %14s %8s %12s %10s %10s %10s\n' "$CONC" "$MEM_FRACTION_STATIC" \
             "$CHUNKED_PREFILL_SIZE" "${MAMBA_FULL_MEMORY_RATIO:-default}" \
-            "$KV_OFFLOADING" "$HICACHE_SIZE"
+            "$KV_OFFLOADING" "$HICACHE_SIZE" "$REPLAYSSM"
     done
     echo
     echo "--- recipe env (dry run, last concurrency) ---"
-    env | grep -E '^(MODEL|TP|EP_SIZE|PP_SIZE|DCP_SIZE|PCP_SIZE|DP_ATTENTION|SPEC_|ACC_MODE|GOLDEN_AL|KV_|HICACHE|TOTAL_CPU_DRAM_GB|MAX_MODEL_LEN|CONTEXT_LENGTH|MAMBA_|MAX_MAMBA|CUDA_GRAPH|DSA_BACKEND|MEM_FRACTION|CHUNKED_|AIPERF_|AGENTIC_|INFMAX_|RUNNER_TYPE|PRECISION|FRAMEWORK|SCENARIO_|DURATION|ENABLE_AGENTX_POWER|REQUIRE_POWER|IS_MULTINODE|DISAGG|EVAL_ONLY|IMAGE|HF_HUB_CACHE|EXTRA_SERVER_ARGS)' | sort
+    env | grep -E '^(MODEL|TP|EP_SIZE|PP_SIZE|DCP_SIZE|PCP_SIZE|DP_ATTENTION|SPEC_|ACC_MODE|GOLDEN_AL|KV_|HICACHE|TOTAL_CPU_DRAM_GB|MAX_MODEL_LEN|CONTEXT_LENGTH|MAMBA_|MAX_MAMBA|CUDA_GRAPH|DSA_BACKEND|REPLAYSSM|MEM_FRACTION|CHUNKED_|AIPERF_|AGENTIC_|INFMAX_|RUNNER_TYPE|PRECISION|FRAMEWORK|SCENARIO_|DURATION|ENABLE_AGENTX_POWER|REQUIRE_POWER|IS_MULTINODE|DISAGG|EVAL_ONLY|IMAGE|HF_HUB_CACHE|EXTRA_SERVER_ARGS)' | sort
     exit 0
 fi
 
@@ -640,6 +690,7 @@ fi
 for CONC in $CONC_LIST; do
     export CONC
     conc_defaults "$CONC"
+    resolve_replayssm
     export MEM_FRACTION_STATIC CHUNKED_PREFILL_SIZE
     [ -n "$MAMBA_FULL_MEMORY_RATIO" ] && export MAMBA_FULL_MEMORY_RATIO
     resolve_kv_tier
@@ -670,7 +721,7 @@ for CONC in $CONC_LIST; do
         sleep 15
     done
 
-    echo ">>> $(date -Is) starting conc=$CONC port=$PORT mem_fraction=$MEM_FRACTION_STATIC chunk=$CHUNKED_PREFILL_SIZE mamba_ratio=${MAMBA_FULL_MEMORY_RATIO:-default} kv=$KV_OFFLOADING hicache=$HICACHE_SIZE numa_balancing=$(numa_balancing_state)" | tee -a "$SWEEP_LOG"
+    echo ">>> $(date -Is) starting conc=$CONC port=$PORT mem_fraction=$MEM_FRACTION_STATIC chunk=$CHUNKED_PREFILL_SIZE mamba_ratio=${MAMBA_FULL_MEMORY_RATIO:-default} kv=$KV_OFFLOADING hicache=$HICACHE_SIZE replayssm=$REPLAYSSM numa_balancing=$(numa_balancing_state)" | tee -a "$SWEEP_LOG"
     echo "    -> $RESULT_DIR" | tee -a "$SWEEP_LOG"
     bash "$RECIPE" > "$RESULT_DIR/recipe.log" 2>&1
     rc=$?
