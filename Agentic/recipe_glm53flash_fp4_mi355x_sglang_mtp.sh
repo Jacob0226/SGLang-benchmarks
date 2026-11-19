@@ -183,6 +183,13 @@ fi
 MAMBA_ARGS=()
 [ -n "${MAMBA_FULL_MEMORY_RATIO:-}" ] && MAMBA_ARGS+=(--mamba-full-memory-ratio "$MAMBA_FULL_MEMORY_RATIO")
 [ -n "${MAX_MAMBA_CACHE_SIZE:-}" ] && MAMBA_ARGS+=(--max-mamba-cache-size "$MAX_MAMBA_CACHE_SIZE")
+# KDA state pool in BF16 (SGLang reads FP32 from the checkpoint otherwise): half the
+# state traffic per decode and verify step. Measured on the 20261106 image + PR stack,
+# P90 interactivity vs FP32: conc 1 / 4 / 8 +3.4% / +8.1% / +5.9% (monokernel),
+# conc 32 +3.0%, conc 64 +6.1%. It needs sglang#49036 for the HIP prefill (Triton
+# otherwise) and sgl-amd-mono#141 for the monokernel, which turns itself off on a
+# BF16 state without it. MAMBA_SSM_DTYPE=float32 for an image that has neither.
+MAMBA_ARGS+=(--mamba-ssm-dtype "${MAMBA_SSM_DTYPE:-bfloat16}")
 
 # Where the radix cache keeps KDA state checkpoints. A cached prefix is only
 # reusable up to a position that also has a state checkpoint. sglang#49886

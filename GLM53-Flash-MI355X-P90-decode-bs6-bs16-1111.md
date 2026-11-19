@@ -1637,3 +1637,48 @@ PR B 的四個部分（+446 / −26，含 3 個測試檔）：
 - fixed-length：`results/amd_GLM-5.3-Flash-Quark-MXFP4/rocm_sgl-dev-v0.5.23-rocm10-mi35x-202611{06,15}/{bench,prof}-Fixed-MTP-GoldenAL-prefill1119-{pgoff,bcg}/`。
 - AgentX：`/shared_nfs/jacchang/agentic_1119_ckpt/{l2,l3}/`。
 - 工具：`tools/prefill_reg_lane_1119.sh`（fixed-length lane）、`tools/agentx_ckpt_level_1119.sh`（AgentX l2 / l3）、`trace_analysis/diagnostics/extend_step_compare.py`。
+
+### 17.11 11/19：1118 image 的 AgentX，stock 對 stock + PR stack
+
+撰寫：2026-11-19（台灣時間）。node 152，`rocm/sgl-dev:v0.5.23-rocm10-mi35x-20261118`（sglang `3a41a59919`、aiter `581579ab5`、sgl-amd-mono `a04ceab`），兩條 lane 同時跑：stock 在 GPU 0–3，PR stack 在 GPU 4–7。每個 conc 3600 s，checkpoint level 3（第 17.10 節），設定照第 17.7.0 節：conc1 MTP5 + monokernel，conc4 / 8 MTP3 + monokernel，conc16–64 MTP5、不開 monokernel、ReplaySSM 開，conc64 HiCache 216 GB/rank、mamba ratio 0.5。
+
+**結論：PR stack 每個 conc 都贏，P90 Int +7.7%（conc1）到 +76%（conc32）；conc 越高差越多。**
+
+| conc | stock P90 Int | PR stack P90 Int | 差 | stock / PR TTFT p90 (ms) | stock / PR ITL p50 (ms) | 11/13 PR stack + BF16（20261106 image） |
+|---|---|---|---|---|---|---|
+| 1 | 421.7 | 454.0 | +7.7% | 498 / 422 | 2.18 / 2.02 | 463.8 |
+| 4 | 390.9 | 438.2 | +12.1% | 388 / 369 | 1.87 / 1.71 | 449.5 |
+| 8 | 288.2 | 336.5 | +16.8% | 430 / 386 | 2.30 / 2.02 | 346.2 |
+| 16 | 173.8 | 253.5 | +45.9% | 676 / 551 | 4.04 / 2.88 | 244.0 |
+| 32 | 90.5 | 159.6 | +76.4% | 1563 / 718 | 5.98 / 3.81 | 157.8 |
+| 64 | 44.2 | 68.6 | +55.2% | 1297 / 1043 | 13.77 / 8.95 | 70.9 |
+
+- 每 GPU total throughput：conc32 48,821 → 59,862（+22.6%），conc64 76,225 → 95,747（+25.6%）。
+- accept len 兩邊都在 golden 附近（MTP5 3.55–3.59、MTP3 2.98–3.00）。PR stack 的 GSM8K 96.89%（sgl-eval，1319 題、thinking、4096 tokens、temperature 1.0），門檻 95.5%。
+- **跟 11/13 比**：conc1 / 4 / 8 低 2.1% / 2.5% / 2.8%，conc16 / 32 高 3.9% / 1.1%，conc64 低 3.2%。conc1 / 4 的 ITL 跟 11/13 一樣（2.0 / 1.7 ms），prefix 命中率也一樣（conc4 97.5% vs 97.4%），但 TTFT p90 長 13% / 7%（422 vs 375、369 vs 346 ms），所以低 conc 的差距出在 prefill，不是 decode。還沒定位是 1118 image 還是 stack v2 的哪一部分，下一步用 fixed-length prefill 比 1106 / 1118。
+
+**兩條 lane 的設定**
+
+| | stock | stock + PR stack |
+|---|---|---|
+| sglang | image 的 `3a41a59919` | stack v2 `407f8a0c64`（`~/PR/wt-glm53-1119-prstack-img1118-v2`，`PYTHONPATH` 指過去） |
+| sgl-amd-mono | image 的 `a04ceab` | `a4d961c`（`a04ceab` + mono#141） |
+| aiter | image | image + aiter#8006 的 CSV |
+| KDA state | FP32（`a04ceab` 的 monokernel 不接受 BF16 state） | BF16 |
+| DSA / KV（conc16–64） | TileLang / BF16 | Triton / FP8 e4m3 |
+| env | — | `SGLANG_OPT_GLM53_KDA_PTPC_MODULES=qkv_proj,f_a_proj,g_a_proj,o_proj` |
+
+- stack v2 是 `3a41a59919` 上一個 PR 一個 commit：#48806（完整 PR diff，含 #41615 和 `a959ff4ef9`）、#41871、#38764、#44416、#44417、#46808、#44659、#48875、#49036（只取自己的 `ea980f38a9`）、#51126、#51127、#51128。#44415 的 diff 已經在 tree 裡。**不含 #44661**（double Hadamard）。#47336、#48303 使用者決定不疊。
+- 解衝突：#48806 拿掉 #51000 的 `dsa_backend_hip` DCP hook（image 沒有 #51000），保留 `_use_aiter_sparse_mla` dispatch；#38764 跟 main 的 CUDA fused KDA decode `fused_onorm` 兩邊都留；#48875 取 PR 那邊的 `full_attn_backend` unwrap；#51126 拿掉 #51000 的 `_hip_chain_verify_fn` block。
+
+**中途的狀況**：17:37 管理員把 149–152、247、250 drain 掉做 ansible upgrade，hold job 290402 被 SIGTERM。container 沒停，conc4 / 8 跑完，但 host 上的 driver 被殺，conc16–64 沒接著開。18:30 node 回到 IDLE 後重新 hold（job 298870，到 24:00），conc16–64 用 `docker exec -d` 在 container 裡重跑，設定不變。以後在 container 裡跑長 benchmark 都用 `docker exec -d`，hold job 被殺也不會中斷。
+
+**改了什麼**
+
+- `Agentic/recipe_glm53flash_fp4_mi355x_sglang_mtp.sh`：預設 `--mamba-ssm-dtype "${MAMBA_SSM_DTYPE:-bfloat16}"`。之前沒有這個 flag，SGLang 照 checkpoint 用 FP32。沒有 sglang#49036 和 mono#141 的 image（例如 stock 1118）要設 `MAMBA_SSM_DTYPE=float32`，否則 monokernel 會關掉、HIP prefill 會退回 Triton。
+
+**檔案與環境**
+
+- node 152：container `jacchang_stock1118`、`jacchang_pr1118`（`tools/mk_img1118_1119.sh` 建立，PR container 套了 aiter#8006）。
+- 結果：`/shared_nfs/jacchang/agentx_1119_img1118/{stock-statefp32,pr-statebf16}/results/`，GSM8K 在 `gsm8k_pr/`。
+- 工具：`tools/agentx_img1118_1119.sh`（一組 conc）、`tools/gsm8k_img1118_1119.sh`（GSM8K gate）、`tools/driver_img1118_1119.sh`（stock 直接跑；PR 先 GSM8K 再跑）。
