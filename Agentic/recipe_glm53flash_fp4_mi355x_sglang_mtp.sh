@@ -184,6 +184,25 @@ MAMBA_ARGS=()
 [ -n "${MAMBA_FULL_MEMORY_RATIO:-}" ] && MAMBA_ARGS+=(--mamba-full-memory-ratio "$MAMBA_FULL_MEMORY_RATIO")
 [ -n "${MAX_MAMBA_CACHE_SIZE:-}" ] && MAMBA_ARGS+=(--max-mamba-cache-size "$MAX_MAMBA_CACHE_SIZE")
 
+# Where the radix cache keeps KDA state checkpoints. A cached prefix is only
+# reusable up to a position that also has a state checkpoint. sglang#49886
+# (first in the 20261115 image) added --hybrid-cache-checkpoints-level and
+# defaults it to 2: checkpoints only at fork points and request ends, soft cap
+# one per path. Level 3 keeps one every prefill chunk and every
+# --mamba-track-interval tokens with no cap, which is what every image before
+# it did. On this lane level 2 is a regression, measured 2026-11-19 on the
+# 20261115 image, conc 8, MTP3, 3600s, no HiCache:
+#   level 2: prefix hit 94.47%, 13.39M prefill tokens, TTFT p90 0.688s, P90 int 262.3
+#   level 3: prefix hit 96.59%,  8.27M prefill tokens, TTFT p90 0.461s, P90 int 285.1
+#   (20261106 image: 96.59%, 8.26M, 0.418s, 293.9)
+# The flag is only passed when the server knows it; older images already
+# behave like level 3. HYBRID_CACHE_CHECKPOINTS_LEVEL=2 to measure the default.
+HYBRID_CKPT_ARGS=()
+_launch_help=$(python3 -m sglang.launch_server --help 2>&1 || true)
+if grep -q -- "--hybrid-cache-checkpoints-level" <<< "$_launch_help"; then
+    HYBRID_CKPT_ARGS=(--hybrid-cache-checkpoints-level "${HYBRID_CACHE_CHECKPOINTS_LEVEL:-3}")
+fi
+
 # ReplaySSM MTP verify; see the B200 recipe. On ROCm the KDA verify kernel that
 # writes the ring is triton, which extra_buffer already requires here.
 REPLAY_ARGS=()
@@ -262,6 +281,7 @@ SGLANG_CMD=(
     --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 32}'
     "${CONTEXT_ARGS[@]}"
     "${MAMBA_ARGS[@]}"
+    "${HYBRID_CKPT_ARGS[@]}"
     "${SPEC_ARGS[@]}"
     "${REPLAY_ARGS[@]}"
     "${CACHE_ARGS[@]}"

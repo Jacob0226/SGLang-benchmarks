@@ -187,6 +187,25 @@ MAMBA_ARGS=()
 [ -n "${MAMBA_FULL_MEMORY_RATIO:-}" ] && MAMBA_ARGS+=(--mamba-full-memory-ratio "$MAMBA_FULL_MEMORY_RATIO")
 [ -n "${MAX_MAMBA_CACHE_SIZE:-}" ] && MAMBA_ARGS+=(--max-mamba-cache-size "$MAX_MAMBA_CACHE_SIZE")
 
+# Where the radix cache keeps KDA state checkpoints. A cached prefix is only
+# reusable up to a position that also has a state checkpoint. sglang#49886
+# (merged 2026-11-13) added --hybrid-cache-checkpoints-level and defaults it
+# to 2: checkpoints only at fork points and request ends, soft cap one per
+# path. Level 3 keeps one every prefill chunk and every --mamba-track-interval
+# tokens with no cap, which is what every build before it did, including the
+# B200 curves recorded so far. Level 3 is pinned on both chips so the
+# comparison does not hinge on the image date. Measured on the MI355X lane
+# (see its recipe): level 2 dropped the prefix hit 96.6% -> 94.5%, re-prefilled
+# 62% more tokens and cost 8% of P90 interactivity at conc 8. Not measured on
+# B200 yet; #49886's own B300 numbers favour level 2 only against level 3 with
+# a cap of one, with HiCache on. The flag is only passed when the server knows
+# it. HYBRID_CACHE_CHECKPOINTS_LEVEL=2 to measure the default.
+HYBRID_CKPT_ARGS=()
+_launch_help=$(python3 -m sglang.launch_server --help 2>&1 || true)
+if grep -q -- "--hybrid-cache-checkpoints-level" <<< "$_launch_help"; then
+    HYBRID_CKPT_ARGS=(--hybrid-cache-checkpoints-level "${HYBRID_CACHE_CHECKPOINTS_LEVEL:-3}")
+fi
+
 # ReplaySSM MTP verify. Instead of an fp32 KDA state snapshot per draft token,
 # verify records the drafts' raw k / v / gate / beta in a ring and, once the
 # accepted length is known, folds only the accepted prefix into the checkpoint.
@@ -252,6 +271,7 @@ SGLANG_CMD=(
     --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 32}'
     "${CONTEXT_ARGS[@]}"
     "${MAMBA_ARGS[@]}"
+    "${HYBRID_CKPT_ARGS[@]}"
     "${SPEC_ARGS[@]}"
     "${REPLAY_ARGS[@]}"
     "${CACHE_ARGS[@]}"

@@ -732,6 +732,16 @@ else
     PROF_CMD=(--profile --profile-num-steps "${PROF_NUM_STEPS:-4}" --profile-by-stage)
     COMBINED_SUFFIX=""
 fi
+# /start_profile is admin-only (ADMIN_FORCE) on builds whose bench client sends
+# SGLANG_ADMIN_API_KEY (first seen in the 20261115 ROCm image). Without a matching
+# --admin-api-key every profile request is a 403 and the cell ends with no trace.
+# Older builds neither gate the route nor send the key, so they get no key at all.
+PROF_ADMIN_ARGS=()
+if [ "$PROF_ENABLED" == "true" ] \
+    && python3 -c "from sglang.srt.utils.auth import admin_auth_headers" >/dev/null 2>&1; then
+    export SGLANG_ADMIN_API_KEY="${SGLANG_ADMIN_API_KEY:-glm-sh-profile}"
+    PROF_ADMIN_ARGS=(--admin-api-key "$SGLANG_ADMIN_API_KEY")
+fi
 # Optional: pass --profile-stages to restrict which stages profile-by-stage
 # captures, e.g. PROF_STAGES_OVERRIDE="decode".
 # WARNING: the 0714 ROCm image (v0.5.15.post1) IGNORES --profile-stages -- its
@@ -755,6 +765,14 @@ fi
 BENCH_SAMPLING_ARGS=()
 [ -n "${BENCH_TEMPERATURE:-}" ] && BENCH_SAMPLING_ARGS+=(--temperature "$BENCH_TEMPERATURE")
 [ -n "${BENCH_TOP_P:-}" ] && BENCH_SAMPLING_ARGS+=(--top-p "$BENCH_TOP_P")
+
+# sglang#47990 removed the sglang.bench_serving shim (first missing in the
+# 20261115 ROCm image); sglang.benchmark.serving is the module behind it.
+if python3 -c "import sglang.benchmark.serving" >/dev/null 2>&1; then
+    BENCH_SERVING_MODULE="sglang.benchmark.serving"
+else
+    BENCH_SERVING_MODULE="sglang.bench_serving"
+fi
 
 # Vendor tag inserted into profiler trace filenames (e.g. ..._p8-AMD-TP-0-...).
 # Auto-detect: AMD on ROCm, NV otherwise. Override with: VENDOR_TAG=AMD ./GLM.sh ...
@@ -857,7 +875,7 @@ run_guarded() {
         while sleep 10; do
             if [ "$(grep -cE "$SCHED_CRASH_PATTERN" "$SERVER_LOG" 2>/dev/null || true)" -gt "${crashes_before:-0}" ]; then
                 touch "$flag"
-                pkill -TERM -f "sglang[.]bench_serving --host ${HOST} --port ${PORT}( |$)" || true
+                pkill -TERM -f "sglang[.](bench_serving|benchmark[.]serving) --host ${HOST} --port ${PORT}( |$)" || true
                 break
             fi
         done
@@ -1209,6 +1227,9 @@ EOF
     if [ ${#EXTRA_SERVER_ARGS[@]} -gt 0 ]; then
         cmd+=("${EXTRA_SERVER_ARGS[@]}")
     fi
+    if [ ${#PROF_ADMIN_ARGS[@]} -gt 0 ]; then
+        cmd+=("${PROF_ADMIN_ARGS[@]}")
+    fi
 
     # DRY_RUN=1 prints the resolved launch command and exits without loading the
     # model (~4 min) — for checking that a new model's args resolve as intended.
@@ -1323,7 +1344,7 @@ check_mhc_markers() {
 warmup() {
     local warmup_log="${LOG_DIR}/warmup.log"
     local warmup_cmd=(
-        python3 -m sglang.bench_serving 
+        python3 -m "$BENCH_SERVING_MODULE"
         --host $HOST 
         --port "${PORT}" 
         --model "${MODEL_PATH}" 
@@ -1484,7 +1505,7 @@ run_benchmarks() {
             local logfile="${LOG_DIR}/bench_in${input_tokens}_out${output_tokens}_conc${c}.log"
 
             local cmd=(
-                python3 -m sglang.bench_serving
+                python3 -m "$BENCH_SERVING_MODULE"
                 --host "${HOST}"
                 --port "${PORT}"
                 --model "${MODEL_PATH}"
@@ -1538,7 +1559,7 @@ run_benchmarks() {
                 if [ "$PROF_ENABLED" == "true" ] && [ "${PROF_WARMUP:-1}" == "1" ]; then
                     local warmup_cfg_log="${LOG_DIR}/warmup_in${input_tokens}_out${output_tokens}_conc${c}.log"
                     local warmup_cfg_cmd=(
-                        python3 -m sglang.bench_serving
+                        python3 -m "$BENCH_SERVING_MODULE"
                         --host "${HOST}" --port "${PORT}" --model "${MODEL_PATH}"
                         --dataset-name "${DATASET}"
                         --random-input "${input_tokens}" --random-output "${output_tokens}"
